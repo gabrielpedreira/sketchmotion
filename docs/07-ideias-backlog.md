@@ -55,3 +55,12 @@ roupa...). Assim, num frame diferente, o usuário seleciona um elemento e o
 **move inteiro ou o edita** conforme a cena. Base para reaproveitar partes do
 personagem entre frames — conecta o sistema de camadas (v0.2) com a animação
 (v0.3) e o rigging (v0.5).
+
+### Barra de ferramentas à esquerda (estilo Illustrator)
+Uma coluna vertical de ferramentas no lado esquerdo, separada da toolbox de
+painéis (direita). Ferramentas previstas (baseadas no Illustrator):
+seleção, laço/seleção livre, **caneta ponto a ponto** (pen/bézier), lápis,
+pincel, borracha, **conta-gotas**, **balde de preenchimento**, formas
+(linha, retângulo, elipse), texto, mão (pan) e zoom. Cada ferramenta é um
+botão/ícone; a arquitetura (crate `tools`) deve permitir adicionar novas sem
+mexer nas existentes. No rodapé, os seletores de cor de preenchimento/traço.
