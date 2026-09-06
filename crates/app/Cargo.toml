@@ -8,4 +8,5 @@ license.workspace = true
 [dependencies]
 sketchmotion-core = { path = "../core" }
 sketchmotion-render = { path = "../render" }
+sketchmotion-tools = { path = "../tools" }
 eframe = "0.29"

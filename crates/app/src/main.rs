@@ -1,21 +1,32 @@
 //! SketchMotion — binário da aplicação (egui/eframe).
 //!
-//! Etapa 4 (v0.1): canvas interativo. Mantém um `Document` do core, desenha
-//! nele com o mouse (arrastar pinta um traço) e re-renderiza a textura pelo
-//! render a cada mudança. Ainda com uma cor/pincel fixos — alternância de
-//! ferramentas (lápis/borracha) e cor entram nas Etapas 5 e 6.
+//! Etapas 5 e 6 (v0.1): ferramentas lápis/borracha, seleção de cor e tamanho
+//! de pincel, num painel lateral. O desenho continua indo para o Document do
+//! core; o render compõe; o egui exibe.
 
 use eframe::egui;
 use sketchmotion_core::{Color, Document};
 use sketchmotion_render::{render_document, PixelImage};
+use sketchmotion_tools::Tool;
 
 const CANVAS_W: u32 = 800;
 const CANVAS_H: u32 = 520;
-const BRUSH_RADIUS: i32 = 2; // raio do pincel, em pixels
+
+/// Cores de acesso rápido no painel (swatches).
+const SWATCHES: [egui::Color32; 8] = [
+    egui::Color32::BLACK,
+    egui::Color32::WHITE,
+    egui::Color32::from_rgb(0xFF, 0x5C, 0x5C), // vermelho
+    egui::Color32::from_rgb(0x2F, 0xB3, 0x74), // verde
+    egui::Color32::from_rgb(0x2F, 0x84, 0xFE), // azul (accent)
+    egui::Color32::from_rgb(0xF5, 0xA6, 0x23), // laranja
+    egui::Color32::from_rgb(0x9B, 0x51, 0xE0), // roxo
+    egui::Color32::from_rgb(0x8B, 0x57, 0x2A), // marrom
+];
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([980.0, 700.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 720.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -28,11 +39,11 @@ fn main() -> eframe::Result<()> {
 struct SketchMotionApp {
     document: Document,
     texture: Option<egui::TextureHandle>,
-    /// Marca que o desenho mudou e a textura precisa ser refeita.
     dirty: bool,
-    /// Último ponto pintado (para ligar os pontos do arrasto).
     last_pos: Option<(i32, i32)>,
-    brush_color: Color,
+    tool: Tool,
+    brush_color: egui::Color32,
+    brush_radius: i32,
 }
 
 impl SketchMotionApp {
@@ -42,15 +53,24 @@ impl SketchMotionApp {
             texture: None,
             dirty: true,
             last_pos: None,
-            brush_color: Color::BLACK,
+            tool: Tool::Pencil,
+            brush_color: egui::Color32::BLACK,
+            brush_radius: 2,
         }
     }
 
-    /// Pinta um "carimbo" circular do pincel centrado em (x, y).
+    /// Cor do core que a ferramenta atual aplica (borracha => transparente).
+    fn active_color(&self) -> Color {
+        let c = self.brush_color;
+        self.tool
+            .effective_color(Color::rgba(c.r(), c.g(), c.b(), c.a()))
+    }
+
+    /// Pinta um carimbo circular do pincel centrado em (x, y).
     fn paint_dab(&mut self, x: i32, y: i32) {
-        let color = self.brush_color;
+        let color = self.active_color();
+        let r = self.brush_radius;
         if let Some(layer) = self.document.layer_mut(0) {
-            let r = BRUSH_RADIUS;
             for dy in -r..=r {
                 for dx in -r..=r {
                     if dx * dx + dy * dy <= r * r {
@@ -81,7 +101,6 @@ impl SketchMotionApp {
 
 impl eframe::App for SketchMotionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // (Re)constrói a textura do documento quando algo mudou.
         if self.dirty || self.texture.is_none() {
             let PixelImage { width, height, rgba } = render_document(&self.document);
             let image =
@@ -98,28 +117,55 @@ impl eframe::App for SketchMotionApp {
         let tex_id = self.texture.as_ref().unwrap().id();
         let size = egui::vec2(CANVAS_W as f32, CANVAS_H as f32);
 
-        egui::TopBottomPanel::top("barra").show(ctx, |ui| {
+        // --- Painel lateral direito: ferramentas, pincel e cores ---
+        egui::SidePanel::right("painel").min_width(180.0).show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.heading("Ferramentas");
+            ui.selectable_value(&mut self.tool, Tool::Pencil, "Lápis");
+            ui.selectable_value(&mut self.tool, Tool::Eraser, "Borracha");
+
+            ui.separator();
+            ui.heading("Pincel");
+            ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30).text("Tamanho"));
+
+            ui.separator();
+            ui.heading("Cor");
             ui.horizontal(|ui| {
-                ui.strong("SketchMotion — v0.1");
-                ui.separator();
-                ui.label("Arraste o mouse sobre o canvas para desenhar.");
-                if ui.button("Limpar").clicked() {
-                    self.document = Document::new(CANVAS_W, CANVAS_H, Color::WHITE);
-                    self.last_pos = None;
-                    self.dirty = true;
+                ui.color_edit_button_srgba(&mut self.brush_color);
+                ui.label("Cor atual");
+            });
+            ui.add_space(4.0);
+            ui.label("Paleta:");
+            egui::Grid::new("swatches").spacing([4.0, 4.0]).show(ui, |ui| {
+                for (i, cor) in SWATCHES.iter().enumerate() {
+                    let btn = egui::Button::new("").fill(*cor).min_size(egui::vec2(24.0, 24.0));
+                    if ui.add(btn).clicked() {
+                        self.brush_color = *cor;
+                        self.tool = Tool::Pencil; // escolher cor volta para o lápis
+                    }
+                    if (i + 1) % 4 == 0 {
+                        ui.end_row();
+                    }
                 }
             });
+
+            ui.separator();
+            if ui.button("Limpar tudo").clicked() {
+                self.document = Document::new(CANVAS_W, CANVAS_H, Color::WHITE);
+                self.last_pos = None;
+                self.dirty = true;
+            }
         });
 
+        // --- Canvas central ---
         egui::CentralPanel::default().show(ctx, |ui| {
             let image = egui::Image::from_texture(egui::load::SizedTexture::new(tex_id, size))
                 .fit_to_exact_size(size)
                 .sense(egui::Sense::click_and_drag());
             let response = ui.add(image);
 
-            // Enquanto o ponteiro estiver pressionado sobre o canvas, pinta.
             if let Some(pointer) = response.interact_pointer_pos() {
-                let local = pointer - response.rect.min; // deslocamento dentro do widget
+                let local = pointer - response.rect.min;
                 let p = (local.x.round() as i32, local.y.round() as i32);
                 match self.last_pos {
                     Some(prev) => self.paint_line(prev, p),
@@ -127,7 +173,7 @@ impl eframe::App for SketchMotionApp {
                 }
                 self.last_pos = Some(p);
             } else {
-                self.last_pos = None; // soltou o botão: recomeça o traço
+                self.last_pos = None;
             }
         });
     }
