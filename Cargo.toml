@@ -1,0 +1,32 @@
+# Workspace SketchMotion
+# Um crate por módulo arquitetural (ver docs/04-estrutura-pastas.md).
+# As fronteiras de dependência entre módulos ficam explícitas: se um crate
+# tentar importar algo que não declarou, o compilador acusa.
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/render",
+    "crates/tools",
+    "crates/input",
+    "crates/animation",
+    "crates/rigging",
+    "crates/color",
+    "crates/brush",
+    "crates/io",
+    "crates/app",
+]
+
+# Metadados e configurações compartilhados por todos os crates do workspace.
+# Cada crate herda com `x.workspace = true` no seu próprio Cargo.toml.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Gabriel Pedreira"]
+license = "MIT"
+repository = "https://github.com/gabrielpedreira/sketchmotion"
+
+# Perfil de release otimizado (usado quando compilarmos o app final).
+[profile.release]
+opt-level = 3
+lto = true
