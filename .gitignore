@@ -1,0 +1,16 @@
+# Artefatos de build do Cargo
+/target
+**/*.rs.bk
+*.pdb
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Editores/IDE
+.idea/
+.vscode/
+*.swp
+
+# Nota: Cargo.lock é versionado de propósito — o produto final é um
+# binário (app), então travar as versões exatas das dependências é o correto.
