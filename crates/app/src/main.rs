@@ -1,8 +1,7 @@
 //! SketchMotion — binário da aplicação (egui/eframe).
 //!
-//! Etapas 5 e 6 (v0.1): ferramentas lápis/borracha, seleção de cor e tamanho
-//! de pincel, num painel lateral. O desenho continua indo para o Document do
-//! core; o render compõe; o egui exibe.
+//! Etapa 7 (v0.1): fecha o MVP com salvar/abrir no formato .sketchmotion
+//! (via crate io), completando o ciclo desenhar -> salvar -> reabrir.
 
 use eframe::egui;
 use sketchmotion_core::{Color, Document};
@@ -26,7 +25,7 @@ const SWATCHES: [egui::Color32; 8] = [
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 720.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 740.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -44,6 +43,7 @@ struct SketchMotionApp {
     tool: Tool,
     brush_color: egui::Color32,
     brush_radius: i32,
+    status: String,
 }
 
 impl SketchMotionApp {
@@ -56,6 +56,7 @@ impl SketchMotionApp {
             tool: Tool::Pencil,
             brush_color: egui::Color32::BLACK,
             brush_radius: 2,
+            status: String::new(),
         }
     }
 
@@ -97,6 +98,36 @@ impl SketchMotionApp {
             self.paint_dab(x, y);
         }
     }
+
+    fn salvar(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
+            .set_file_name("desenho.sketchmotion")
+            .save_file()
+        {
+            self.status = match sketchmotion_io::save(&self.document, &path) {
+                Ok(()) => format!("Salvo em {}", path.display()),
+                Err(e) => format!("Erro ao salvar: {e}"),
+            };
+        }
+    }
+
+    fn abrir(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
+            .pick_file()
+        {
+            match sketchmotion_io::load(&path) {
+                Ok(doc) => {
+                    self.document = doc;
+                    self.last_pos = None;
+                    self.dirty = true;
+                    self.status = format!("Aberto: {}", path.display());
+                }
+                Err(e) => self.status = format!("Erro ao abrir: {e}"),
+            }
+        }
+    }
 }
 
 impl eframe::App for SketchMotionApp {
@@ -115,7 +146,25 @@ impl eframe::App for SketchMotionApp {
             self.dirty = false;
         }
         let tex_id = self.texture.as_ref().unwrap().id();
-        let size = egui::vec2(CANVAS_W as f32, CANVAS_H as f32);
+        let size = egui::vec2(self.document.width as f32, self.document.height as f32);
+
+        // --- Barra superior: arquivo + status ---
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("SketchMotion");
+                ui.separator();
+                if ui.button("Salvar").clicked() {
+                    self.salvar();
+                }
+                if ui.button("Abrir").clicked() {
+                    self.abrir();
+                }
+                if !self.status.is_empty() {
+                    ui.separator();
+                    ui.label(&self.status);
+                }
+            });
+        });
 
         // --- Painel lateral direito: ferramentas, pincel e cores ---
         egui::SidePanel::right("painel").min_width(180.0).show(ctx, |ui| {
@@ -141,7 +190,7 @@ impl eframe::App for SketchMotionApp {
                     let btn = egui::Button::new("").fill(*cor).min_size(egui::vec2(24.0, 24.0));
                     if ui.add(btn).clicked() {
                         self.brush_color = *cor;
-                        self.tool = Tool::Pencil; // escolher cor volta para o lápis
+                        self.tool = Tool::Pencil;
                     }
                     if (i + 1) % 4 == 0 {
                         ui.end_row();

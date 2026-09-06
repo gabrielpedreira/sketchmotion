@@ -4,8 +4,9 @@
 //! opacidade/bloqueio/grupos na v0.2 — a struct já reserva `visible` para isso.
 
 use crate::color::Color;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Layer {
     pub name: String,
     pub visible: bool,

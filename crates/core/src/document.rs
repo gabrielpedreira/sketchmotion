@@ -5,8 +5,9 @@
 
 use crate::color::Color;
 use crate::layer::Layer;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub width: u32,
     pub height: u32,

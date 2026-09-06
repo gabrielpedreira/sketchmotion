@@ -6,3 +6,6 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+sketchmotion-core = { path = "../core" }
+# Serialização binária compacta (CBOR) do formato de projeto.
+ciborium = "0.2"

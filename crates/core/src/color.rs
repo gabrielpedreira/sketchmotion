@@ -2,9 +2,11 @@
 //!
 //! Vive no `core` porque é um dado fundamental do documento. O crate `color`
 //! (separado) cuidará de paleta e seleção de cores — lógica de UI —, não deste
-//! tipo básico. Assim o `core` continua sem depender de ninguém.
+//! tipo básico. Assim o `core` continua sem depender de nenhum outro crate.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
