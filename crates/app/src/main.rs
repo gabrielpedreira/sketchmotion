@@ -1,9 +1,11 @@
 //! SketchMotion — binário da aplicação (egui/eframe).
 //!
-//! Paletas, Parte B: seletor de cores abrangente — escolher por clique (color
-//! picker) ou digitando o código hex, com o código da cor atual sempre à vista.
+//! Paletas, Parte C: janela de gerenciamento das paletas por personagem —
+//! criar personagem, áreas (Pele, Roupa...), adicionar cores nomeadas e clicar
+//! numa cor da paleta para usá-la como pincel.
 
 use eframe::egui;
+use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{Color, Document};
 use sketchmotion_render::{render_document, PixelImage};
 use sketchmotion_tools::Tool;
@@ -24,7 +26,7 @@ const SWATCHES: [egui::Color32; 8] = [
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1040.0, 740.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1120.0, 760.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -32,6 +34,10 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Ok(Box::new(SketchMotionApp::new()))),
     )
+}
+
+fn to_color32(c: Color) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
 }
 
 struct SketchMotionApp {
@@ -44,6 +50,13 @@ struct SketchMotionApp {
     brush_radius: i32,
     hex_input: String,
     status: String,
+    // --- paletas ---
+    library: PaletteLibrary,
+    palettes_open: bool,
+    selected_char: Option<usize>,
+    new_char_name: String,
+    new_group_name: String,
+    new_color_label: String,
 }
 
 impl SketchMotionApp {
@@ -58,16 +71,20 @@ impl SketchMotionApp {
             brush_radius: 2,
             hex_input: String::new(),
             status: String::new(),
+            library: PaletteLibrary::new(),
+            palettes_open: false,
+            selected_char: None,
+            new_char_name: String::new(),
+            new_group_name: String::new(),
+            new_color_label: String::new(),
         }
     }
 
-    /// Cor pura do pincel (sem a lógica de ferramenta), como Color do core.
     fn brush_core_color(&self) -> Color {
         let c = self.brush_color;
         Color::rgba(c.r(), c.g(), c.b(), c.a())
     }
 
-    /// Cor que a ferramenta atual aplica (borracha => transparente).
     fn active_color(&self) -> Color {
         self.tool.effective_color(self.brush_core_color())
     }
@@ -132,7 +149,6 @@ impl SketchMotionApp {
         }
     }
 
-    /// Seção de cores do painel (clique + código hex).
     fn ui_cor(&mut self, ui: &mut egui::Ui) {
         ui.heading("Cor");
         ui.horizontal(|ui| {
@@ -146,13 +162,11 @@ impl SketchMotionApp {
                     .desired_width(84.0)
                     .hint_text("#RRGGBB"),
             );
-            let enter =
-                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             if (ui.button("Ir").clicked() || enter) && !self.hex_input.trim().is_empty() {
                 match sketchmotion_color::from_hex(&self.hex_input) {
                     Some(c) => {
-                        self.brush_color =
-                            egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a);
+                        self.brush_color = to_color32(c);
                         self.tool = Tool::Pencil;
                         self.status = format!("Cor {} selecionada", sketchmotion_color::to_hex(c));
                     }
@@ -174,6 +188,149 @@ impl SketchMotionApp {
                 }
             }
         });
+    }
+
+    /// Janela de gerenciamento das paletas por personagem.
+    fn paletas_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.palettes_open;
+        let current = self.brush_core_color();
+
+        // Ações adiadas (para não mutar a biblioteca durante a iteração dela).
+        let mut pick: Option<Color> = None;
+        let mut remove_group: Option<usize> = None;
+        let mut add_to_group: Option<(usize, String)> = None;
+        let mut remove_char = false;
+
+        egui::Window::new("Paletas de personagem")
+            .open(&mut open)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_char_name)
+                            .desired_width(160.0)
+                            .hint_text("Nome do personagem"),
+                    );
+                    if ui.button("Novo").clicked() && !self.new_char_name.trim().is_empty() {
+                        let idx = self.library.add_character(self.new_char_name.trim());
+                        self.selected_char = Some(idx);
+                        self.new_char_name.clear();
+                    }
+                });
+
+                if self.library.characters.is_empty() {
+                    ui.label("Nenhum personagem ainda — crie um acima.");
+                    return;
+                }
+
+                let sel_name = self
+                    .selected_char
+                    .and_then(|i| self.library.characters.get(i))
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "—".to_owned());
+                egui::ComboBox::from_label("Personagem")
+                    .selected_text(sel_name)
+                    .show_ui(ui, |ui| {
+                        for (i, c) in self.library.characters.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected_char, Some(i), c.name.as_str());
+                        }
+                    });
+
+                let Some(ci) = self.selected_char else {
+                    return;
+                };
+                if ci >= self.library.characters.len() {
+                    return;
+                }
+
+                if ui.button("Remover personagem").clicked() {
+                    remove_char = true;
+                }
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_group_name)
+                            .desired_width(160.0)
+                            .hint_text("Nova área: Pele, Roupa..."),
+                    );
+                    if ui.button("Adicionar área").clicked()
+                        && !self.new_group_name.trim().is_empty()
+                    {
+                        self.library.characters[ci].add_group(self.new_group_name.trim());
+                        self.new_group_name.clear();
+                    }
+                });
+
+                egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
+                    for (gi, group) in self.library.characters[ci].groups.iter().enumerate() {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(&group.name);
+                                if ui.small_button("remover área").clicked() {
+                                    remove_group = Some(gi);
+                                }
+                            });
+                            for nc in &group.colors {
+                                ui.horizontal(|ui| {
+                                    let btn = egui::Button::new("")
+                                        .fill(to_color32(nc.color))
+                                        .min_size(egui::vec2(22.0, 22.0));
+                                    if ui.add(btn).clicked() {
+                                        pick = Some(nc.color);
+                                    }
+                                    ui.label(format!(
+                                        "{} — {}",
+                                        nc.label,
+                                        sketchmotion_color::to_hex(nc.color)
+                                    ));
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.new_color_label)
+                                        .desired_width(110.0)
+                                        .hint_text("rótulo"),
+                                );
+                                if ui.button("+ cor atual").clicked() {
+                                    let label = if self.new_color_label.trim().is_empty() {
+                                        "cor".to_owned()
+                                    } else {
+                                        self.new_color_label.trim().to_owned()
+                                    };
+                                    add_to_group = Some((gi, label));
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+
+        // Aplica as ações adiadas.
+        if let Some(ci) = self.selected_char {
+            if ci < self.library.characters.len() {
+                if let Some((gi, label)) = add_to_group {
+                    if gi < self.library.characters[ci].groups.len() {
+                        self.library.characters[ci].groups[gi].add_color(label, current);
+                        self.new_color_label.clear();
+                    }
+                }
+                if let Some(gi) = remove_group {
+                    self.library.characters[ci].remove_group(gi);
+                }
+                if remove_char {
+                    self.library.remove_character(ci);
+                    self.selected_char =
+                        if self.library.characters.is_empty() { None } else { Some(0) };
+                }
+            }
+        }
+        if let Some(c) = pick {
+            self.brush_color = to_color32(c);
+            self.tool = Tool::Pencil;
+            self.status = format!("Cor {} da paleta", sketchmotion_color::to_hex(c));
+        }
+        self.palettes_open = open;
     }
 }
 
@@ -204,6 +361,9 @@ impl eframe::App for SketchMotionApp {
                 }
                 if ui.button("Abrir").clicked() {
                     self.abrir();
+                }
+                if ui.button("Paletas").clicked() {
+                    self.palettes_open = !self.palettes_open;
                 }
                 if !self.status.is_empty() {
                     ui.separator();
@@ -251,5 +411,7 @@ impl eframe::App for SketchMotionApp {
                 self.last_pos = None;
             }
         });
+
+        self.paletas_window(ctx);
     }
 }
