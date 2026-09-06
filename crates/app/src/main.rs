@@ -1,8 +1,8 @@
 //! SketchMotion — binário da aplicação (egui/eframe).
 //!
-//! Toolbox à direita: uma coluna com painéis que se exibem/ocultam
-//! individualmente (Ferramentas, Cor, Paletas). É a base para acrescentar
-//! Camadas, Degradê e Opacidade como novos painéis no futuro.
+//! Paletas, Parte D (biblioteca global): as paletas são carregadas do
+//! diretório do usuário quando o app abre e salvas automaticamente sempre que
+//! mudam, ficando disponíveis em qualquer projeto.
 
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
@@ -50,12 +50,12 @@ struct SketchMotionApp {
     brush_radius: i32,
     hex_input: String,
     status: String,
-    // --- toolbox: visibilidade dos painéis ---
     show_tools: bool,
     show_colors: bool,
     show_palettes: bool,
-    // --- paletas ---
     library: PaletteLibrary,
+    /// A biblioteca mudou e precisa ser salva no disco.
+    library_dirty: bool,
     selected_char: Option<usize>,
     new_char_name: String,
     new_group_name: String,
@@ -64,6 +64,12 @@ struct SketchMotionApp {
 
 impl SketchMotionApp {
     fn new() -> Self {
+        // Carrega a biblioteca global de paletas, se existir.
+        let library = sketchmotion_io::default_library_path()
+            .and_then(|p| sketchmotion_io::load_library(&p).ok())
+            .unwrap_or_default();
+        let selected_char = if library.characters.is_empty() { None } else { Some(0) };
+
         Self {
             document: Document::new(CANVAS_W, CANVAS_H, Color::WHITE),
             texture: None,
@@ -77,8 +83,9 @@ impl SketchMotionApp {
             show_tools: true,
             show_colors: true,
             show_palettes: true,
-            library: PaletteLibrary::new(),
-            selected_char: None,
+            library,
+            library_dirty: false,
+            selected_char,
             new_char_name: String::new(),
             new_group_name: String::new(),
             new_color_label: String::new(),
@@ -154,7 +161,15 @@ impl SketchMotionApp {
         }
     }
 
-    // ---- Painel: Ferramentas ----
+    /// Persiste a biblioteca global de paletas no disco.
+    fn salvar_biblioteca(&mut self) {
+        if let Some(path) = sketchmotion_io::default_library_path() {
+            if let Err(e) = sketchmotion_io::save_library(&self.library, &path) {
+                self.status = format!("Erro ao salvar paletas: {e}");
+            }
+        }
+    }
+
     fn ui_ferramentas(&mut self, ui: &mut egui::Ui) {
         ui.heading("Ferramentas");
         ui.horizontal(|ui| {
@@ -169,7 +184,6 @@ impl SketchMotionApp {
         }
     }
 
-    // ---- Painel: Cor ----
     fn ui_cor(&mut self, ui: &mut egui::Ui) {
         ui.heading("Cor");
         ui.horizontal(|ui| {
@@ -211,9 +225,9 @@ impl SketchMotionApp {
         });
     }
 
-    // ---- Painel: Paletas por personagem ----
     fn ui_paletas(&mut self, ui: &mut egui::Ui) {
         ui.heading("Paletas");
+        ui.label("(salvas automaticamente e reusáveis entre projetos)");
         let current = self.brush_core_color();
 
         let mut pick: Option<Color> = None;
@@ -231,6 +245,7 @@ impl SketchMotionApp {
                 let idx = self.library.add_character(self.new_char_name.trim());
                 self.selected_char = Some(idx);
                 self.new_char_name.clear();
+                self.library_dirty = true;
             }
         });
 
@@ -273,6 +288,7 @@ impl SketchMotionApp {
             if ui.button("Adicionar área").clicked() && !self.new_group_name.trim().is_empty() {
                 self.library.characters[ci].add_group(self.new_group_name.trim());
                 self.new_group_name.clear();
+                self.library_dirty = true;
             }
         });
 
@@ -304,7 +320,6 @@ impl SketchMotionApp {
                             .desired_width(100.0)
                             .hint_text("rótulo"),
                     );
-                    // amostra da cor atual, ao lado do botão
                     let sw = egui::Button::new("")
                         .fill(to_color32(current))
                         .min_size(egui::vec2(20.0, 20.0));
@@ -321,19 +336,21 @@ impl SketchMotionApp {
             });
         }
 
-        // aplica ações adiadas
         if let Some((gi, label)) = add_to_group {
             if gi < self.library.characters[ci].groups.len() {
                 self.library.characters[ci].groups[gi].add_color(label, current);
                 self.new_color_label.clear();
+                self.library_dirty = true;
             }
         }
         if let Some(gi) = remove_group {
             self.library.characters[ci].remove_group(gi);
+            self.library_dirty = true;
         }
         if remove_char {
             self.library.remove_character(ci);
             self.selected_char = if self.library.characters.is_empty() { None } else { Some(0) };
+            self.library_dirty = true;
         }
         if let Some(c) = pick {
             self.brush_color = to_color32(c);
@@ -378,7 +395,6 @@ impl eframe::App for SketchMotionApp {
             });
         });
 
-        // --- Toolbox à direita: chips de visibilidade + painéis ativos ---
         egui::SidePanel::right("toolbox").min_width(240.0).show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -421,5 +437,11 @@ impl eframe::App for SketchMotionApp {
                 self.last_pos = None;
             }
         });
+
+        // Salva a biblioteca de paletas quando ela muda.
+        if self.library_dirty {
+            self.salvar_biblioteca();
+            self.library_dirty = false;
+        }
     }
 }
