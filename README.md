@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo_escrita.png" alt="SketchMotion" width="360">
+  <img src="assets/logo_horizontal.png" alt="SketchMotion" width="360">
 </p>
 
 <p align="center">
