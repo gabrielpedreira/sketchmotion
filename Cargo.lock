@@ -2894,6 +2894,7 @@ name = "sketchmotion"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "sketchmotion-core",
  "sketchmotion-render",
 ]
 
@@ -2925,6 +2926,7 @@ version = "0.1.0"
 name = "sketchmotion-render"
 version = "0.1.0"
 dependencies = [
+ "sketchmotion-core",
  "skia-safe",
 ]
 

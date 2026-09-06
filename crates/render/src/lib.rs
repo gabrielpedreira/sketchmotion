@@ -1,13 +1,15 @@
-//! sketchmotion-render — renderização via skia-safe.
+//! sketchmotion-render — composição do documento em pixels.
 //!
-//! Etapa 2 (spike): prova que conseguimos desenhar com o skia num buffer de
-//! pixels e entregá-lo ao app (egui) como textura. Ainda não desenha o
-//! documento real do `core` — apenas uma imagem de teste. É o ponto de maior
-//! risco técnico do projeto (ver docs/02-stack-tecnologica.md).
+//! Etapa 4 (v0.1): lê o estado do `core` (fundo + camadas) e produz um buffer
+//! RGBA que o app exibe como textura. É **somente leitura** sobre o `core`.
+//!
+//! A composição aqui é feita em CPU (alpha "over"), simples e robusta para a
+//! v0.1. Quando entrarem formas vetoriais, blending avançado e onion skin
+//! (v0.2+), migramos esta etapa para o skia — por isso ele já é dependência.
 
-use skia_safe::{surfaces, AlphaType, Color, ColorType, ImageInfo, Paint, Rect};
+use sketchmotion_core::Document;
 
-/// Imagem em pixels, pronta para virar uma textura no egui.
+/// Imagem em pixels, pronta para virar textura no egui.
 pub struct PixelImage {
     pub width: i32,
     pub height: i32,
@@ -15,46 +17,43 @@ pub struct PixelImage {
     pub rgba: Vec<u8>,
 }
 
-/// Desenha uma imagem de teste com o skia e devolve os pixels em RGBA.
-///
-/// Usa uma surface *raster* (em CPU): o skia desenha num buffer de memória
-/// que depois é entregue ao egui. É a abordagem mais simples e portável para
-/// validar a integração, sem precisar compartilhar contexto de GPU entre as
-/// duas bibliotecas. Se o desempenho exigir, migramos para GPU depois — sem
-/// mudar quem chama esta função.
-pub fn render_test_image(width: i32, height: i32) -> PixelImage {
-    // 1) Surface raster (buffer em CPU) no tamanho pedido.
-    let mut surface =
-        surfaces::raster_n32_premul((width, height)).expect("falha ao criar surface skia");
-    let canvas = surface.canvas();
+/// Compõe o documento inteiro (fundo opaco + camadas visíveis) num buffer RGBA.
+pub fn render_document(doc: &Document) -> PixelImage {
+    let w = doc.width as usize;
+    let h = doc.height as usize;
+    let mut rgba = vec![0u8; w * h * 4];
 
-    // 2) Fundo no cinza do canvas do design system (#1B1B1B).
-    canvas.clear(Color::from_argb(0xFF, 0x1B, 0x1B, 0x1B));
+    // 1) Preenche com a cor de fundo (opaca).
+    let bg = doc.background;
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = bg.r;
+        px[1] = bg.g;
+        px[2] = bg.b;
+        px[3] = 255;
+    }
 
-    // 3) Retângulo arredondado no azul de accent (#2F84FE).
-    let mut paint = Paint::default();
-    paint.set_anti_alias(true);
-    paint.set_color(Color::from_argb(0xFF, 0x2F, 0x84, 0xFE));
-    let margin = 40.0;
-    let rect = Rect::from_xywh(
-        margin,
-        margin,
-        width as f32 - margin * 2.0,
-        height as f32 - margin * 2.0,
-    );
-    canvas.draw_round_rect(rect, 16.0, 16.0, &paint);
+    // 2) Compõe cada camada visível por cima (alpha over), de baixo para cima.
+    for layer in &doc.layers {
+        if !layer.visible {
+            continue;
+        }
+        let src = layer.pixels();
+        for (dst, s) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            let sa = s[3] as u32;
+            if sa == 0 {
+                continue; // pixel transparente da camada: não altera o fundo
+            }
+            let ia = 255 - sa; // inverso do alpha
+            dst[0] = ((s[0] as u32 * sa + dst[0] as u32 * ia) / 255) as u8;
+            dst[1] = ((s[1] as u32 * sa + dst[1] as u32 * ia) / 255) as u8;
+            dst[2] = ((s[2] as u32 * sa + dst[2] as u32 * ia) / 255) as u8;
+            dst[3] = 255;
+        }
+    }
 
-    // 4) Um círculo na cor de seleção (#2FD4FE), só para ter duas formas.
-    paint.set_color(Color::from_argb(0xFF, 0x2F, 0xD4, 0xFE));
-    canvas.draw_circle((width as f32 / 2.0, height as f32 / 2.0), 60.0, &paint);
-
-    // 5) Lê os pixels da surface em RGBA8888 não pré-multiplicado — formato
-    //    que o egui espera para montar a textura.
-    let info = ImageInfo::new((width, height), ColorType::RGBA8888, AlphaType::Unpremul, None);
-    let row_bytes = (width * 4) as usize;
-    let mut rgba = vec![0u8; row_bytes * height as usize];
-    let ok = surface.read_pixels(&info, &mut rgba, row_bytes, (0, 0));
-    assert!(ok, "falha ao ler os pixels da surface skia");
-
-    PixelImage { width, height, rgba }
+    PixelImage {
+        width: doc.width as i32,
+        height: doc.height as i32,
+        rgba,
+    }
 }

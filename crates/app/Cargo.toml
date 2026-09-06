@@ -6,7 +6,6 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Único crate que compõe os demais.
+sketchmotion-core = { path = "../core" }
 sketchmotion-render = { path = "../render" }
-# Janela + UI em modo imediato (eframe já traz o egui junto via eframe::egui).
 eframe = "0.29"
