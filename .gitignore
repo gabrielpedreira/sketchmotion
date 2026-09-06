@@ -14,3 +14,6 @@ Thumbs.db
 
 # Nota: Cargo.lock é versionado de propósito — o produto final é um
 # binário (app), então travar as versões exatas das dependências é o correto.
+
+# Log de build gerado pelo Tee-Object
+build.log

@@ -6,5 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Único crate que pode depender de todos os outros (camada de composição).
-# As dependências entre módulos serão adicionadas a partir da Etapa 2.
+# Único crate que compõe os demais.
+sketchmotion-render = { path = "../render" }
+# Janela + UI em modo imediato (eframe já traz o egui junto via eframe::egui).
+eframe = "0.29"

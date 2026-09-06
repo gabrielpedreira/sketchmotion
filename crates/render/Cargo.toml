@@ -6,3 +6,6 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+# Motor de renderização 2D (bindings Rust para Skia). Na primeira compilação
+# ele baixa binários pré-compilados — pode demorar alguns minutos e exige rede.
+skia-safe = "0.78"
