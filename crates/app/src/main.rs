@@ -1,8 +1,8 @@
 //! SketchMotion — binário da aplicação (egui/eframe).
 //!
-//! Paletas, Parte C: janela de gerenciamento das paletas por personagem —
-//! criar personagem, áreas (Pele, Roupa...), adicionar cores nomeadas e clicar
-//! numa cor da paleta para usá-la como pincel.
+//! Toolbox à direita: uma coluna com painéis que se exibem/ocultam
+//! individualmente (Ferramentas, Cor, Paletas). É a base para acrescentar
+//! Camadas, Degradê e Opacidade como novos painéis no futuro.
 
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
@@ -50,9 +50,12 @@ struct SketchMotionApp {
     brush_radius: i32,
     hex_input: String,
     status: String,
+    // --- toolbox: visibilidade dos painéis ---
+    show_tools: bool,
+    show_colors: bool,
+    show_palettes: bool,
     // --- paletas ---
     library: PaletteLibrary,
-    palettes_open: bool,
     selected_char: Option<usize>,
     new_char_name: String,
     new_group_name: String,
@@ -71,8 +74,10 @@ impl SketchMotionApp {
             brush_radius: 2,
             hex_input: String::new(),
             status: String::new(),
+            show_tools: true,
+            show_colors: true,
+            show_palettes: true,
             library: PaletteLibrary::new(),
-            palettes_open: false,
             selected_char: None,
             new_char_name: String::new(),
             new_group_name: String::new(),
@@ -149,6 +154,22 @@ impl SketchMotionApp {
         }
     }
 
+    // ---- Painel: Ferramentas ----
+    fn ui_ferramentas(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Ferramentas");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tool, Tool::Pencil, "Lápis");
+            ui.selectable_value(&mut self.tool, Tool::Eraser, "Borracha");
+        });
+        ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30).text("Tamanho"));
+        if ui.button("Limpar tudo").clicked() {
+            self.document = Document::new(CANVAS_W, CANVAS_H, Color::WHITE);
+            self.last_pos = None;
+            self.dirty = true;
+        }
+    }
+
+    // ---- Painel: Cor ----
     fn ui_cor(&mut self, ui: &mut egui::Ui) {
         ui.heading("Cor");
         ui.horizontal(|ui| {
@@ -178,7 +199,7 @@ impl SketchMotionApp {
         ui.label("Paleta rápida:");
         egui::Grid::new("swatches").spacing([4.0, 4.0]).show(ui, |ui| {
             for (i, cor) in SWATCHES.iter().enumerate() {
-                let btn = egui::Button::new("").fill(*cor).min_size(egui::vec2(24.0, 24.0));
+                let btn = egui::Button::new("").fill(*cor).min_size(egui::vec2(26.0, 26.0));
                 if ui.add(btn).clicked() {
                     self.brush_color = *cor;
                     self.tool = Tool::Pencil;
@@ -190,147 +211,135 @@ impl SketchMotionApp {
         });
     }
 
-    /// Janela de gerenciamento das paletas por personagem.
-    fn paletas_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.palettes_open;
+    // ---- Painel: Paletas por personagem ----
+    fn ui_paletas(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Paletas");
         let current = self.brush_core_color();
 
-        // Ações adiadas (para não mutar a biblioteca durante a iteração dela).
         let mut pick: Option<Color> = None;
         let mut remove_group: Option<usize> = None;
         let mut add_to_group: Option<(usize, String)> = None;
         let mut remove_char = false;
 
-        egui::Window::new("Paletas de personagem")
-            .open(&mut open)
-            .default_width(300.0)
-            .show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_char_name)
+                    .desired_width(140.0)
+                    .hint_text("Novo personagem"),
+            );
+            if ui.button("Criar").clicked() && !self.new_char_name.trim().is_empty() {
+                let idx = self.library.add_character(self.new_char_name.trim());
+                self.selected_char = Some(idx);
+                self.new_char_name.clear();
+            }
+        });
+
+        if self.library.characters.is_empty() {
+            ui.label("Nenhum personagem ainda — crie um acima.");
+            return;
+        }
+
+        let sel_name = self
+            .selected_char
+            .and_then(|i| self.library.characters.get(i))
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| "—".to_owned());
+        egui::ComboBox::from_label("Personagem")
+            .selected_text(sel_name)
+            .show_ui(ui, |ui| {
+                for (i, c) in self.library.characters.iter().enumerate() {
+                    ui.selectable_value(&mut self.selected_char, Some(i), c.name.as_str());
+                }
+            });
+
+        let Some(ci) = self.selected_char else {
+            return;
+        };
+        if ci >= self.library.characters.len() {
+            return;
+        }
+
+        if ui.button("Remover personagem").clicked() {
+            remove_char = true;
+        }
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.new_group_name)
+                    .desired_width(140.0)
+                    .hint_text("Nova área: Pele..."),
+            );
+            if ui.button("Adicionar área").clicked() && !self.new_group_name.trim().is_empty() {
+                self.library.characters[ci].add_group(self.new_group_name.trim());
+                self.new_group_name.clear();
+            }
+        });
+
+        for (gi, group) in self.library.characters[ci].groups.iter().enumerate() {
+            ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_char_name)
-                            .desired_width(160.0)
-                            .hint_text("Nome do personagem"),
-                    );
-                    if ui.button("Novo").clicked() && !self.new_char_name.trim().is_empty() {
-                        let idx = self.library.add_character(self.new_char_name.trim());
-                        self.selected_char = Some(idx);
-                        self.new_char_name.clear();
+                    ui.strong(&group.name);
+                    if ui.small_button("remover área").clicked() {
+                        remove_group = Some(gi);
                     }
                 });
-
-                if self.library.characters.is_empty() {
-                    ui.label("Nenhum personagem ainda — crie um acima.");
-                    return;
-                }
-
-                let sel_name = self
-                    .selected_char
-                    .and_then(|i| self.library.characters.get(i))
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| "—".to_owned());
-                egui::ComboBox::from_label("Personagem")
-                    .selected_text(sel_name)
-                    .show_ui(ui, |ui| {
-                        for (i, c) in self.library.characters.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_char, Some(i), c.name.as_str());
+                for nc in &group.colors {
+                    ui.horizontal(|ui| {
+                        let btn = egui::Button::new("")
+                            .fill(to_color32(nc.color))
+                            .min_size(egui::vec2(30.0, 30.0));
+                        if ui.add(btn).clicked() {
+                            pick = Some(nc.color);
                         }
+                        ui.vertical(|ui| {
+                            ui.strong(&nc.label);
+                            ui.monospace(sketchmotion_color::to_hex(nc.color));
+                        });
                     });
-
-                let Some(ci) = self.selected_char else {
-                    return;
-                };
-                if ci >= self.library.characters.len() {
-                    return;
                 }
-
-                if ui.button("Remover personagem").clicked() {
-                    remove_char = true;
-                }
-                ui.separator();
-
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.new_group_name)
-                            .desired_width(160.0)
-                            .hint_text("Nova área: Pele, Roupa..."),
+                        egui::TextEdit::singleline(&mut self.new_color_label)
+                            .desired_width(100.0)
+                            .hint_text("rótulo"),
                     );
-                    if ui.button("Adicionar área").clicked()
-                        && !self.new_group_name.trim().is_empty()
-                    {
-                        self.library.characters[ci].add_group(self.new_group_name.trim());
-                        self.new_group_name.clear();
-                    }
-                });
-
-                egui::ScrollArea::vertical().max_height(380.0).show(ui, |ui| {
-                    for (gi, group) in self.library.characters[ci].groups.iter().enumerate() {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.strong(&group.name);
-                                if ui.small_button("remover área").clicked() {
-                                    remove_group = Some(gi);
-                                }
-                            });
-                            for nc in &group.colors {
-                                ui.horizontal(|ui| {
-                                    let btn = egui::Button::new("")
-                                        .fill(to_color32(nc.color))
-                                        .min_size(egui::vec2(22.0, 22.0));
-                                    if ui.add(btn).clicked() {
-                                        pick = Some(nc.color);
-                                    }
-                                    ui.label(format!(
-                                        "{} — {}",
-                                        nc.label,
-                                        sketchmotion_color::to_hex(nc.color)
-                                    ));
-                                });
-                            }
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.new_color_label)
-                                        .desired_width(110.0)
-                                        .hint_text("rótulo"),
-                                );
-                                if ui.button("+ cor atual").clicked() {
-                                    let label = if self.new_color_label.trim().is_empty() {
-                                        "cor".to_owned()
-                                    } else {
-                                        self.new_color_label.trim().to_owned()
-                                    };
-                                    add_to_group = Some((gi, label));
-                                }
-                            });
-                        });
+                    // amostra da cor atual, ao lado do botão
+                    let sw = egui::Button::new("")
+                        .fill(to_color32(current))
+                        .min_size(egui::vec2(20.0, 20.0));
+                    ui.add_enabled(false, sw);
+                    if ui.button("+ salvar cor").clicked() {
+                        let label = if self.new_color_label.trim().is_empty() {
+                            "cor".to_owned()
+                        } else {
+                            self.new_color_label.trim().to_owned()
+                        };
+                        add_to_group = Some((gi, label));
                     }
                 });
             });
+        }
 
-        // Aplica as ações adiadas.
-        if let Some(ci) = self.selected_char {
-            if ci < self.library.characters.len() {
-                if let Some((gi, label)) = add_to_group {
-                    if gi < self.library.characters[ci].groups.len() {
-                        self.library.characters[ci].groups[gi].add_color(label, current);
-                        self.new_color_label.clear();
-                    }
-                }
-                if let Some(gi) = remove_group {
-                    self.library.characters[ci].remove_group(gi);
-                }
-                if remove_char {
-                    self.library.remove_character(ci);
-                    self.selected_char =
-                        if self.library.characters.is_empty() { None } else { Some(0) };
-                }
+        // aplica ações adiadas
+        if let Some((gi, label)) = add_to_group {
+            if gi < self.library.characters[ci].groups.len() {
+                self.library.characters[ci].groups[gi].add_color(label, current);
+                self.new_color_label.clear();
             }
+        }
+        if let Some(gi) = remove_group {
+            self.library.characters[ci].remove_group(gi);
+        }
+        if remove_char {
+            self.library.remove_character(ci);
+            self.selected_char = if self.library.characters.is_empty() { None } else { Some(0) };
         }
         if let Some(c) = pick {
             self.brush_color = to_color32(c);
             self.tool = Tool::Pencil;
             self.status = format!("Cor {} da paleta", sketchmotion_color::to_hex(c));
         }
-        self.palettes_open = open;
     }
 }
 
@@ -362,9 +371,6 @@ impl eframe::App for SketchMotionApp {
                 if ui.button("Abrir").clicked() {
                     self.abrir();
                 }
-                if ui.button("Paletas").clicked() {
-                    self.palettes_open = !self.palettes_open;
-                }
                 if !self.status.is_empty() {
                     ui.separator();
                     ui.label(&self.status);
@@ -372,25 +378,29 @@ impl eframe::App for SketchMotionApp {
             });
         });
 
-        egui::SidePanel::right("painel").min_width(190.0).show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.heading("Ferramentas");
-            ui.selectable_value(&mut self.tool, Tool::Pencil, "Lápis");
-            ui.selectable_value(&mut self.tool, Tool::Eraser, "Borracha");
-
+        // --- Toolbox à direita: chips de visibilidade + painéis ativos ---
+        egui::SidePanel::right("toolbox").min_width(240.0).show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.toggle_value(&mut self.show_tools, "Ferramentas");
+                ui.toggle_value(&mut self.show_colors, "Cor");
+                ui.toggle_value(&mut self.show_palettes, "Paletas");
+            });
             ui.separator();
-            ui.heading("Pincel");
-            ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30).text("Tamanho"));
-
-            ui.separator();
-            self.ui_cor(ui);
-
-            ui.separator();
-            if ui.button("Limpar tudo").clicked() {
-                self.document = Document::new(CANVAS_W, CANVAS_H, Color::WHITE);
-                self.last_pos = None;
-                self.dirty = true;
-            }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if self.show_tools {
+                    self.ui_ferramentas(ui);
+                    ui.separator();
+                }
+                if self.show_colors {
+                    self.ui_cor(ui);
+                    ui.separator();
+                }
+                if self.show_palettes {
+                    self.ui_paletas(ui);
+                    ui.separator();
+                }
+            });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -411,7 +421,5 @@ impl eframe::App for SketchMotionApp {
                 self.last_pos = None;
             }
         });
-
-        self.paletas_window(ctx);
     }
 }
