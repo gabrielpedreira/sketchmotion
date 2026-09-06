@@ -9,7 +9,7 @@ license.workspace = true
 sketchmotion-core = { path = "../core" }
 sketchmotion-render = { path = "../render" }
 sketchmotion-tools = { path = "../tools" }
+sketchmotion-color = { path = "../color" }
 sketchmotion-io = { path = "../io" }
 eframe = "0.29"
-# Diálogos nativos de salvar/abrir arquivo.
 rfd = "0.14"

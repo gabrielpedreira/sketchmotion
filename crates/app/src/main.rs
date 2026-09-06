@@ -1,7 +1,7 @@
 //! SketchMotion — binário da aplicação (egui/eframe).
 //!
-//! Etapa 7 (v0.1): fecha o MVP com salvar/abrir no formato .sketchmotion
-//! (via crate io), completando o ciclo desenhar -> salvar -> reabrir.
+//! Paletas, Parte B: seletor de cores abrangente — escolher por clique (color
+//! picker) ou digitando o código hex, com o código da cor atual sempre à vista.
 
 use eframe::egui;
 use sketchmotion_core::{Color, Document};
@@ -11,16 +11,15 @@ use sketchmotion_tools::Tool;
 const CANVAS_W: u32 = 800;
 const CANVAS_H: u32 = 520;
 
-/// Cores de acesso rápido no painel (swatches).
 const SWATCHES: [egui::Color32; 8] = [
     egui::Color32::BLACK,
     egui::Color32::WHITE,
-    egui::Color32::from_rgb(0xFF, 0x5C, 0x5C), // vermelho
-    egui::Color32::from_rgb(0x2F, 0xB3, 0x74), // verde
-    egui::Color32::from_rgb(0x2F, 0x84, 0xFE), // azul (accent)
-    egui::Color32::from_rgb(0xF5, 0xA6, 0x23), // laranja
-    egui::Color32::from_rgb(0x9B, 0x51, 0xE0), // roxo
-    egui::Color32::from_rgb(0x8B, 0x57, 0x2A), // marrom
+    egui::Color32::from_rgb(0xFF, 0x5C, 0x5C),
+    egui::Color32::from_rgb(0x2F, 0xB3, 0x74),
+    egui::Color32::from_rgb(0x2F, 0x84, 0xFE),
+    egui::Color32::from_rgb(0xF5, 0xA6, 0x23),
+    egui::Color32::from_rgb(0x9B, 0x51, 0xE0),
+    egui::Color32::from_rgb(0x8B, 0x57, 0x2A),
 ];
 
 fn main() -> eframe::Result<()> {
@@ -43,6 +42,7 @@ struct SketchMotionApp {
     tool: Tool,
     brush_color: egui::Color32,
     brush_radius: i32,
+    hex_input: String,
     status: String,
 }
 
@@ -56,18 +56,22 @@ impl SketchMotionApp {
             tool: Tool::Pencil,
             brush_color: egui::Color32::BLACK,
             brush_radius: 2,
+            hex_input: String::new(),
             status: String::new(),
         }
     }
 
-    /// Cor do core que a ferramenta atual aplica (borracha => transparente).
-    fn active_color(&self) -> Color {
+    /// Cor pura do pincel (sem a lógica de ferramenta), como Color do core.
+    fn brush_core_color(&self) -> Color {
         let c = self.brush_color;
-        self.tool
-            .effective_color(Color::rgba(c.r(), c.g(), c.b(), c.a()))
+        Color::rgba(c.r(), c.g(), c.b(), c.a())
     }
 
-    /// Pinta um carimbo circular do pincel centrado em (x, y).
+    /// Cor que a ferramenta atual aplica (borracha => transparente).
+    fn active_color(&self) -> Color {
+        self.tool.effective_color(self.brush_core_color())
+    }
+
     fn paint_dab(&mut self, x: i32, y: i32) {
         let color = self.active_color();
         let r = self.brush_radius;
@@ -86,7 +90,6 @@ impl SketchMotionApp {
         self.dirty = true;
     }
 
-    /// Liga dois pontos com carimbos para o traço não sair tracejado.
     fn paint_line(&mut self, from: (i32, i32), to: (i32, i32)) {
         let (x0, y0) = from;
         let (x1, y1) = to;
@@ -128,6 +131,50 @@ impl SketchMotionApp {
             }
         }
     }
+
+    /// Seção de cores do painel (clique + código hex).
+    fn ui_cor(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Cor");
+        ui.horizontal(|ui| {
+            ui.color_edit_button_srgba(&mut self.brush_color);
+            ui.monospace(sketchmotion_color::to_hex(self.brush_core_color()));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Código:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.hex_input)
+                    .desired_width(84.0)
+                    .hint_text("#RRGGBB"),
+            );
+            let enter =
+                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Ir").clicked() || enter) && !self.hex_input.trim().is_empty() {
+                match sketchmotion_color::from_hex(&self.hex_input) {
+                    Some(c) => {
+                        self.brush_color =
+                            egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a);
+                        self.tool = Tool::Pencil;
+                        self.status = format!("Cor {} selecionada", sketchmotion_color::to_hex(c));
+                    }
+                    None => self.status = "Código hex inválido".to_owned(),
+                }
+            }
+        });
+        ui.add_space(4.0);
+        ui.label("Paleta rápida:");
+        egui::Grid::new("swatches").spacing([4.0, 4.0]).show(ui, |ui| {
+            for (i, cor) in SWATCHES.iter().enumerate() {
+                let btn = egui::Button::new("").fill(*cor).min_size(egui::vec2(24.0, 24.0));
+                if ui.add(btn).clicked() {
+                    self.brush_color = *cor;
+                    self.tool = Tool::Pencil;
+                }
+                if (i + 1) % 4 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    }
 }
 
 impl eframe::App for SketchMotionApp {
@@ -148,7 +195,6 @@ impl eframe::App for SketchMotionApp {
         let tex_id = self.texture.as_ref().unwrap().id();
         let size = egui::vec2(self.document.width as f32, self.document.height as f32);
 
-        // --- Barra superior: arquivo + status ---
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("SketchMotion");
@@ -166,8 +212,7 @@ impl eframe::App for SketchMotionApp {
             });
         });
 
-        // --- Painel lateral direito: ferramentas, pincel e cores ---
-        egui::SidePanel::right("painel").min_width(180.0).show(ctx, |ui| {
+        egui::SidePanel::right("painel").min_width(190.0).show(ctx, |ui| {
             ui.add_space(6.0);
             ui.heading("Ferramentas");
             ui.selectable_value(&mut self.tool, Tool::Pencil, "Lápis");
@@ -178,25 +223,7 @@ impl eframe::App for SketchMotionApp {
             ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30).text("Tamanho"));
 
             ui.separator();
-            ui.heading("Cor");
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgba(&mut self.brush_color);
-                ui.label("Cor atual");
-            });
-            ui.add_space(4.0);
-            ui.label("Paleta:");
-            egui::Grid::new("swatches").spacing([4.0, 4.0]).show(ui, |ui| {
-                for (i, cor) in SWATCHES.iter().enumerate() {
-                    let btn = egui::Button::new("").fill(*cor).min_size(egui::vec2(24.0, 24.0));
-                    if ui.add(btn).clicked() {
-                        self.brush_color = *cor;
-                        self.tool = Tool::Pencil;
-                    }
-                    if (i + 1) % 4 == 0 {
-                        ui.end_row();
-                    }
-                }
-            });
+            self.ui_cor(ui);
 
             ui.separator();
             if ui.button("Limpar tudo").clicked() {
@@ -206,7 +233,6 @@ impl eframe::App for SketchMotionApp {
             }
         });
 
-        // --- Canvas central ---
         egui::CentralPanel::default().show(ctx, |ui| {
             let image = egui::Image::from_texture(egui::load::SizedTexture::new(tex_id, size))
                 .fit_to_exact_size(size)

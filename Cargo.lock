@@ -3026,6 +3026,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "rfd",
+ "sketchmotion-color",
  "sketchmotion-core",
  "sketchmotion-io",
  "sketchmotion-render",
@@ -3043,6 +3044,10 @@ version = "0.1.0"
 [[package]]
 name = "sketchmotion-color"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "sketchmotion-core",
+]
 
 [[package]]
 name = "sketchmotion-core"
