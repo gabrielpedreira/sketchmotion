@@ -32,3 +32,26 @@ Ampliar o sistema de pincéis (crate `brush`) para além do lápis sólido:
 - Pincéis com **textura** (a "ponta" do pincel é uma imagem/máscara aplicada ao longo do traço).
 - Arquitetura deve permitir **adicionar novos pincéis** sem alterar os existentes
   (cada pincel implementa um trait comum), e futuramente importar pincéis.
+
+### Toolbox à direita (painéis mostráveis/ocultáveis)
+Uma barra/coluna à direita que agrupa painéis que o usuário pode **exibir ou
+ocultar** individualmente, no estilo Illustrator:
+- Paletas personalizadas (por personagem)
+- Camadas
+- Seleção de cores (com amostras visuais, não só código hex)
+- Degradês
+- Opacidade
+Cada painel é um módulo independente ligado/desligado por ícones. Substitui o
+painel lateral fixo atual por algo configurável.
+
+### Melhoria na criação de paleta
+Na área de criação da paleta, mostrar **amostras de cor** (blocos visuais),
+não depender só do código; ao salvar, a amostra vai para o painel/janela de
+paletas personalizadas.
+
+### Camadas nomeadas por elemento (ligado a camadas e animação)
+Criar camadas e **nomear cada elemento** do personagem (chapéu, cabeça,
+roupa...). Assim, num frame diferente, o usuário seleciona um elemento e o
+**move inteiro ou o edita** conforme a cena. Base para reaproveitar partes do
+personagem entre frames — conecta o sistema de camadas (v0.2) com a animação
+(v0.3) e o rigging (v0.5).
