@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 pub struct Layer {
     pub name: String,
     pub visible: bool,
+    /// Camada bloqueada não recebe desenho.
+    #[serde(default)]
+    pub locked: bool,
     width: u32,
     height: u32,
     /// Pixels RGBA, linha a linha: width * height * 4 bytes.
@@ -22,6 +25,7 @@ impl Layer {
         Self {
             name: name.into(),
             visible: true,
+            locked: false,
             width,
             height,
             pixels: vec![0; (width as usize) * (height as usize) * 4],

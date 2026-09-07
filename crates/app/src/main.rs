@@ -145,9 +145,9 @@ fn seletor_sv(ui: &mut egui::Ui, hsva: &mut egui::ecolor::Hsva, largura: f32, al
     let px = rect.left() + hsva.s * rect.width();
     let py = rect.top() + (1.0 - hsva.v) * rect.height();
     ui.painter()
-        .circle_stroke(egui::pos2(px, py), 5.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+        .circle_stroke(egui::pos2(px, py), 5.0_f32, egui::Stroke::new(2.0_f32, egui::Color32::WHITE));
     ui.painter()
-        .circle_stroke(egui::pos2(px, py), 6.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+        .circle_stroke(egui::pos2(px, py), 6.0_f32, egui::Stroke::new(1.0_f32, egui::Color32::BLACK));
 
     let mut changed = false;
     if resp.dragged() || resp.clicked() {
@@ -187,7 +187,7 @@ fn seletor_hue(ui: &mut egui::Ui, hsva: &mut egui::ecolor::Hsva, largura: f32, a
             egui::pos2(x + 2.0, rect.bottom()),
         ),
         0.0,
-        egui::Stroke::new(2.0, egui::Color32::WHITE),
+        egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
     );
 
     let mut changed = false;
@@ -238,6 +238,10 @@ struct SketchMotionApp {
     reopen_color: bool,
     reopen_palette: bool,
     eyedropper: Eyedropper,
+    active_layer: usize,
+    win_layers: bool,
+    reopen_layers: bool,
+    icon_r_layers: Option<egui::Rect>,
 }
 
 impl SketchMotionApp {
@@ -274,6 +278,10 @@ impl SketchMotionApp {
             reopen_color: false,
             reopen_palette: false,
             eyedropper: Eyedropper::Off,
+            active_layer: 0,
+            win_layers: false,
+            reopen_layers: false,
+            icon_r_layers: None,
         }
     }
 
@@ -288,34 +296,53 @@ impl SketchMotionApp {
 
     /// Cor do documento no pixel (x, y): a da camada se opaca, senão o fundo.
     fn cor_no_pixel(&self, x: i32, y: i32) -> Color {
-        if x >= 0 && y >= 0 {
-            if let Some(layer) = self.document.layer(0) {
-                if let Some(px) = layer.get_pixel(x as u32, y as u32) {
-                    if px.a > 0 {
-                        return px;
-                    }
+        if x < 0 || y < 0 {
+            return self.document.background;
+        }
+        let (xu, yu) = (x as u32, y as u32);
+        let bg = self.document.background;
+        let (mut r, mut g, mut b) = (bg.r as u32, bg.g as u32, bg.b as u32);
+        for layer in &self.document.layers {
+            if !layer.visible {
+                continue;
+            }
+            if let Some(px) = layer.get_pixel(xu, yu) {
+                let a = px.a as u32;
+                if a == 0 {
+                    continue;
                 }
+                let ia = 255 - a;
+                r = (px.r as u32 * a + r * ia) / 255;
+                g = (px.g as u32 * a + g * ia) / 255;
+                b = (px.b as u32 * a + b * ia) / 255;
             }
         }
-        self.document.background
+        Color::rgb(r as u8, g as u8, b as u8)
     }
 
     fn paint_dab(&mut self, x: i32, y: i32) {
         let color = self.active_color();
         let r = self.brush_radius;
-        if let Some(layer) = self.document.layer_mut(0) {
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    if dx * dx + dy * dy <= r * r {
-                        let (px, py) = (x + dx, y + dy);
-                        if px >= 0 && py >= 0 {
-                            layer.set_pixel(px as u32, py as u32, color);
+        let li = self.active_layer;
+        let mut pintou = false;
+        if let Some(layer) = self.document.layer_mut(li) {
+            if !layer.locked {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if dx * dx + dy * dy <= r * r {
+                            let (px, py) = (x + dx, y + dy);
+                            if px >= 0 && py >= 0 {
+                                layer.set_pixel(px as u32, py as u32, color);
+                            }
                         }
                     }
                 }
+                pintou = true;
             }
         }
-        self.dirty = true;
+        if pintou {
+            self.dirty = true;
+        }
     }
 
     fn paint_line(&mut self, from: (i32, i32), to: (i32, i32)) {
@@ -408,6 +435,17 @@ impl SketchMotionApp {
                             self.reopen_palette = true;
                         }
                     }
+                    ui.add_space(6.0);
+
+                    let resp_l = icon_button(ui, self.win_layers, icon::STACK)
+                        .on_hover_text("Camadas");
+                    self.icon_r_layers = Some(resp_l.rect);
+                    if resp_l.clicked() {
+                        self.win_layers = !self.win_layers;
+                        if self.win_layers {
+                            self.reopen_layers = true;
+                        }
+                    }
                 });
             });
     }
@@ -497,7 +535,7 @@ impl SketchMotionApp {
                     ui.painter().rect_stroke(
                         sw,
                         3.0,
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
                     );
                     if ui
                         .button(egui_phosphor::regular::EYEDROPPER)
@@ -632,7 +670,7 @@ impl SketchMotionApp {
                     for (idx, nc) in group.colors.iter().enumerate() {
                         let cell = egui::Rect::from_min_size(egui::pos2(x, cy), egui::vec2(sw, sw));
                         p.rect_filled(cell, 2.0, to_color32(nc.color));
-                        p.rect_stroke(cell, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(35)));
+                        p.rect_stroke(cell, 2.0, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(35)));
                         if let Some(cp) = click {
                             if cell.contains(cp) {
                                 pick = Some(nc.color);
@@ -656,7 +694,7 @@ impl SketchMotionApp {
                     );
                     // "+" adiciona a cor atual à área
                     let add_c = egui::pos2(row.right() - 54.0, row.center().y);
-                    p.circle_stroke(add_c, 9.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                    p.circle_stroke(add_c, 9.0_f32, egui::Stroke::new(1.5_f32, egui::Color32::WHITE));
                     p.text(
                         add_c,
                         egui::Align2::CENTER_CENTER,
@@ -740,6 +778,132 @@ impl SketchMotionApp {
         self.reopen_palette = false;
         self.win_palette = open;
     }
+
+    fn janela_camadas(&mut self, ctx: &egui::Context) {
+        use egui_phosphor::regular as icon;
+        let mut open = self.win_layers;
+
+        let mut toggle_vis: Option<usize> = None;
+        let mut toggle_lock: Option<usize> = None;
+        let mut set_active: Option<usize> = None;
+        let mut move_up: Option<usize> = None;
+        let mut move_down: Option<usize> = None;
+        let mut nova = false;
+        let mut excluir = false;
+
+        let mut win = egui::Window::new("Camadas").open(&mut open).default_width(320.0);
+        if let Some(r) = self.icon_r_layers {
+            let pos = egui::pos2(r.left() - 8.0, r.top());
+            win = win.pivot(egui::Align2::RIGHT_TOP);
+            win = if self.reopen_layers { win.current_pos(pos) } else { win.default_pos(pos) };
+        }
+        win.show(ctx, |ui| {
+            let n = self.document.layers.len();
+            // Lista do topo da pilha (índice maior) para baixo.
+            for i in (0..n).rev() {
+                let vis = self.document.layers[i].visible;
+                let lck = self.document.layers[i].locked;
+                let ativa = self.active_layer == i;
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(false, if vis { icon::EYE } else { icon::EYE_SLASH })
+                        .on_hover_text("Ver/ocultar")
+                        .clicked()
+                    {
+                        toggle_vis = Some(i);
+                    }
+                    if ui
+                        .selectable_label(lck, if lck { icon::LOCK } else { icon::LOCK_OPEN })
+                        .on_hover_text("Bloquear/desbloquear")
+                        .clicked()
+                    {
+                        toggle_lock = Some(i);
+                    }
+                    if ui
+                        .selectable_label(ativa, icon::CIRCLE)
+                        .on_hover_text("Selecionar (camada ativa)")
+                        .clicked()
+                    {
+                        set_active = Some(i);
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.document.layers[i].name)
+                            .desired_width(130.0),
+                    );
+                    if ui.small_button(icon::ARROW_UP).clicked() {
+                        move_up = Some(i);
+                    }
+                    if ui.small_button(icon::ARROW_DOWN).clicked() {
+                        move_down = Some(i);
+                    }
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button(icon::PLUS).on_hover_text("Nova camada").clicked() {
+                    nova = true;
+                }
+                if ui.button(icon::TRASH).on_hover_text("Excluir camada ativa").clicked() {
+                    excluir = true;
+                }
+                ui.label(format!("{n} camada(s)"));
+            });
+            ui.weak("A camada ativa recebe o desenho. Ordem = pilha (topo em cima).");
+        });
+
+        if let Some(i) = toggle_vis {
+            if let Some(l) = self.document.layer_mut(i) {
+                l.visible = !l.visible;
+            }
+            self.dirty = true;
+        }
+        if let Some(i) = toggle_lock {
+            if let Some(l) = self.document.layer_mut(i) {
+                l.locked = !l.locked;
+            }
+        }
+        if let Some(i) = set_active {
+            self.active_layer = i;
+        }
+        if let Some(i) = move_up {
+            if i + 1 < self.document.layers.len() {
+                self.document.swap_layers(i, i + 1);
+                if self.active_layer == i {
+                    self.active_layer = i + 1;
+                } else if self.active_layer == i + 1 {
+                    self.active_layer = i;
+                }
+                self.dirty = true;
+            }
+        }
+        if let Some(i) = move_down {
+            if i > 0 {
+                self.document.swap_layers(i, i - 1);
+                if self.active_layer == i {
+                    self.active_layer = i - 1;
+                } else if self.active_layer == i - 1 {
+                    self.active_layer = i;
+                }
+                self.dirty = true;
+            }
+        }
+        if nova {
+            let nome = format!("Camada {}", self.document.layers.len() + 1);
+            let idx = self.document.add_layer_above(self.active_layer, nome);
+            self.active_layer = idx;
+            self.dirty = true;
+        }
+        if excluir {
+            self.document.remove_layer(self.active_layer);
+            if self.active_layer >= self.document.layers.len() {
+                self.active_layer = self.document.layers.len() - 1;
+            }
+            self.dirty = true;
+        }
+
+        self.reopen_layers = false;
+        self.win_layers = open;
+    }
 }
 
 impl eframe::App for SketchMotionApp {
@@ -782,6 +946,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_ferramentas(ctx);
         self.janela_cor(ctx);
         self.janela_paletas(ctx);
+        self.janela_camadas(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let image = egui::Image::from_texture(egui::load::SizedTexture::new(tex_id, size))
@@ -813,14 +978,34 @@ impl eframe::App for SketchMotionApp {
                     }
                 }
                 self.last_pos = None;
-            } else if let Some(pointer) = response.interact_pointer_pos() {
-                let local = pointer - response.rect.min;
-                let p = (local.x.round() as i32, local.y.round() as i32);
-                match self.last_pos {
-                    Some(prev) => self.paint_line(prev, p),
-                    None => self.paint_dab(p.0, p.1),
+            } else if response.is_pointer_button_down_on() || response.dragged() {
+                let rect_min = response.rect.min;
+                // Coleta TODOS os movimentos do ponteiro neste quadro (não só a
+                // posição final), para o traço acompanhar movimentos rápidos.
+                let mut pontos: Vec<(i32, i32)> = ui.input(|i| {
+                    i.events
+                        .iter()
+                        .filter_map(|e| {
+                            if let egui::Event::PointerMoved(pos) = e {
+                                let l = *pos - rect_min;
+                                Some((l.x.round() as i32, l.y.round() as i32))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                });
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let l = pos - rect_min;
+                    pontos.push((l.x.round() as i32, l.y.round() as i32));
                 }
-                self.last_pos = Some(p);
+                for p in pontos {
+                    match self.last_pos {
+                        Some(prev) => self.paint_line(prev, p),
+                        None => self.paint_dab(p.0, p.1),
+                    }
+                    self.last_pos = Some(p);
+                }
             } else {
                 self.last_pos = None;
             }

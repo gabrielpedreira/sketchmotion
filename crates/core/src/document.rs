@@ -42,4 +42,27 @@ impl Document {
     pub fn layer_mut(&mut self, index: usize) -> Option<&mut Layer> {
         self.layers.get_mut(index)
     }
+
+    /// Insere uma camada nova logo acima da de índice `index` (na pilha) e
+    /// devolve o índice dela.
+    pub fn add_layer_above(&mut self, index: usize, name: impl Into<String>) -> usize {
+        let at = (index + 1).min(self.layers.len());
+        self.layers
+            .insert(at, Layer::new(name, self.width, self.height));
+        at
+    }
+
+    /// Remove a camada de índice `index` (mantém ao menos uma camada).
+    pub fn remove_layer(&mut self, index: usize) {
+        if self.layers.len() > 1 && index < self.layers.len() {
+            self.layers.remove(index);
+        }
+    }
+
+    /// Troca duas camadas de posição (reordenação na pilha).
+    pub fn swap_layers(&mut self, a: usize, b: usize) {
+        if a < self.layers.len() && b < self.layers.len() {
+            self.layers.swap(a, b);
+        }
+    }
 }
