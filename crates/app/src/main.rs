@@ -258,6 +258,7 @@ struct SketchMotionApp {
     home_pixel: bool,
     undo_stack: Vec<Document>,
     redo_stack: Vec<Document>,
+    zoom: f32,
 }
 
 impl SketchMotionApp {
@@ -306,6 +307,7 @@ impl SketchMotionApp {
             home_pixel: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            zoom: 1.0,
         }
     }
 
@@ -439,6 +441,11 @@ impl SketchMotionApp {
         self.last_pos = None;
         self.current_path = None;
         self.pixel_mode = pixel;
+        self.zoom = if pixel {
+            (512.0 / (w.max(h) as f32)).floor().max(1.0)
+        } else {
+            1.0
+        };
         self.dirty = true;
         self.status = if pixel {
             format!("Novo documento pixel art {w}x{h}")
@@ -1195,131 +1202,157 @@ impl eframe::App for SketchMotionApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let doc_w = self.document.width as f32;
             let doc_h = self.document.height as f32;
-            // Escala inteira: no pixel art, amplia para caber na área (nearest);
-            // no modo ilustração, 1:1.
+            // Zoom efetivo: inteiro no pixel art (nitidez), livre na ilustração.
             let zoom = if self.pixel_mode {
-                let avail = ui.available_size();
-                ((avail.x / doc_w).min(avail.y / doc_h)).floor().max(1.0)
+                self.zoom.round().max(1.0)
             } else {
-                1.0
+                self.zoom.max(0.05)
             };
-            let size = egui::vec2(doc_w * zoom, doc_h * zoom);
-            let image = egui::Image::from_texture(egui::load::SizedTexture::new(tex_id, size))
-                .fit_to_exact_size(size)
-                .sense(egui::Sense::click_and_drag());
-            let response = ui.add(image);
-            let rect = response.rect;
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .drag_to_scroll(false)
+                .show(ui, |ui| {
+                    let size = egui::vec2(doc_w * zoom, doc_h * zoom);
+                    let image =
+                        egui::Image::from_texture(egui::load::SizedTexture::new(tex_id, size))
+                            .fit_to_exact_size(size)
+                            .sense(egui::Sense::click_and_drag());
+                    let response = ui.add(image);
+                    let rect = response.rect;
 
-            // Grade guia (pixel art), só quando o zoom deixa legível.
-            if self.pixel_mode && zoom >= 6.0 {
-                let painter = ui.painter_at(rect);
-                let cor = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 90);
-                for i in 0..=self.document.width {
-                    let x = rect.left() + i as f32 * zoom;
-                    painter.line_segment(
-                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                        egui::Stroke::new(1.0_f32, cor),
-                    );
-                }
-                for j in 0..=self.document.height {
-                    let y = rect.top() + j as f32 * zoom;
-                    painter.line_segment(
-                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                        egui::Stroke::new(1.0_f32, cor),
-                    );
-                }
-            }
+                    if self.pixel_mode && zoom >= 6.0 {
+                        let painter = ui.painter_at(rect);
+                        let cor = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 90);
+                        for i in 0..=self.document.width {
+                            let x = rect.left() + i as f32 * zoom;
+                            painter.line_segment(
+                                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                                egui::Stroke::new(1.0_f32, cor),
+                            );
+                        }
+                        for j in 0..=self.document.height {
+                            let y = rect.top() + j as f32 * zoom;
+                            painter.line_segment(
+                                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                                egui::Stroke::new(1.0_f32, cor),
+                            );
+                        }
+                    }
 
-            // Converte posição de tela em coordenada de pixel do documento.
-            let to_pixel = |pos: egui::Pos2| -> (i32, i32) {
-                let l = pos - rect.min;
-                ((l.x / zoom).floor() as i32, (l.y / zoom).floor() as i32)
-            };
+                    let to_pixel = |pos: egui::Pos2| -> (i32, i32) {
+                        let l = pos - rect.min;
+                        ((l.x / zoom).floor() as i32, (l.y / zoom).floor() as i32)
+                    };
 
-            if self.eyedropper != Eyedropper::Off {
-                if response.clicked() {
-                    if let Some(pointer) = response.interact_pointer_pos() {
-                        let (x, y) = to_pixel(pointer);
-                        let cor = self.cor_no_pixel(x, y);
-                        self.brush_color = to_color32(cor);
-                        if let Eyedropper::ToArea(gi) = self.eyedropper {
-                            if let Some(ci) = self.selected_char {
-                                if ci < self.library.characters.len()
-                                    && gi < self.library.characters[ci].groups.len()
-                                {
-                                    let label = sketchmotion_color::to_hex(cor);
-                                    self.library.characters[ci].groups[gi].add_color(label, cor);
-                                    self.library_dirty = true;
+                    if self.eyedropper != Eyedropper::Off {
+                        if response.clicked() {
+                            if let Some(pointer) = response.interact_pointer_pos() {
+                                let (x, y) = to_pixel(pointer);
+                                let cor = self.cor_no_pixel(x, y);
+                                self.brush_color = to_color32(cor);
+                                if let Eyedropper::ToArea(gi) = self.eyedropper {
+                                    if let Some(ci) = self.selected_char {
+                                        if ci < self.library.characters.len()
+                                            && gi < self.library.characters[ci].groups.len()
+                                        {
+                                            let label = sketchmotion_color::to_hex(cor);
+                                            self.library.characters[ci].groups[gi]
+                                                .add_color(label, cor);
+                                            self.library_dirty = true;
+                                        }
+                                    }
                                 }
+                                self.eyedropper = Eyedropper::Off;
+                                self.tool = Tool::Pencil;
+                                self.status =
+                                    format!("Cor {} capturada", sketchmotion_color::to_hex(cor));
                             }
                         }
-                        self.eyedropper = Eyedropper::Off;
-                        self.tool = Tool::Pencil;
-                        self.status = format!("Cor {} capturada", sketchmotion_color::to_hex(cor));
-                    }
-                }
-                self.last_pos = None;
-            } else if response.is_pointer_button_down_on() || response.dragged() {
-                // Todos os movimentos do ponteiro neste quadro (traço fiel),
-                // já convertidos para coordenada de pixel do documento.
-                let mut pontos: Vec<(i32, i32)> = ui.input(|i| {
-                    i.events
-                        .iter()
-                        .filter_map(|e| {
-                            if let egui::Event::PointerMoved(pos) = e {
-                                Some(to_pixel(*pos))
-                            } else {
-                                None
+                        self.last_pos = None;
+                    } else if response.is_pointer_button_down_on() || response.dragged() {
+                        let mut pontos: Vec<(i32, i32)> = ui.input(|i| {
+                            i.events
+                                .iter()
+                                .filter_map(|e| {
+                                    if let egui::Event::PointerMoved(pos) = e {
+                                        Some(to_pixel(*pos))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        });
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            pontos.push(to_pixel(pos));
+                        }
+                        if self.last_pos.is_none() && !pontos.is_empty() {
+                            self.push_undo();
+                        }
+                        for p in pontos {
+                            match self.last_pos {
+                                Some(prev) => self.paint_line(prev, p),
+                                None => self.paint_dab(p.0, p.1),
                             }
-                        })
-                        .collect()
+                            self.last_pos = Some(p);
+                        }
+                    } else {
+                        self.last_pos = None;
+                    }
                 });
-                if let Some(pos) = response.interact_pointer_pos() {
-                    pontos.push(to_pixel(pos));
-                }
-                if self.last_pos.is_none() && !pontos.is_empty() {
-                    self.push_undo();
-                }
-                for p in pontos {
-                    match self.last_pos {
-                        Some(prev) => self.paint_line(prev, p),
-                        None => self.paint_dab(p.0, p.1),
-                    }
-                    self.last_pos = Some(p);
-                }
-            } else {
-                self.last_pos = None;
-            }
         });
-
-        egui::Area::new(egui::Id::new("undo_redo"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+        let mut do_zoom_in = false;
+        let mut do_zoom_out = false;
+        egui::Area::new(egui::Id::new("acoes_canvas"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-66.0, -16.0))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let can_undo = !self.undo_stack.is_empty();
-                    let can_redo = !self.redo_stack.is_empty();
-                    if ui
-                        .add_enabled(
-                            can_undo,
-                            egui::Button::new(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)
-                                .min_size(egui::vec2(38.0, 38.0)),
-                        )
-                        .on_hover_text("Desfazer (Ctrl+Z)")
-                        .clicked()
-                    {
-                        do_undo = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            can_redo,
-                            egui::Button::new(egui_phosphor::regular::ARROW_CLOCKWISE)
-                                .min_size(egui::vec2(38.0, 38.0)),
-                        )
-                        .on_hover_text("Refazer (Ctrl+Shift+Z)")
-                        .clicked()
-                    {
-                        do_redo = true;
-                    }
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let can_undo = !self.undo_stack.is_empty();
+                        let can_redo = !self.redo_stack.is_empty();
+                        if ui
+                            .add_enabled(
+                                can_undo,
+                                egui::Button::new(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Desfazer (Ctrl+Z)")
+                            .clicked()
+                        {
+                            do_undo = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                can_redo,
+                                egui::Button::new(egui_phosphor::regular::ARROW_CLOCKWISE)
+                                    .min_size(egui::vec2(32.0, 32.0)),
+                            )
+                            .on_hover_text("Refazer (Ctrl+Shift+Z)")
+                            .clicked()
+                        {
+                            do_redo = true;
+                        }
+                        ui.separator();
+                        if ui
+                            .button(egui_phosphor::regular::MAGNIFYING_GLASS_MINUS)
+                            .on_hover_text("Diminuir zoom")
+                            .clicked()
+                        {
+                            do_zoom_out = true;
+                        }
+                        let efetivo = if self.pixel_mode {
+                            self.zoom.round().max(1.0)
+                        } else {
+                            self.zoom
+                        };
+                        ui.label(format!("{}%", (efetivo * 100.0).round() as i32));
+                        if ui
+                            .button(egui_phosphor::regular::MAGNIFYING_GLASS_PLUS)
+                            .on_hover_text("Aumentar zoom")
+                            .clicked()
+                        {
+                            do_zoom_in = true;
+                        }
+                    });
                 });
             });
         if do_undo {
@@ -1327,6 +1360,12 @@ impl eframe::App for SketchMotionApp {
         }
         if do_redo {
             self.redo();
+        }
+        if do_zoom_in {
+            self.zoom = (self.zoom * 1.25).min(64.0);
+        }
+        if do_zoom_out {
+            self.zoom = (self.zoom / 1.25).max(0.1);
         }
 
         if self.library_dirty {
