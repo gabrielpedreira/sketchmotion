@@ -15,6 +15,7 @@ use sketchmotion_tools::Tool;
 
 const CANVAS_W: u32 = 800;
 const CANVAS_H: u32 = 520;
+const MAX_UNDO: usize = 10;
 
 /// Nº de colunas da grade de cores básicas.
 const BASICAS_COLS: usize = 16;
@@ -255,6 +256,8 @@ struct SketchMotionApp {
     home_w: u32,
     home_h: u32,
     home_pixel: bool,
+    undo_stack: Vec<Document>,
+    redo_stack: Vec<Document>,
 }
 
 impl SketchMotionApp {
@@ -301,6 +304,8 @@ impl SketchMotionApp {
             home_w: 800,
             home_h: 520,
             home_pixel: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -311,6 +316,41 @@ impl SketchMotionApp {
 
     fn active_color(&self) -> Color {
         self.tool.effective_color(self.brush_core_color())
+    }
+
+    /// Salva o estado atual no histórico (limitado a MAX_UNDO) e limpa o refazer.
+    fn push_undo(&mut self) {
+        self.undo_stack.push(self.document.clone());
+        if self.undo_stack.len() > MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(self.document.clone());
+            self.document = prev;
+            self.active_layer = self
+                .active_layer
+                .min(self.document.layers.len().saturating_sub(1));
+            self.last_pos = None;
+            self.dirty = true;
+            self.status = "Desfeito".to_owned();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.document.clone());
+            self.document = next;
+            self.active_layer = self
+                .active_layer
+                .min(self.document.layers.len().saturating_sub(1));
+            self.last_pos = None;
+            self.dirty = true;
+            self.status = "Refeito".to_owned();
+        }
     }
 
     /// Cor do documento no pixel (x, y): a da camada se opaca, senão o fundo.
@@ -1063,6 +1103,20 @@ impl eframe::App for SketchMotionApp {
             self.tela_inicial(ctx);
             return;
         }
+        let mut do_undo = false;
+        let mut do_redo = false;
+        ctx.input(|i| {
+            if i.modifiers.command && i.key_pressed(egui::Key::Z) {
+                if i.modifiers.shift {
+                    do_redo = true;
+                } else {
+                    do_undo = true;
+                }
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::Y) {
+                do_redo = true;
+            }
+        });
         if self.dirty || self.texture.is_none() {
             let PixelImage { width, height, rgba } = render_document(&self.document);
             let image =
@@ -1223,6 +1277,9 @@ impl eframe::App for SketchMotionApp {
                 if let Some(pos) = response.interact_pointer_pos() {
                     pontos.push(to_pixel(pos));
                 }
+                if self.last_pos.is_none() && !pontos.is_empty() {
+                    self.push_undo();
+                }
                 for p in pontos {
                     match self.last_pos {
                         Some(prev) => self.paint_line(prev, p),
@@ -1234,6 +1291,43 @@ impl eframe::App for SketchMotionApp {
                 self.last_pos = None;
             }
         });
+
+        egui::Area::new(egui::Id::new("undo_redo"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let can_undo = !self.undo_stack.is_empty();
+                    let can_redo = !self.redo_stack.is_empty();
+                    if ui
+                        .add_enabled(
+                            can_undo,
+                            egui::Button::new(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)
+                                .min_size(egui::vec2(38.0, 38.0)),
+                        )
+                        .on_hover_text("Desfazer (Ctrl+Z)")
+                        .clicked()
+                    {
+                        do_undo = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            can_redo,
+                            egui::Button::new(egui_phosphor::regular::ARROW_CLOCKWISE)
+                                .min_size(egui::vec2(38.0, 38.0)),
+                        )
+                        .on_hover_text("Refazer (Ctrl+Shift+Z)")
+                        .clicked()
+                    {
+                        do_redo = true;
+                    }
+                });
+            });
+        if do_undo {
+            self.undo();
+        }
+        if do_redo {
+            self.redo();
+        }
 
         if self.library_dirty {
             self.salvar_biblioteca();
