@@ -202,6 +202,13 @@ fn seletor_hue(ui: &mut egui::Ui, hsva: &mut egui::ecolor::Hsva, largura: f32, a
 
 /// Estado do conta-gotas: desligado, capturar para o pincel, ou capturar e
 /// adicionar a uma área (índice do grupo) do personagem selecionado.
+/// Tela atual do app: inicial (escolher documento) ou editor.
+#[derive(Clone, Copy, PartialEq)]
+enum Screen {
+    Home,
+    Editor,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Eyedropper {
     Off,
@@ -242,6 +249,12 @@ struct SketchMotionApp {
     win_layers: bool,
     reopen_layers: bool,
     icon_r_layers: Option<egui::Rect>,
+    current_path: Option<std::path::PathBuf>,
+    pixel_mode: bool,
+    screen: Screen,
+    home_w: u32,
+    home_h: u32,
+    home_pixel: bool,
 }
 
 impl SketchMotionApp {
@@ -282,6 +295,12 @@ impl SketchMotionApp {
             win_layers: false,
             reopen_layers: false,
             icon_r_layers: None,
+            current_path: None,
+            pixel_mode: false,
+            screen: Screen::Home,
+            home_w: 800,
+            home_h: 520,
+            home_pixel: false,
         }
     }
 
@@ -324,15 +343,30 @@ impl SketchMotionApp {
         let color = self.active_color();
         let r = self.brush_radius;
         let li = self.active_layer;
+        let pixel = self.pixel_mode;
         let mut pintou = false;
         if let Some(layer) = self.document.layer_mut(li) {
             if !layer.locked {
-                for dy in -r..=r {
-                    for dx in -r..=r {
-                        if dx * dx + dy * dy <= r * r {
-                            let (px, py) = (x + dx, y + dy);
+                if pixel {
+                    // Pixel art: quadrado de lado `r` células, encaixado no grid.
+                    let half = (r - 1) / 2;
+                    for dy in 0..r {
+                        for dx in 0..r {
+                            let px = x + dx - half;
+                            let py = y + dy - half;
                             if px >= 0 && py >= 0 {
                                 layer.set_pixel(px as u32, py as u32, color);
+                            }
+                        }
+                    }
+                } else {
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            if dx * dx + dy * dy <= r * r {
+                                let (px, py) = (x + dx, y + dy);
+                                if px >= 0 && py >= 0 {
+                                    layer.set_pixel(px as u32, py as u32, color);
+                                }
                             }
                         }
                     }
@@ -357,20 +391,70 @@ impl SketchMotionApp {
         }
     }
 
+    /// Cria um documento novo em branco (w x h). `pixel` marca o modo pixel art
+    /// (comportamento específico virá com o painel de configuração).
+    fn novo_documento(&mut self, w: u32, h: u32, pixel: bool) {
+        self.document = Document::new(w, h, Color::WHITE);
+        self.active_layer = 0;
+        self.last_pos = None;
+        self.current_path = None;
+        self.pixel_mode = pixel;
+        self.dirty = true;
+        self.status = if pixel {
+            format!("Novo documento pixel art {w}x{h}")
+        } else {
+            format!("Novo documento {w}x{h}")
+        };
+    }
+
     fn salvar(&mut self) {
+        if let Some(path) = self.current_path.clone() {
+            self.status = match sketchmotion_io::save(&self.document, &path) {
+                Ok(()) => format!("Salvo em {}", path.display()),
+                Err(e) => format!("Erro ao salvar: {e}"),
+            };
+        } else {
+            self.salvar_como();
+        }
+    }
+
+    fn salvar_como(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
             .set_file_name("desenho.sketchmotion")
             .save_file()
         {
-            self.status = match sketchmotion_io::save(&self.document, &path) {
-                Ok(()) => format!("Salvo em {}", path.display()),
-                Err(e) => format!("Erro ao salvar: {e}"),
+            match sketchmotion_io::save(&self.document, &path) {
+                Ok(()) => {
+                    self.status = format!("Salvo em {}", path.display());
+                    self.current_path = Some(path);
+                }
+                Err(e) => self.status = format!("Erro ao salvar: {e}"),
+            }
+        }
+    }
+
+    fn exportar(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG", &["png"])
+            .add_filter("JPEG", &["jpg", "jpeg"])
+            .set_file_name("desenho.png")
+            .save_file()
+        {
+            let img = render_document(&self.document);
+            self.status = match sketchmotion_io::export_png(
+                img.width as u32,
+                img.height as u32,
+                &img.rgba,
+                &path,
+            ) {
+                Ok(()) => format!("Exportado: {}", path.display()),
+                Err(e) => format!("Erro ao exportar: {e}"),
             };
         }
     }
 
-    fn abrir(&mut self) {
+    fn abrir(&mut self) -> bool {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
             .pick_file()
@@ -378,13 +462,17 @@ impl SketchMotionApp {
             match sketchmotion_io::load(&path) {
                 Ok(doc) => {
                     self.document = doc;
+                    self.active_layer = 0;
                     self.last_pos = None;
                     self.dirty = true;
+                    self.current_path = Some(path.clone());
                     self.status = format!("Aberto: {}", path.display());
+                    return true;
                 }
                 Err(e) => self.status = format!("Erro ao abrir: {e}"),
             }
         }
+        false
     }
 
     fn salvar_biblioteca(&mut self) {
@@ -904,10 +992,77 @@ impl SketchMotionApp {
         self.reopen_layers = false;
         self.win_layers = open;
     }
+
+    /// Tela inicial: escolher o tamanho do documento (presets ou personalizado),
+    /// marcar se é pixel art, e então entrar no editor.
+    fn tela_inicial(&mut self, ctx: &egui::Context) {
+        let mut criar: Option<(u32, u32, bool)> = None;
+        let mut abrir = false;
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("SketchMotion");
+                ui.label("Crie um novo documento ou abra um existente.");
+            });
+            ui.add_space(20.0);
+
+            ui.label("Criar um novo arquivo:");
+            ui.add_space(6.0);
+            let presets = [
+                ("Ilustração", 800u32, 520u32, false),
+                ("Quadrado", 1024, 1024, false),
+                ("HD 1920x1080", 1920, 1080, false),
+                ("Pixel art 32", 32, 32, true),
+                ("Pixel art 64", 64, 64, true),
+                ("Pixel art 128", 128, 128, true),
+            ];
+            ui.horizontal_wrapped(|ui| {
+                for (nome, w, h, px) in presets {
+                    let texto = format!("{nome}\n{w} x {h} px");
+                    if ui.add_sized([150.0, 84.0], egui::Button::new(texto)).clicked() {
+                        criar = Some((w, h, px));
+                    }
+                }
+            });
+
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label("Tamanho personalizado:");
+            ui.horizontal(|ui| {
+                ui.label("Largura");
+                ui.add(egui::DragValue::new(&mut self.home_w).range(1..=8192));
+                ui.label("Altura");
+                ui.add(egui::DragValue::new(&mut self.home_h).range(1..=8192));
+                ui.checkbox(&mut self.home_pixel, "Pixel art");
+                if ui.button("Criar").clicked() {
+                    criar = Some((self.home_w, self.home_h, self.home_pixel));
+                }
+            });
+
+            ui.add_space(16.0);
+            if ui.button("Abrir arquivo existente...").clicked() {
+                abrir = true;
+            }
+        });
+
+        if let Some((w, h, px)) = criar {
+            self.novo_documento(w, h, px);
+            self.screen = Screen::Editor;
+        }
+        if abrir && self.abrir() {
+            self.screen = Screen::Editor;
+        }
+    }
 }
 
 impl eframe::App for SketchMotionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.screen == Screen::Home {
+            self.tela_inicial(ctx);
+            return;
+        }
         if self.dirty || self.texture.is_none() {
             let PixelImage { width, height, rgba } = render_document(&self.document);
             let image =
@@ -922,24 +1077,59 @@ impl eframe::App for SketchMotionApp {
             self.dirty = false;
         }
         let tex_id = self.texture.as_ref().unwrap().id();
-        let size = egui::vec2(self.document.width as f32, self.document.height as f32);
 
+        let mut a_novo = false;
+        let mut a_abrir = false;
+        let mut a_salvar = false;
+        let mut a_salvar_como = false;
+        let mut a_exportar = false;
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong("SketchMotion");
-                ui.separator();
-                if ui.button("Salvar").clicked() {
-                    self.salvar();
-                }
-                if ui.button("Abrir").clicked() {
-                    self.abrir();
-                }
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("Arquivo", |ui| {
+                    if ui.button("Novo...").clicked() {
+                        a_novo = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Abrir...").clicked() {
+                        a_abrir = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Salvar").clicked() {
+                        a_salvar = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Salvar como...").clicked() {
+                        a_salvar_como = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Exportar...").clicked() {
+                        a_exportar = true;
+                        ui.close_menu();
+                    }
+                });
                 if !self.status.is_empty() {
                     ui.separator();
                     ui.label(&self.status);
                 }
             });
         });
+        if a_novo {
+            self.screen = Screen::Home;
+        }
+        if a_abrir {
+            self.abrir();
+        }
+        if a_salvar {
+            self.salvar();
+        }
+        if a_salvar_como {
+            self.salvar_como();
+        }
+        if a_exportar {
+            self.exportar();
+        }
 
         // Barra de ícones (sempre visível) e janelas de ferramenta (flutuantes).
         self.barra_icones(ctx);
@@ -949,17 +1139,54 @@ impl eframe::App for SketchMotionApp {
         self.janela_camadas(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            let doc_w = self.document.width as f32;
+            let doc_h = self.document.height as f32;
+            // Escala inteira: no pixel art, amplia para caber na área (nearest);
+            // no modo ilustração, 1:1.
+            let zoom = if self.pixel_mode {
+                let avail = ui.available_size();
+                ((avail.x / doc_w).min(avail.y / doc_h)).floor().max(1.0)
+            } else {
+                1.0
+            };
+            let size = egui::vec2(doc_w * zoom, doc_h * zoom);
             let image = egui::Image::from_texture(egui::load::SizedTexture::new(tex_id, size))
                 .fit_to_exact_size(size)
                 .sense(egui::Sense::click_and_drag());
             let response = ui.add(image);
+            let rect = response.rect;
+
+            // Grade guia (pixel art), só quando o zoom deixa legível.
+            if self.pixel_mode && zoom >= 6.0 {
+                let painter = ui.painter_at(rect);
+                let cor = egui::Color32::from_rgba_unmultiplied(120, 120, 120, 90);
+                for i in 0..=self.document.width {
+                    let x = rect.left() + i as f32 * zoom;
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(1.0_f32, cor),
+                    );
+                }
+                for j in 0..=self.document.height {
+                    let y = rect.top() + j as f32 * zoom;
+                    painter.line_segment(
+                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        egui::Stroke::new(1.0_f32, cor),
+                    );
+                }
+            }
+
+            // Converte posição de tela em coordenada de pixel do documento.
+            let to_pixel = |pos: egui::Pos2| -> (i32, i32) {
+                let l = pos - rect.min;
+                ((l.x / zoom).floor() as i32, (l.y / zoom).floor() as i32)
+            };
 
             if self.eyedropper != Eyedropper::Off {
                 if response.clicked() {
                     if let Some(pointer) = response.interact_pointer_pos() {
-                        let local = pointer - response.rect.min;
-                        let cor =
-                            self.cor_no_pixel(local.x.round() as i32, local.y.round() as i32);
+                        let (x, y) = to_pixel(pointer);
+                        let cor = self.cor_no_pixel(x, y);
                         self.brush_color = to_color32(cor);
                         if let Eyedropper::ToArea(gi) = self.eyedropper {
                             if let Some(ci) = self.selected_char {
@@ -979,16 +1206,14 @@ impl eframe::App for SketchMotionApp {
                 }
                 self.last_pos = None;
             } else if response.is_pointer_button_down_on() || response.dragged() {
-                let rect_min = response.rect.min;
-                // Coleta TODOS os movimentos do ponteiro neste quadro (não só a
-                // posição final), para o traço acompanhar movimentos rápidos.
+                // Todos os movimentos do ponteiro neste quadro (traço fiel),
+                // já convertidos para coordenada de pixel do documento.
                 let mut pontos: Vec<(i32, i32)> = ui.input(|i| {
                     i.events
                         .iter()
                         .filter_map(|e| {
                             if let egui::Event::PointerMoved(pos) = e {
-                                let l = *pos - rect_min;
-                                Some((l.x.round() as i32, l.y.round() as i32))
+                                Some(to_pixel(*pos))
                             } else {
                                 None
                             }
@@ -996,8 +1221,7 @@ impl eframe::App for SketchMotionApp {
                         .collect()
                 });
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let l = pos - rect_min;
-                    pontos.push((l.x.round() as i32, l.y.round() as i32));
+                    pontos.push(to_pixel(pos));
                 }
                 for p in pontos {
                     match self.last_pos {

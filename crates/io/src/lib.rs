@@ -56,6 +56,18 @@ pub fn load_library(path: &Path) -> Result<PaletteLibrary, String> {
     ciborium::from_reader(BufReader::new(file)).map_err(|e| e.to_string())
 }
 
+/// Exporta um buffer RGBA como imagem (PNG/JPEG conforme a extensão do caminho).
+pub fn export_png(width: u32, height: u32, rgba: &[u8], path: &Path) -> Result<(), String> {
+    image::save_buffer(
+        path,
+        rgba,
+        width,
+        height,
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
