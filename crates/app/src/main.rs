@@ -200,6 +200,15 @@ fn seletor_hue(ui: &mut egui::Ui, hsva: &mut egui::ecolor::Hsva, largura: f32, a
     changed
 }
 
+/// Estado do conta-gotas: desligado, capturar para o pincel, ou capturar e
+/// adicionar a uma área (índice do grupo) do personagem selecionado.
+#[derive(Clone, Copy, PartialEq)]
+enum Eyedropper {
+    Off,
+    ToBrush,
+    ToArea(usize),
+}
+
 struct SketchMotionApp {
     document: Document,
     texture: Option<egui::TextureHandle>,
@@ -222,10 +231,13 @@ struct SketchMotionApp {
     selected_char: Option<usize>,
     new_char_name: String,
     new_group_name: String,
-    new_color_label: String,
     icon_r_tools: Option<egui::Rect>,
     icon_r_color: Option<egui::Rect>,
     icon_r_palette: Option<egui::Rect>,
+    reopen_tools: bool,
+    reopen_color: bool,
+    reopen_palette: bool,
+    eyedropper: Eyedropper,
 }
 
 impl SketchMotionApp {
@@ -255,10 +267,13 @@ impl SketchMotionApp {
             selected_char,
             new_char_name: String::new(),
             new_group_name: String::new(),
-            new_color_label: String::new(),
             icon_r_tools: None,
             icon_r_color: None,
             icon_r_palette: None,
+            reopen_tools: false,
+            reopen_color: false,
+            reopen_palette: false,
+            eyedropper: Eyedropper::Off,
         }
     }
 
@@ -269,6 +284,20 @@ impl SketchMotionApp {
 
     fn active_color(&self) -> Color {
         self.tool.effective_color(self.brush_core_color())
+    }
+
+    /// Cor do documento no pixel (x, y): a da camada se opaca, senão o fundo.
+    fn cor_no_pixel(&self, x: i32, y: i32) -> Color {
+        if x >= 0 && y >= 0 {
+            if let Some(layer) = self.document.layer(0) {
+                if let Some(px) = layer.get_pixel(x as u32, y as u32) {
+                    if px.a > 0 {
+                        return px;
+                    }
+                }
+            }
+        }
+        self.document.background
     }
 
     fn paint_dab(&mut self, x: i32, y: i32) {
@@ -353,6 +382,9 @@ impl SketchMotionApp {
                     self.icon_r_tools = Some(resp_t.rect);
                     if resp_t.clicked() {
                         self.win_tools = !self.win_tools;
+                        if self.win_tools {
+                            self.reopen_tools = true;
+                        }
                     }
                     ui.add_space(6.0);
 
@@ -361,6 +393,9 @@ impl SketchMotionApp {
                     self.icon_r_color = Some(resp_c.rect);
                     if resp_c.clicked() {
                         self.win_color = !self.win_color;
+                        if self.win_color {
+                            self.reopen_color = true;
+                        }
                     }
                     ui.add_space(6.0);
 
@@ -369,6 +404,9 @@ impl SketchMotionApp {
                     self.icon_r_palette = Some(resp_p.rect);
                     if resp_p.clicked() {
                         self.win_palette = !self.win_palette;
+                        if self.win_palette {
+                            self.reopen_palette = true;
+                        }
                     }
                 });
             });
@@ -381,9 +419,9 @@ impl SketchMotionApp {
             .open(&mut open)
             .default_width(220.0);
         if let Some(r) = self.icon_r_tools {
-            win = win
-                .default_pos(egui::pos2(r.left() - 8.0, r.top()))
-                .pivot(egui::Align2::RIGHT_TOP);
+            let pos = egui::pos2(r.left() - 8.0, r.top());
+            win = win.pivot(egui::Align2::RIGHT_TOP);
+            win = if self.reopen_tools { win.current_pos(pos) } else { win.default_pos(pos) };
         }
         win.show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -397,6 +435,7 @@ impl SketchMotionApp {
                     self.dirty = true;
                 }
             });
+        self.reopen_tools = false;
         self.win_tools = open;
     }
 
@@ -410,9 +449,9 @@ impl SketchMotionApp {
             .open(&mut open)
             .default_width(560.0);
         if let Some(r) = self.icon_r_color {
-            win = win
-                .default_pos(egui::pos2(r.left() - 8.0, r.top()))
-                .pivot(egui::Align2::RIGHT_TOP);
+            let pos = egui::pos2(r.left() - 8.0, r.top());
+            win = win.pivot(egui::Align2::RIGHT_TOP);
+            win = if self.reopen_color { win.current_pos(pos) } else { win.default_pos(pos) };
         }
         win.show(ctx, |ui| {
                 // Ressincroniza o HSV se a cor mudou por outra via (paleta, hex...).
@@ -460,6 +499,13 @@ impl SketchMotionApp {
                         3.0,
                         egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
                     );
+                    if ui
+                        .button(egui_phosphor::regular::EYEDROPPER)
+                        .on_hover_text("Conta-gotas: capturar cor do canvas")
+                        .clicked()
+                    {
+                        self.eyedropper = Eyedropper::ToBrush;
+                    }
                 });
                 ui.separator();
                 ui.label("Cores básicas:");
@@ -494,6 +540,7 @@ impl SketchMotionApp {
             self.brush_color = c;
             self.tool = Tool::Pencil;
         }
+        self.reopen_color = false;
         self.win_color = open;
     }
 
@@ -504,140 +551,172 @@ impl SketchMotionApp {
 
         let mut pick: Option<Color> = None;
         let mut remove_group: Option<usize> = None;
-        let mut add_to_group: Option<(usize, String)> = None;
+        let mut add_to_group: Option<usize> = None;
+        let mut remove_color: Option<(usize, usize)> = None;
         let mut remove_char = false;
 
         let mut win = egui::Window::new("Paleta personalizada")
             .open(&mut open)
-            .default_width(380.0);
+            .default_width(400.0);
         if let Some(r) = self.icon_r_palette {
-            win = win
-                .default_pos(egui::pos2(r.left() - 8.0, r.top()))
-                .pivot(egui::Align2::RIGHT_TOP);
+            let pos = egui::pos2(r.left() - 8.0, r.top());
+            win = win.pivot(egui::Align2::RIGHT_TOP);
+            win = if self.reopen_palette { win.current_pos(pos) } else { win.default_pos(pos) };
         }
         win.show(ctx, |ui| {
-                // Abas de personagem
-                ui.horizontal_wrapped(|ui| {
-                    for (i, c) in self.library.characters.iter().enumerate() {
-                        if ui
-                            .selectable_label(self.selected_char == Some(i), c.name.clone())
-                            .clicked()
-                        {
-                            self.selected_char = Some(i);
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_char_name)
-                            .desired_width(150.0)
-                            .hint_text("Novo personagem"),
-                    );
-                    if ui.button("+ personagem").clicked() && !self.new_char_name.trim().is_empty()
+            // Abas de personagem
+            ui.horizontal_wrapped(|ui| {
+                for (i, c) in self.library.characters.iter().enumerate() {
+                    let sel = self.selected_char == Some(i);
+                    if ui
+                        .selectable_label(sel, egui::RichText::new(&c.name).size(15.0).strong())
+                        .clicked()
                     {
-                        let idx = self.library.add_character(self.new_char_name.trim());
-                        self.selected_char = Some(idx);
-                        self.new_char_name.clear();
-                        self.library_dirty = true;
+                        self.selected_char = Some(i);
                     }
-                });
-
-                if self.library.characters.is_empty() {
-                    ui.label("Nenhum personagem ainda — crie um acima.");
-                    return;
                 }
-                let Some(ci) = self.selected_char else {
-                    return;
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_char_name)
+                        .desired_width(110.0)
+                        .hint_text("novo personagem"),
+                );
+                if ui.button("+").clicked() && !self.new_char_name.trim().is_empty() {
+                    let idx = self.library.add_character(self.new_char_name.trim());
+                    self.selected_char = Some(idx);
+                    self.new_char_name.clear();
+                    self.library_dirty = true;
+                }
+            });
+            ui.separator();
+
+            if self.library.characters.is_empty() {
+                ui.label("Crie um personagem acima.");
+                return;
+            }
+            let Some(ci) = self.selected_char else {
+                return;
+            };
+            if ci >= self.library.characters.len() {
+                return;
+            }
+
+            // Lista de áreas: cada uma numa faixa (nome + cores em fila).
+            for (gi, group) in self.library.characters[ci].groups.iter().enumerate() {
+                let full_w = ui.available_width();
+                let (row, resp) =
+                    ui.allocate_exact_size(egui::vec2(full_w, 32.0), egui::Sense::click());
+                let click = if resp.clicked() {
+                    resp.interact_pointer_pos()
+                } else {
+                    None
                 };
-                if ci >= self.library.characters.len() {
-                    return;
-                }
-
-                ui.horizontal(|ui| {
-                    if ui.small_button("remover personagem").clicked() {
-                        remove_char = true;
-                    }
-                });
-                ui.separator();
-
-                // Uma linha por área: rótulo + amostras em fila
-                for (gi, group) in self.library.characters[ci].groups.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(84.0, 26.0), egui::Sense::hover());
-                        ui.painter()
-                            .rect_filled(rect, 3.0, egui::Color32::from_rgb(0x3A, 0x52, 0x6B));
-                        ui.painter().text(
-                            rect.left_center() + egui::vec2(6.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            &group.name,
-                            egui::FontId::proportional(13.0),
-                            egui::Color32::WHITE,
-                        );
-                        for nc in &group.colors {
-                            let (r, resp) = ui
-                                .allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
-                            ui.painter().rect_filled(r, 2.0, to_color32(nc.color));
-                            ui.painter().rect_stroke(
-                                r,
-                                2.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-                            );
-                            if resp
-                                .on_hover_text(format!(
-                                    "{} {}",
-                                    nc.label,
-                                    sketchmotion_color::to_hex(nc.color)
-                                ))
-                                .clicked()
-                            {
+                let rclick = if resp.secondary_clicked() {
+                    resp.interact_pointer_pos()
+                } else {
+                    None
+                };
+                {
+                    let p = ui.painter();
+                    p.rect_filled(row, 4.0, egui::Color32::from_rgb(0x5A, 0x70, 0x88));
+                    p.text(
+                        row.left_center() + egui::vec2(10.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        &group.name,
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::WHITE,
+                    );
+                    let sw = 24.0;
+                    let gap = 3.0;
+                    let mut x = row.left() + 100.0;
+                    let cy = row.center().y - sw / 2.0;
+                    for (idx, nc) in group.colors.iter().enumerate() {
+                        let cell = egui::Rect::from_min_size(egui::pos2(x, cy), egui::vec2(sw, sw));
+                        p.rect_filled(cell, 2.0, to_color32(nc.color));
+                        p.rect_stroke(cell, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(35)));
+                        if let Some(cp) = click {
+                            if cell.contains(cp) {
                                 pick = Some(nc.color);
                             }
                         }
-                        if ui.small_button("x").clicked() {
+                        if let Some(cp) = rclick {
+                            if cell.contains(cp) {
+                                remove_color = Some((gi, idx));
+                            }
+                        }
+                        x += sw + gap;
+                    }
+                    // conta-gotas: captura uma cor do canvas e adiciona à área
+                    let eye_c = egui::pos2(row.right() - 86.0, row.center().y);
+                    p.text(
+                        eye_c,
+                        egui::Align2::CENTER_CENTER,
+                        egui_phosphor::regular::EYEDROPPER,
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::WHITE,
+                    );
+                    // "+" adiciona a cor atual à área
+                    let add_c = egui::pos2(row.right() - 54.0, row.center().y);
+                    p.circle_stroke(add_c, 9.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                    p.text(
+                        add_c,
+                        egui::Align2::CENTER_CENTER,
+                        "+",
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::WHITE,
+                    );
+                    // lixeira: remove a área inteira
+                    let del_c = egui::pos2(row.right() - 22.0, row.center().y);
+                    p.text(
+                        del_c,
+                        egui::Align2::CENTER_CENTER,
+                        egui_phosphor::regular::TRASH,
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::from_gray(235),
+                    );
+                    if let Some(cp) = click {
+                        if cp.distance(eye_c) <= 12.0 {
+                            self.eyedropper = Eyedropper::ToArea(gi);
+                        } else if cp.distance(add_c) <= 11.0 {
+                            add_to_group = Some(gi);
+                        } else if cp.distance(del_c) <= 12.0 {
                             remove_group = Some(gi);
                         }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(86.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.new_color_label)
-                                .desired_width(90.0)
-                                .hint_text("rótulo"),
-                        );
-                        if ui.small_button("+ cor atual").clicked() {
-                            let label = if self.new_color_label.trim().is_empty() {
-                                "cor".to_owned()
-                            } else {
-                                self.new_color_label.trim().to_owned()
-                            };
-                            add_to_group = Some((gi, label));
-                        }
-                    });
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_group_name)
-                            .desired_width(150.0)
-                            .hint_text("Nova área: Pele..."),
-                    );
-                    if ui.button("+ área").clicked() && !self.new_group_name.trim().is_empty() {
-                        self.library.characters[ci].add_group(self.new_group_name.trim());
-                        self.new_group_name.clear();
-                        self.library_dirty = true;
                     }
-                });
+                }
+                ui.add_space(5.0);
+            }
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_group_name)
+                        .desired_width(150.0)
+                        .hint_text("Nova área: Pele..."),
+                );
+                if ui.button("+ área").clicked() && !self.new_group_name.trim().is_empty() {
+                    self.library.characters[ci].add_group(self.new_group_name.trim());
+                    self.new_group_name.clear();
+                    self.library_dirty = true;
+                }
             });
+            if ui.small_button("remover personagem").clicked() {
+                remove_char = true;
+            }
+        });
 
         // Ações adiadas
         if let Some(ci) = self.selected_char {
             if ci < self.library.characters.len() {
-                if let Some((gi, label)) = add_to_group {
+                if let Some(gi) = add_to_group {
                     if gi < self.library.characters[ci].groups.len() {
+                        let label = sketchmotion_color::to_hex(current);
                         self.library.characters[ci].groups[gi].add_color(label, current);
-                        self.new_color_label.clear();
+                        self.library_dirty = true;
+                    }
+                }
+                if let Some((gi, idx)) = remove_color {
+                    if gi < self.library.characters[ci].groups.len() {
+                        self.library.characters[ci].groups[gi].remove_color(idx);
                         self.library_dirty = true;
                     }
                 }
@@ -658,6 +737,7 @@ impl SketchMotionApp {
             self.tool = Tool::Pencil;
             self.status = format!("Cor {} da paleta", sketchmotion_color::to_hex(c));
         }
+        self.reopen_palette = false;
         self.win_palette = open;
     }
 }
@@ -709,7 +789,31 @@ impl eframe::App for SketchMotionApp {
                 .sense(egui::Sense::click_and_drag());
             let response = ui.add(image);
 
-            if let Some(pointer) = response.interact_pointer_pos() {
+            if self.eyedropper != Eyedropper::Off {
+                if response.clicked() {
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let local = pointer - response.rect.min;
+                        let cor =
+                            self.cor_no_pixel(local.x.round() as i32, local.y.round() as i32);
+                        self.brush_color = to_color32(cor);
+                        if let Eyedropper::ToArea(gi) = self.eyedropper {
+                            if let Some(ci) = self.selected_char {
+                                if ci < self.library.characters.len()
+                                    && gi < self.library.characters[ci].groups.len()
+                                {
+                                    let label = sketchmotion_color::to_hex(cor);
+                                    self.library.characters[ci].groups[gi].add_color(label, cor);
+                                    self.library_dirty = true;
+                                }
+                            }
+                        }
+                        self.eyedropper = Eyedropper::Off;
+                        self.tool = Tool::Pencil;
+                        self.status = format!("Cor {} capturada", sketchmotion_color::to_hex(cor));
+                    }
+                }
+                self.last_pos = None;
+            } else if let Some(pointer) = response.interact_pointer_pos() {
                 let local = pointer - response.rect.min;
                 let p = (local.x.round() as i32, local.y.round() as i32);
                 match self.last_pos {
