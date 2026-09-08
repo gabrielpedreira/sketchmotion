@@ -84,3 +84,27 @@ etapa dedicada (cada uma é um módulo/estado próprio no crate `tools`):
 
 Ordem sugerida quando forem implementadas: Seleção (mover) → Varinha mágica →
 Caneta → Seleção direta → Texto.
+
+## Fila do sistema vetorial / animação (pedidos do Gabriel)
+Ordem sugerida, cada um em fatia validada:
+
+1. (feito) Caneta com curvas bézier (clique-arrasta cria alças).
+2. (feito) Redimensionar objeto pelas alças da seleção.
+3. Ferramenta Formas geométricas: botão na barra esquerda; no topo escolher
+   quadrado, triângulo, círculo, polígono N lados; espessura do traço e cor de
+   preenchimento. Cria objeto vetorial (com fill).
+4. Ferramenta Preencher (balde), igual ao Paint: flood fill do interior no
+   raster; em forma vetorial fechada, pinta o interior.
+5. Seleção de traços a PINCEL (raster): decidir abordagem — seleção retangular
+   estilo Paint (recorta/flutua a região e permite mover/escalar) — já que
+   pixels não são "objetos". Definir com o Gabriel.
+6. Rotacionar o objeto selecionado (além de escalar).
+7. Seleção direta: arrastar cada ponto-âncora e as alças.
+8. FRAMES / animação:
+   - Timeline embaixo com frames selecionáveis (miniaturas), painel principal
+     mostra o frame atual.
+   - Botão de avançar a lista (mostra ~5 por vez, rola até N).
+   - Onion skin: ao ativar animação, o frame anterior aparece a ~30% no atual.
+   - Play: abre a tela de reprodução com FPS/tempo configuráveis.
+   Requer modelo de frames no core (cada frame = conjunto de camadas/vetores).
+9. Cursor personalizado por ferramenta (imagem/emoji do cursor).

@@ -74,6 +74,50 @@ fn dist_point_seg(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
+/// As 8 alças da caixa de seleção, na ordem canônica.
+fn handle_positions(r: egui::Rect) -> [egui::Pos2; 8] {
+    [
+        r.left_top(),
+        r.center_top(),
+        r.right_top(),
+        r.right_center(),
+        r.right_bottom(),
+        r.center_bottom(),
+        r.left_bottom(),
+        r.left_center(),
+    ]
+}
+
+/// Para a alça `hi`: ponto agarrado, ponto fixo (oposto) e quais eixos escalam.
+fn handle_geometry(
+    hi: usize,
+    minx: f32,
+    miny: f32,
+    maxx: f32,
+    maxy: f32,
+    cx: f32,
+    cy: f32,
+) -> ((f32, f32), (f32, f32), (bool, bool)) {
+    match hi {
+        0 => ((minx, miny), (maxx, maxy), (true, true)),
+        1 => ((cx, miny), (cx, maxy), (false, true)),
+        2 => ((maxx, miny), (minx, maxy), (true, true)),
+        3 => ((maxx, cy), (minx, cy), (true, false)),
+        4 => ((maxx, maxy), (minx, miny), (true, true)),
+        5 => ((cx, maxy), (cx, miny), (false, true)),
+        6 => ((minx, maxy), (maxx, miny), (true, true)),
+        _ => ((minx, cy), (maxx, cy), (true, false)),
+    }
+}
+
+fn safe_ratio(num: f32, den: f32) -> f32 {
+    if den.abs() < 1e-4 {
+        1.0
+    } else {
+        num / den
+    }
+}
+
 /// Gera a grade de cores básicas: uma linha de tons de cinza + linhas de
 /// matizes em variações de saturação/valor (primárias, secundárias,
 /// terciárias e suas variações claras/escuras).
@@ -299,8 +343,15 @@ struct SketchMotionApp {
     pen_width: i32,
     // estado vetorial
     selected_obj: Option<usize>,
-    pen_points: Vec<(f32, f32)>,
+    pen_anchors: Vec<Anchor>,
+    pen_drag_idx: Option<usize>,
     dragging_obj: bool,
+    // redimensionamento pelas alças da seleção
+    resize_handle: Option<usize>,
+    resize_orig: Vec<Anchor>,
+    resize_fixed: (f32, f32),
+    resize_grab: (f32, f32),
+    resize_axes: (bool, bool),
 }
 
 impl SketchMotionApp {
@@ -356,8 +407,14 @@ impl SketchMotionApp {
             wand_tolerance: 32,
             pen_width: 2,
             selected_obj: None,
-            pen_points: Vec::new(),
+            pen_anchors: Vec::new(),
+            pen_drag_idx: None,
             dragging_obj: false,
+            resize_handle: None,
+            resize_orig: Vec::new(),
+            resize_fixed: (0.0, 0.0),
+            resize_grab: (0.0, 0.0),
+            resize_axes: (true, true),
         }
     }
 
@@ -583,19 +640,16 @@ impl SketchMotionApp {
     /// Barra direita de ícones (uma ferramenta por ícone).
     /// Finaliza o traço da Caneta, criando um objeto vetorial.
     fn finalizar_caneta(&mut self) {
-        if self.pen_points.len() >= 2 {
+        if self.pen_anchors.len() >= 2 {
             self.push_undo();
             let mut obj = VectorObject::new(self.brush_core_color(), self.pen_width as f32);
-            obj.points = self
-                .pen_points
-                .iter()
-                .map(|(x, y)| Anchor::new(*x, *y))
-                .collect();
+            obj.points = self.pen_anchors.clone();
             self.document.vectors.push(obj);
             self.selected_obj = Some(self.document.vectors.len() - 1);
             self.status = "Traço vetorial criado".into();
         }
-        self.pen_points.clear();
+        self.pen_anchors.clear();
+        self.pen_drag_idx = None;
         self.dirty = true;
     }
 
@@ -605,13 +659,13 @@ impl SketchMotionApp {
         let (px, py) = ponto;
         let mut best: Option<(usize, f32)> = None;
         for (i, obj) in self.document.vectors.iter().enumerate() {
+            let flat = obj.flatten(20);
             let mut dmin = f32::INFINITY;
-            if obj.points.len() == 1 {
-                let a = &obj.points[0];
-                dmin = ((a.x - px).powi(2) + (a.y - py).powi(2)).sqrt();
+            if flat.len() == 1 {
+                dmin = ((flat[0].0 - px).powi(2) + (flat[0].1 - py).powi(2)).sqrt();
             } else {
-                for w in obj.points.windows(2) {
-                    let d = dist_point_seg(px, py, w[0].x, w[0].y, w[1].x, w[1].y);
+                for w in flat.windows(2) {
+                    let d = dist_point_seg(px, py, w[0].0, w[0].1, w[1].0, w[1].1);
                     if d < dmin {
                         dmin = d;
                     }
@@ -625,8 +679,8 @@ impl SketchMotionApp {
         best.map(|(i, _)| i)
     }
 
-    /// Desenha os objetos vetoriais, a caixa de seleção e o traço em progresso
-    /// como overlay sobre o canvas (coordenadas do documento -> tela).
+    /// Desenha os objetos vetoriais (curvas), a caixa/alças de seleção e o
+    /// traço em progresso da Caneta, como overlay sobre o canvas.
     fn desenhar_vetores(&self, ui: &egui::Ui, rect: egui::Rect, zoom: f32) {
         let painter = ui.painter_at(rect);
         let sp = |x: f32, y: f32| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom);
@@ -634,9 +688,9 @@ impl SketchMotionApp {
         for (idx, obj) in self.document.vectors.iter().enumerate() {
             let col = to_color32(obj.stroke).linear_multiply(obj.opacity.clamp(0.0, 1.0));
             let w = (obj.stroke_width * zoom).max(1.0);
-            let pts: Vec<egui::Pos2> = obj.points.iter().map(|a| sp(a.x, a.y)).collect();
+            let pts: Vec<egui::Pos2> = obj.flatten(24).iter().map(|(x, y)| sp(*x, *y)).collect();
             if pts.len() >= 2 {
-                painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(w, col)));
+                painter.add(egui::Shape::line(pts, egui::Stroke::new(w, col)));
             } else if pts.len() == 1 {
                 painter.circle_filled(pts[0], (w / 2.0).max(1.5), col);
             }
@@ -644,37 +698,42 @@ impl SketchMotionApp {
                 if let Some((minx, miny, maxx, maxy)) = obj.bounds() {
                     let r = egui::Rect::from_min_max(sp(minx, miny), sp(maxx, maxy)).expand(3.0);
                     painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0_f32, azul));
-                    for c in [
-                        r.left_top(),
-                        r.center_top(),
-                        r.right_top(),
-                        r.right_center(),
-                        r.right_bottom(),
-                        r.center_bottom(),
-                        r.left_bottom(),
-                        r.left_center(),
-                    ] {
-                        let h = egui::Rect::from_center_size(c, egui::vec2(7.0, 7.0));
+                    for c in handle_positions(r) {
+                        let h = egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0));
                         painter.rect_filled(h, 0.0, egui::Color32::WHITE);
                         painter.rect_stroke(h, 0.0, egui::Stroke::new(1.0_f32, azul));
                     }
                 }
             }
         }
-        if self.tool == Tool::Pen && !self.pen_points.is_empty() {
-            let pts: Vec<egui::Pos2> = self.pen_points.iter().map(|(x, y)| sp(*x, *y)).collect();
+        // Traço em progresso da Caneta: curva + âncoras + alças bézier.
+        if self.tool == Tool::Pen && !self.pen_anchors.is_empty() {
+            let mut temp = VectorObject::new(self.brush_core_color(), self.pen_width as f32);
+            temp.points = self.pen_anchors.clone();
+            let pts: Vec<egui::Pos2> = temp.flatten(24).iter().map(|(x, y)| sp(*x, *y)).collect();
             if pts.len() >= 2 {
                 painter.add(egui::Shape::line(
-                    pts.clone(),
+                    pts,
                     egui::Stroke::new(
                         (self.pen_width as f32 * zoom).max(1.0),
                         to_color32(self.brush_core_color()),
                     ),
                 ));
             }
-            for pt in &pts {
-                painter.circle_filled(*pt, 3.5, azul);
-                painter.circle_stroke(*pt, 3.5, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
+            for a in &self.pen_anchors {
+                let p = sp(a.x, a.y);
+                if let Some((hx, hy)) = a.hout {
+                    let hp = sp(hx, hy);
+                    painter.line_segment([p, hp], egui::Stroke::new(1.0_f32, azul));
+                    painter.circle_filled(hp, 3.0, azul);
+                }
+                if let Some((hx, hy)) = a.hin {
+                    let hp = sp(hx, hy);
+                    painter.line_segment([p, hp], egui::Stroke::new(1.0_f32, azul));
+                    painter.circle_filled(hp, 3.0, azul);
+                }
+                painter.circle_filled(p, 3.5, egui::Color32::WHITE);
+                painter.circle_stroke(p, 3.5, egui::Stroke::new(1.5_f32, azul));
             }
         }
     }
@@ -895,7 +954,7 @@ impl SketchMotionApp {
         ui.separator();
         self.swatch_cor(ui);
         ui.separator();
-        let n = self.pen_points.len();
+        let n = self.pen_anchors.len();
         if ui
             .add_enabled(n >= 2, egui::Button::new("Finalizar traço"))
             .clicked()
@@ -903,7 +962,8 @@ impl SketchMotionApp {
             self.finalizar_caneta();
         }
         if ui.add_enabled(n > 0, egui::Button::new("Cancelar")).clicked() {
-            self.pen_points.clear();
+            self.pen_anchors.clear();
+            self.pen_drag_idx = None;
             self.dirty = true;
         }
         ui.separator();
@@ -1464,6 +1524,16 @@ impl eframe::App for SketchMotionApp {
             self.tela_inicial(ctx);
             return;
         }
+        // Ao sair da Caneta com um traço em aberto, finaliza-o (vira objeto)
+        // em vez de descartá-lo — assim ele não "some" ao trocar de ferramenta.
+        if self.tool != Tool::Pen && !self.pen_anchors.is_empty() {
+            if self.pen_anchors.len() >= 2 {
+                self.finalizar_caneta();
+            } else {
+                self.pen_anchors.clear();
+                self.pen_drag_idx = None;
+            }
+        }
         let mut do_undo = false;
         let mut do_redo = false;
         let mut k_enter = false;
@@ -1602,8 +1672,9 @@ impl eframe::App for SketchMotionApp {
                 self.finalizar_caneta();
             }
             if k_esc {
-                if !self.pen_points.is_empty() {
-                    self.pen_points.clear();
+                if !self.pen_anchors.is_empty() {
+                    self.pen_anchors.clear();
+                    self.pen_drag_idx = None;
                     self.dirty = true;
                 }
                 self.selected_obj = None;
@@ -1682,6 +1753,7 @@ impl eframe::App for SketchMotionApp {
                     let pressed = ui.input(|i| i.pointer.primary_pressed());
                     let down = ui.input(|i| i.pointer.primary_down());
                     let pdelta = ui.input(|i| i.pointer.delta());
+                    let ppos = ui.input(|i| i.pointer.latest_pos());
 
                     if self.eyedropper != Eyedropper::Off {
                         if pressed {
@@ -1711,9 +1783,31 @@ impl eframe::App for SketchMotionApp {
                     } else if self.tool == Tool::Pen {
                         if response.double_clicked() {
                             self.finalizar_caneta();
-                        } else if pressed {
-                            if let Some(p) = hover {
-                                self.pen_points.push(to_doc(p));
+                        } else {
+                            if pressed {
+                                if let Some(p) = hover {
+                                    let (dx, dy) = to_doc(p);
+                                    self.pen_anchors.push(Anchor::new(dx, dy));
+                                    self.pen_drag_idx = Some(self.pen_anchors.len() - 1);
+                                }
+                            }
+                            if down {
+                                if let Some(i) = self.pen_drag_idx {
+                                    if i < self.pen_anchors.len() {
+                                        if let Some(pp) = ppos {
+                                            let (cx, cy) = to_doc(pp);
+                                            let a = &mut self.pen_anchors[i];
+                                            let (ddx, ddy) = (cx - a.x, cy - a.y);
+                                            if ddx * ddx + ddy * ddy > 4.0 {
+                                                a.hout = Some((cx, cy));
+                                                a.hin = Some((a.x - ddx, a.y - ddy));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !down {
+                                self.pen_drag_idx = None;
                             }
                         }
                         self.last_pos = None;
@@ -1721,20 +1815,99 @@ impl eframe::App for SketchMotionApp {
                         let thr = 6.0 / zoom;
                         if pressed {
                             if let Some(p) = hover {
-                                match self.hit_test(to_doc(p), thr) {
-                                    Some(i) => {
-                                        self.selected_obj = Some(i);
-                                        self.push_undo();
-                                        self.dragging_obj = true;
+                                let mut grabbed = false;
+                                if let Some(si) = self.selected_obj {
+                                    if si < self.document.vectors.len() {
+                                        if let Some((minx, miny, maxx, maxy)) =
+                                            self.document.vectors[si].bounds()
+                                        {
+                                            let r = egui::Rect::from_min_max(
+                                                egui::pos2(
+                                                    rect.min.x + minx * zoom,
+                                                    rect.min.y + miny * zoom,
+                                                ),
+                                                egui::pos2(
+                                                    rect.min.x + maxx * zoom,
+                                                    rect.min.y + maxy * zoom,
+                                                ),
+                                            )
+                                            .expand(3.0);
+                                            let hs = handle_positions(r);
+                                            let (cx, cy) =
+                                                ((minx + maxx) / 2.0, (miny + maxy) / 2.0);
+                                            for (hi, hc) in hs.iter().enumerate() {
+                                                if hc.distance(p) <= 8.0 {
+                                                    self.push_undo();
+                                                    let (grab, fixed, axes) = handle_geometry(
+                                                        hi, minx, miny, maxx, maxy, cx, cy,
+                                                    );
+                                                    self.resize_handle = Some(hi);
+                                                    self.resize_orig =
+                                                        self.document.vectors[si].points.clone();
+                                                    self.resize_grab = grab;
+                                                    self.resize_fixed = fixed;
+                                                    self.resize_axes = axes;
+                                                    self.dragging_obj = false;
+                                                    grabbed = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
                                     }
-                                    None => {
-                                        self.selected_obj = None;
-                                        self.dragging_obj = false;
+                                }
+                                if !grabbed {
+                                    match self.hit_test(to_doc(p), thr) {
+                                        Some(i) => {
+                                            self.selected_obj = Some(i);
+                                            self.push_undo();
+                                            self.dragging_obj = true;
+                                        }
+                                        None => {
+                                            self.selected_obj = None;
+                                            self.dragging_obj = false;
+                                        }
                                     }
                                 }
                             }
                         }
-                        if down && self.dragging_obj {
+                        if down && self.resize_handle.is_some() {
+                            if let Some(si) = self.selected_obj {
+                                if si < self.document.vectors.len() {
+                                    if let Some(pp) = ppos {
+                                        let cur = to_doc(pp);
+                                        let (fx, fy) = self.resize_fixed;
+                                        let (gx, gy) = self.resize_grab;
+                                        let (ax, ay) = self.resize_axes;
+                                        let sx = if ax {
+                                            safe_ratio(cur.0 - fx, gx - fx)
+                                        } else {
+                                            1.0
+                                        };
+                                        let sy = if ay {
+                                            safe_ratio(cur.1 - fy, gy - fy)
+                                        } else {
+                                            1.0
+                                        };
+                                        let orig = self.resize_orig.clone();
+                                        let obj = &mut self.document.vectors[si];
+                                        if obj.points.len() == orig.len() {
+                                            for (dst, src) in
+                                                obj.points.iter_mut().zip(orig.iter())
+                                            {
+                                                dst.x = fx + (src.x - fx) * sx;
+                                                dst.y = fy + (src.y - fy) * sy;
+                                                dst.hin = src.hin.map(|(hx, hy)| {
+                                                    (fx + (hx - fx) * sx, fy + (hy - fy) * sy)
+                                                });
+                                                dst.hout = src.hout.map(|(hx, hy)| {
+                                                    (fx + (hx - fx) * sx, fy + (hy - fy) * sy)
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if down && self.dragging_obj {
                             if let Some(i) = self.selected_obj {
                                 if i < self.document.vectors.len()
                                     && (pdelta.x != 0.0 || pdelta.y != 0.0)
@@ -1746,6 +1919,7 @@ impl eframe::App for SketchMotionApp {
                         }
                         if !down {
                             self.dragging_obj = false;
+                            self.resize_handle = None;
                         }
                         self.last_pos = None;
                     } else if self.tool.paints()

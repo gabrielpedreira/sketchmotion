@@ -43,6 +43,16 @@ fn one() -> f32 {
     1.0
 }
 
+/// Ponto numa curva bézier cúbica em t (0..1).
+fn cubic(p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32), t: f32) -> (f32, f32) {
+    let u = 1.0 - t;
+    let (w0, w1, w2, w3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    (
+        w0 * p0.0 + w1 * p1.0 + w2 * p2.0 + w3 * p3.0,
+        w0 * p0.1 + w1 * p1.1 + w2 * p2.1 + w3 * p3.1,
+    )
+}
+
 impl VectorObject {
     pub fn new(stroke: Color, stroke_width: f32) -> Self {
         Self {
@@ -54,16 +64,41 @@ impl VectorObject {
         }
     }
 
-    /// Caixa delimitadora (min_x, min_y, max_x, max_y) pelas âncoras.
+    /// Achata o caminho numa polilinha (amostrando as curvas bézier), em
+    /// coordenadas do documento. Usada para desenhar, medir e testar cliques.
+    pub fn flatten(&self, steps: usize) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        if self.points.is_empty() {
+            return out;
+        }
+        out.push((self.points[0].x, self.points[0].y));
+        for w in self.points.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            if a.hout.is_none() && b.hin.is_none() {
+                out.push((b.x, b.y));
+            } else {
+                let c1 = a.hout.unwrap_or((a.x, a.y));
+                let c2 = b.hin.unwrap_or((b.x, b.y));
+                for s in 1..=steps.max(1) {
+                    let t = s as f32 / steps.max(1) as f32;
+                    out.push(cubic((a.x, a.y), c1, c2, (b.x, b.y), t));
+                }
+            }
+        }
+        out
+    }
+
+    /// Caixa delimitadora (min_x, min_y, max_x, max_y) pela curva real.
     pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
-        let mut it = self.points.iter();
+        let flat = self.flatten(12);
+        let mut it = flat.iter();
         let f = it.next()?;
-        let (mut minx, mut miny, mut maxx, mut maxy) = (f.x, f.y, f.x, f.y);
+        let (mut minx, mut miny, mut maxx, mut maxy) = (f.0, f.1, f.0, f.1);
         for p in it {
-            minx = minx.min(p.x);
-            miny = miny.min(p.y);
-            maxx = maxx.max(p.x);
-            maxy = maxy.max(p.y);
+            minx = minx.min(p.0);
+            miny = miny.min(p.1);
+            maxx = maxx.max(p.0);
+            maxy = maxy.max(p.1);
         }
         Some((minx, miny, maxx, maxy))
     }
