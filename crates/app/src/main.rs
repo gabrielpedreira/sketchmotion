@@ -22,6 +22,7 @@ const BASICAS_COLS: usize = 16;
 
 /// Fontes exibidas no painel de texto (aplicação real virá com o módulo de texto).
 const FONTES: [&str; 4] = ["Sans", "Serif", "Monospace", "Manuscrito"];
+const FORMAS: [&str; 4] = ["Retângulo", "Elipse", "Triângulo", "Polígono"];
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -352,6 +353,13 @@ struct SketchMotionApp {
     resize_fixed: (f32, f32),
     resize_grab: (f32, f32),
     resize_axes: (bool, bool),
+    // ferramenta Formas
+    shape_kind: usize,
+    shape_sides: u32,
+    shape_stroke: i32,
+    shape_fill: bool,
+    fill_color: egui::Color32,
+    shape_start: Option<(f32, f32)>,
 }
 
 impl SketchMotionApp {
@@ -415,6 +423,12 @@ impl SketchMotionApp {
             resize_fixed: (0.0, 0.0),
             resize_grab: (0.0, 0.0),
             resize_axes: (true, true),
+            shape_kind: 0,
+            shape_sides: 5,
+            shape_stroke: 2,
+            shape_fill: true,
+            fill_color: egui::Color32::from_rgb(180, 180, 180),
+            shape_start: None,
         }
     }
 
@@ -700,11 +714,22 @@ impl SketchMotionApp {
         let sp = |x: f32, y: f32| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom);
         let azul = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
         for (idx, obj) in self.document.vectors.iter().enumerate() {
-            let col = to_color32(obj.stroke).linear_multiply(obj.opacity.clamp(0.0, 1.0));
+            let op = obj.opacity.clamp(0.0, 1.0);
+            let col = to_color32(obj.stroke).linear_multiply(op);
             let w = (obj.stroke_width * zoom).max(1.0);
             let pts: Vec<egui::Pos2> = obj.flatten(24).iter().map(|(x, y)| sp(*x, *y)).collect();
-            if pts.len() >= 2 {
-                painter.add(egui::Shape::line(pts, egui::Stroke::new(w, col)));
+            let stroke = egui::Stroke::new(w, col);
+            if let Some(fill) = obj.fill {
+                let fc = to_color32(fill).linear_multiply(op);
+                if pts.len() >= 3 {
+                    painter.add(egui::Shape::convex_polygon(pts, fc, stroke));
+                } else if pts.len() >= 2 {
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            } else if obj.closed && pts.len() >= 3 {
+                painter.add(egui::Shape::closed_line(pts, stroke));
+            } else if pts.len() >= 2 {
+                painter.add(egui::Shape::line(pts, stroke));
             } else if pts.len() == 1 {
                 painter.circle_filled(pts[0], (w / 2.0).max(1.5), col);
             }
@@ -783,6 +808,7 @@ impl SketchMotionApp {
                         (Tool::Text, icon::TEXT_T, "Texto"),
                         (Tool::Pencil, icon::PAINT_BRUSH, "Pincel"),
                         (Tool::Eraser, icon::ERASER, "Borracha"),
+                        (Tool::Shapes, icon::SHAPES, "Formas geométricas"),
                     ] {
                         let ativa = self.tool == t && self.eyedropper == Eyedropper::Off;
                         if icon_button(ui, ativa, ic).on_hover_text(hint).clicked() {
@@ -840,6 +866,7 @@ impl SketchMotionApp {
                         Tool::Pen => self.opcoes_caneta(ui),
                         Tool::MagicWand => self.opcoes_varinha(ui),
                         Tool::DirectSelect => self.opcoes_selecao_direta(ui),
+                        Tool::Shapes => self.opcoes_formas(ui),
                     }
                 }
             });
@@ -902,6 +929,28 @@ impl SketchMotionApp {
         match self.selected_obj {
             Some(idx) if idx < self.document.vectors.len() => {
                 ui.label("Traço selecionado.");
+                ui.separator();
+                if ui.button("↺ 90°").on_hover_text("Girar 90° à esquerda").clicked() {
+                    self.push_undo();
+                    self.document.vectors[idx].rotate_ccw_self();
+                }
+                if ui.button("↻ 90°").on_hover_text("Girar 90° à direita").clicked() {
+                    self.push_undo();
+                    self.document.vectors[idx].rotate_cw_self();
+                }
+                if ui.button("180°").on_hover_text("Girar 180°").clicked() {
+                    self.push_undo();
+                    self.document.vectors[idx].rotate_180_self();
+                }
+                ui.separator();
+                if ui.button("Espelhar H").on_hover_text("Espelhar horizontalmente").clicked() {
+                    self.push_undo();
+                    self.document.vectors[idx].flip_h_self();
+                }
+                if ui.button("Espelhar V").on_hover_text("Espelhar verticalmente").clicked() {
+                    self.push_undo();
+                    self.document.vectors[idx].flip_v_self();
+                }
                 ui.separator();
                 ui.label("Espessura:");
                 let mut w = self.document.vectors[idx].stroke_width;
@@ -995,6 +1044,84 @@ impl SketchMotionApp {
 
     fn opcoes_selecao_direta(&mut self, ui: &mut egui::Ui) {
         ui.weak("Edição por pontos (vetorial): em desenvolvimento.");
+    }
+
+    fn opcoes_formas(&mut self, ui: &mut egui::Ui) {
+        ui.label("Forma:");
+        egui::ComboBox::from_id_salt("forma_tipo")
+            .selected_text(FORMAS[self.shape_kind])
+            .show_ui(ui, |ui| {
+                for (i, f) in FORMAS.iter().enumerate() {
+                    ui.selectable_value(&mut self.shape_kind, i, *f);
+                }
+            });
+        if self.shape_kind == 3 {
+            ui.label("Lados:");
+            ui.add(egui::Slider::new(&mut self.shape_sides, 3..=12));
+        }
+        ui.separator();
+        ui.label("Espessura:");
+        ui.add(egui::Slider::new(&mut self.shape_stroke, 1..=40));
+        ui.separator();
+        ui.label("Traço:");
+        self.swatch_cor(ui);
+        ui.separator();
+        ui.checkbox(&mut self.shape_fill, "Preencher");
+        ui.label("Cor:");
+        ui.color_edit_button_srgba(&mut self.fill_color);
+        ui.separator();
+        ui.weak("Arraste no canvas para desenhar a forma.");
+    }
+
+    /// Pontos (coords do documento) da forma atual no retângulo start..end.
+    fn forma_pontos(&self, start: (f32, f32), end: (f32, f32)) -> Vec<(f32, f32)> {
+        let minx = start.0.min(end.0);
+        let maxx = start.0.max(end.0);
+        let miny = start.1.min(end.1);
+        let maxy = start.1.max(end.1);
+        let (cx, cy) = ((minx + maxx) / 2.0, (miny + maxy) / 2.0);
+        let (rx, ry) = ((maxx - minx) / 2.0, (maxy - miny) / 2.0);
+        let mut v = Vec::new();
+        match self.shape_kind {
+            0 => v.extend_from_slice(&[(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)]),
+            1 => {
+                let n = 48;
+                for k in 0..n {
+                    let t = k as f32 / n as f32 * std::f32::consts::TAU;
+                    v.push((cx + rx * t.cos(), cy + ry * t.sin()));
+                }
+            }
+            2 => v.extend_from_slice(&[(cx, miny), (maxx, maxy), (minx, maxy)]),
+            _ => {
+                let n = self.shape_sides.max(3);
+                for k in 0..n {
+                    let t = -std::f32::consts::FRAC_PI_2 + k as f32 / n as f32 * std::f32::consts::TAU;
+                    v.push((cx + rx * t.cos(), cy + ry * t.sin()));
+                }
+            }
+        }
+        v
+    }
+
+    /// Cria uma forma vetorial a partir do retângulo arrastado.
+    fn criar_forma(&mut self, start: (f32, f32), end: (f32, f32)) {
+        if (start.0 - end.0).abs() < 1.0 || (start.1 - end.1).abs() < 1.0 {
+            self.shape_start = None;
+            return;
+        }
+        let pts = self.forma_pontos(start, end);
+        self.push_undo();
+        let mut obj = VectorObject::new(self.brush_core_color(), self.shape_stroke as f32);
+        obj.points = pts.iter().map(|(x, y)| Anchor::new(*x, *y)).collect();
+        obj.closed = true;
+        if self.shape_fill {
+            let c = self.fill_color;
+            obj.fill = Some(Color::rgba(c.r(), c.g(), c.b(), c.a()));
+        }
+        self.document.vectors.push(obj);
+        self.selected_obj = Some(self.document.vectors.len() - 1);
+        self.shape_start = None;
+        self.dirty = true;
     }
 
     fn barra_icones(&mut self, ctx: &egui::Context) {
@@ -1936,6 +2063,20 @@ impl eframe::App for SketchMotionApp {
                             self.resize_handle = None;
                         }
                         self.last_pos = None;
+                    } else if self.tool == Tool::Shapes {
+                        if pressed {
+                            if let Some(p) = hover {
+                                self.shape_start = Some(to_doc(p));
+                            }
+                        }
+                        if !down {
+                            if let Some(start) = self.shape_start.take() {
+                                if let Some(pp) = ppos {
+                                    self.criar_forma(start, to_doc(pp));
+                                }
+                            }
+                        }
+                        self.last_pos = None;
                     } else if self.tool.paints()
                         && (response.is_pointer_button_down_on() || response.dragged())
                     {
@@ -1964,8 +2105,44 @@ impl eframe::App for SketchMotionApp {
                             }
                             self.last_pos = Some(p);
                         }
+                        if self.tool == Tool::Eraser {
+                            if let Some(pp) = ppos {
+                                let tol = (self.brush_radius as f32).max(3.0);
+                                if let Some(i) = self.hit_test(to_doc(pp), tol) {
+                                    self.document.vectors.remove(i);
+                                    match self.selected_obj {
+                                        Some(si) if si == i => self.selected_obj = None,
+                                        Some(si) if si > i => self.selected_obj = Some(si - 1),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         self.last_pos = None;
+                    }
+
+                    // Prévia da forma sendo desenhada (durante o arraste).
+                    if self.tool == Tool::Shapes {
+                        if let (Some(start), Some(pp)) = (self.shape_start, ppos) {
+                            let dpts = self.forma_pontos(start, to_doc(pp));
+                            if dpts.len() >= 2 {
+                                let painter = ui.painter_at(rect);
+                                let spts: Vec<egui::Pos2> = dpts
+                                    .iter()
+                                    .map(|(x, y)| {
+                                        egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom)
+                                    })
+                                    .collect();
+                                painter.add(egui::Shape::closed_line(
+                                    spts,
+                                    egui::Stroke::new(
+                                        (self.shape_stroke as f32 * zoom).max(1.0),
+                                        to_color32(self.brush_core_color()),
+                                    ),
+                                ));
+                            }
+                        }
                     }
 
                     // Cursor contextual: muda conforme a ferramenta e o que
@@ -1976,7 +2153,7 @@ impl eframe::App for SketchMotionApp {
                             CI::Crosshair
                         } else {
                             match self.tool {
-                                Tool::Pen | Tool::Pencil | Tool::Eraser => CI::Crosshair,
+                                Tool::Pen | Tool::Shapes | Tool::Pencil | Tool::Eraser => CI::Crosshair,
                                 Tool::Select => {
                                     if self.dragging_obj || self.resize_handle.is_some() {
                                         CI::Grabbing

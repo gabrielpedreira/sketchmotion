@@ -19,6 +19,8 @@ pub enum Tool {
     Pen,
     /// Texto (em desenvolvimento).
     Text,
+    /// Formas geométricas (retângulo, elipse, triângulo, polígono).
+    Shapes,
     /// Pincel — desenho livre raster.
     Pencil,
     /// Borracha — pinta transparente, revelando o que está por baixo.
@@ -46,6 +48,7 @@ impl Tool {
             Tool::MagicWand => "Varinha mágica",
             Tool::Pen => "Caneta",
             Tool::Text => "Texto",
+            Tool::Shapes => "Formas",
             Tool::Pencil => "Pincel",
             Tool::Eraser => "Borracha",
         }

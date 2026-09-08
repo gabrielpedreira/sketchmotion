@@ -37,6 +37,9 @@ pub struct VectorObject {
     pub stroke_width: f32,
     #[serde(default = "one")]
     pub opacity: f32,
+    /// Cor de preenchimento (None = sem preenchimento). Usada por formas.
+    #[serde(default)]
+    pub fill: Option<Color>,
 }
 
 fn one() -> f32 {
@@ -61,6 +64,7 @@ impl VectorObject {
             stroke,
             stroke_width,
             opacity: 1.0,
+            fill: None,
         }
     }
 
@@ -74,6 +78,20 @@ impl VectorObject {
         out.push((self.points[0].x, self.points[0].y));
         for w in self.points.windows(2) {
             let (a, b) = (&w[0], &w[1]);
+            if a.hout.is_none() && b.hin.is_none() {
+                out.push((b.x, b.y));
+            } else {
+                let c1 = a.hout.unwrap_or((a.x, a.y));
+                let c2 = b.hin.unwrap_or((b.x, b.y));
+                for s in 1..=steps.max(1) {
+                    let t = s as f32 / steps.max(1) as f32;
+                    out.push(cubic((a.x, a.y), c1, c2, (b.x, b.y), t));
+                }
+            }
+        }
+        if self.closed && self.points.len() >= 2 {
+            let a = self.points.last().unwrap();
+            let b = &self.points[0];
             if a.hout.is_none() && b.hin.is_none() {
                 out.push((b.x, b.y));
             } else {
@@ -142,5 +160,32 @@ impl VectorObject {
     }
     pub fn rotate_90_ccw(&mut self, old_w: f32) {
         self.map_points(|x, y| (y, old_w - x));
+    }
+
+    // --- transformações em torno do próprio centro (objeto selecionado) ---
+    pub fn flip_h_self(&mut self) {
+        if let Some((cx, _)) = self.center() {
+            self.map_points(|x, y| (2.0 * cx - x, y));
+        }
+    }
+    pub fn flip_v_self(&mut self) {
+        if let Some((_, cy)) = self.center() {
+            self.map_points(|x, y| (x, 2.0 * cy - y));
+        }
+    }
+    pub fn rotate_cw_self(&mut self) {
+        if let Some((cx, cy)) = self.center() {
+            self.map_points(|x, y| (cx - (y - cy), cy + (x - cx)));
+        }
+    }
+    pub fn rotate_ccw_self(&mut self) {
+        if let Some((cx, cy)) = self.center() {
+            self.map_points(|x, y| (cx + (y - cy), cy - (x - cx)));
+        }
+    }
+    pub fn rotate_180_self(&mut self) {
+        if let Some((cx, cy)) = self.center() {
+            self.map_points(|x, y| (2.0 * cx - x, 2.0 * cy - y));
+        }
     }
 }
