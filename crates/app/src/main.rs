@@ -511,6 +511,12 @@ struct SketchMotionApp {
     frame_thumbs: Vec<Option<egui::TextureHandle>>,
     onion_tex: Option<egui::TextureHandle>,
     onion_for: Option<usize>,
+    playing: bool,
+    play_frame: usize,
+    play_accum: f32,
+    play_loop: bool,
+    play_done: bool,
+    play_tex: Option<egui::TextureHandle>,
 }
 
 impl SketchMotionApp {
@@ -599,10 +605,16 @@ impl SketchMotionApp {
             marquee_cur: (0, 0),
             lasso_points: Vec::new(),
             fill_tolerance: 24,
-            onion: false,
+            onion: true,
             frame_thumbs: Vec::new(),
             onion_tex: None,
             onion_for: None,
+            playing: false,
+            play_frame: 0,
+            play_accum: 0.0,
+            play_loop: true,
+            play_done: false,
+            play_tex: None,
         }
     }
 
@@ -1490,6 +1502,89 @@ impl SketchMotionApp {
             });
     }
 
+    /// Janela de reprodução da animação (Play): roda os frames no FPS definido,
+    /// em loop ou sequência finita.
+    fn janela_reproducao(&mut self, ctx: &egui::Context) {
+        if !self.playing {
+            return;
+        }
+        let n = self.document.frame_count();
+        let fps = self.document.fps.max(1) as f32;
+        let step = 1.0 / fps;
+        let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        if !self.play_done {
+            self.play_accum += dt;
+            while self.play_accum >= step {
+                self.play_accum -= step;
+                if self.play_frame + 1 >= n {
+                    if self.play_loop {
+                        self.play_frame = 0;
+                    } else {
+                        self.play_done = true;
+                        break;
+                    }
+                } else {
+                    self.play_frame += 1;
+                }
+            }
+        }
+        ctx.request_repaint();
+        let pf = self.play_frame.min(n.saturating_sub(1));
+        let img = render_layers(
+            self.document.width,
+            self.document.height,
+            self.document.background,
+            &self.document.frames[pf].layers,
+        );
+        let ci = egui::ColorImage::from_rgba_unmultiplied(
+            [img.width as usize, img.height as usize],
+            &img.rgba,
+        );
+        match &mut self.play_tex {
+            Some(t) => t.set(ci, egui::TextureOptions::NEAREST),
+            None => {
+                self.play_tex = Some(ctx.load_texture("play", ci, egui::TextureOptions::NEAREST))
+            }
+        }
+        let mut open = true;
+        egui::Window::new("Reprodução")
+            .open(&mut open)
+            .default_size(egui::vec2(380.0, 340.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.play_loop, "Em loop")
+                        .on_hover_text("Ligado: repete ao terminar. Desligado: roda uma vez e para.");
+                    ui.separator();
+                    if ui.button("Reiniciar").clicked() {
+                        self.play_frame = 0;
+                        self.play_accum = 0.0;
+                        self.play_done = false;
+                    }
+                    ui.separator();
+                    ui.label(format!("Frame {}/{}", pf + 1, n));
+                    if self.play_done {
+                        ui.label("• fim");
+                    }
+                });
+                ui.separator();
+                if let Some(t) = &self.play_tex {
+                    let avail = ui.available_size();
+                    let (dw, dh) = (self.document.width as f32, self.document.height as f32);
+                    let scale = (avail.x / dw)
+                        .min((avail.y.max(60.0)) / dh)
+                        .clamp(0.02, 8.0);
+                    let size = egui::vec2(dw * scale, dh * scale);
+                    ui.add(
+                        egui::Image::from_texture(egui::load::SizedTexture::new(t.id(), size))
+                            .fit_to_exact_size(size),
+                    );
+                }
+            });
+        if !open {
+            self.playing = false;
+        }
+    }
+
     /// Timeline de frames (rodapé): miniaturas selecionáveis, navegação, FPS
     /// e onion skin.
     fn barra_frames(&mut self, ctx: &egui::Context) {
@@ -1517,12 +1612,22 @@ impl SketchMotionApp {
         let mut act_del = false;
         let mut act_prev = false;
         let mut act_next = false;
+        let mut act_play = false;
         let mut goto: Option<usize> = None;
         egui::TopBottomPanel::bottom("timeline")
             .resizable(false)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
+                    let play_lbl = if self.playing { "⏸ Parar" } else { "▶ Play" };
+                    if ui
+                        .button(play_lbl)
+                        .on_hover_text("Rodar a animação no FPS definido")
+                        .clicked()
+                    {
+                        act_play = true;
+                    }
+                    ui.separator();
                     if ui.button("＋ Frame").on_hover_text("Novo frame após o atual").clicked() {
                         act_add = true;
                     }
@@ -1602,6 +1707,20 @@ impl SketchMotionApp {
                 });
                 ui.add_space(4.0);
             });
+        if goto.is_some() || act_add || act_dup || act_del || act_prev || act_next {
+            self.playing = false;
+        }
+        if act_play {
+            if self.playing {
+                self.playing = false;
+            } else {
+                self.document.sync_to_frames();
+                self.play_frame = 0;
+                self.play_accum = 0.0;
+                self.play_done = false;
+                self.playing = true;
+            }
+        }
         if let Some(i) = goto {
             self.document.go_to_frame(i);
             self.dirty = true;
@@ -2706,6 +2825,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_paletas(ctx);
         self.janela_camadas(ctx);
         self.barra_frames(ctx);
+        self.janela_reproducao(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let doc_w = self.document.width as f32;
