@@ -108,3 +108,9 @@ Ordem sugerida, cada um em fatia validada:
    - Play: abre a tela de reprodução com FPS/tempo configuráveis.
    Requer modelo de frames no core (cada frame = conjunto de camadas/vetores).
 9. Cursor personalizado por ferramenta (imagem/emoji do cursor).
+
+### Melhorias na seleção retangular raster (estilo Paint) — pós-MVP
+A seleção flutuante já recorta/move. Falta deixá-la como a seleção vetorial:
+- Alças que redimensionam a região (escala do bitmap; render escala a textura, commit reamostra).
+- Ponto de rotação (girar o bitmap — precisa desenhar o quad via mesh e rasterizar girado no commit).
+- Opacidade da seleção flutuante (tint no desenho + multiplicar no commit).

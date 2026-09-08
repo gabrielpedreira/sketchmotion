@@ -145,6 +145,28 @@ fn densify(pts: &[(f32, f32)], spacing: f32) -> Vec<(f32, f32)> {
     out
 }
 
+/// Carimba um disco opaco de cor `col` no buffer RGBA (para rasterizar bordas).
+fn stamp_disc(rgba: &mut [u8], w: u32, h: u32, cx: f32, cy: f32, r: f32, col: Color) {
+    let r2 = r * r;
+    let x0 = ((cx - r).floor() as i32).max(0);
+    let x1 = ((cx + r).ceil() as i32).min(w as i32 - 1);
+    let y0 = ((cy - r).floor() as i32).max(0);
+    let y1 = ((cy + r).ceil() as i32).min(h as i32 - 1);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= r2 {
+                let i = ((y as u32 * w + x as u32) * 4) as usize;
+                rgba[i] = col.r;
+                rgba[i + 1] = col.g;
+                rgba[i + 2] = col.b;
+                rgba[i + 3] = 255;
+            }
+        }
+    }
+}
+
 /// Gera a grade de cores básicas: uma linha de tons de cinza + linhas de
 /// matizes em variações de saturação/valor (primárias, secundárias,
 /// terciárias e suas variações claras/escuras).
@@ -409,6 +431,7 @@ struct SketchMotionApp {
     float_grab: (f32, f32),
     marquee_start: Option<(i32, i32)>,
     marquee_cur: (i32, i32),
+    fill_tolerance: i32,
 }
 
 impl SketchMotionApp {
@@ -489,6 +512,7 @@ impl SketchMotionApp {
             float_grab: (0.0, 0.0),
             marquee_start: None,
             marquee_cur: (0, 0),
+            fill_tolerance: 24,
         }
     }
 
@@ -895,6 +919,79 @@ impl SketchMotionApp {
         }
     }
 
+    /// Ferramentas que não trabalham em pixels ficam bloqueadas no pixel art.
+    fn bloqueada_pixel(&self, t: Tool) -> bool {
+        self.pixel_mode
+            && matches!(
+                t,
+                Tool::Pen | Tool::Shapes | Tool::Text | Tool::DirectSelect | Tool::MagicWand
+            )
+    }
+
+    /// Desenha os traços vetoriais no buffer RGBA (borda para o flood fill).
+    fn rasterizar_vetores(&self, rgba: &mut [u8], w: u32, h: u32) {
+        for obj in &self.document.vectors {
+            let r = (obj.stroke_width * 0.5).max(0.6);
+            let dense = densify(&obj.flatten(24), r.max(1.0));
+            for &(fx, fy) in &dense {
+                stamp_disc(rgba, w, h, fx, fy, r, obj.stroke);
+            }
+        }
+    }
+
+    /// Balde de preenchimento (flood fill) na camada ativa, usando como
+    /// referência a composição raster + vetores (respeita pincel e formas).
+    fn balde_preencher(&mut self, x0: i32, y0: i32) {
+        let w = self.document.width as i32;
+        let h = self.document.height as i32;
+        if x0 < 0 || y0 < 0 || x0 >= w || y0 >= h {
+            return;
+        }
+        let li = self.active_layer;
+        if self.document.layer(li).map_or(true, |l| l.locked) {
+            self.status = "Camada bloqueada".into();
+            return;
+        }
+        let PixelImage { width, height, mut rgba } = render_document(&self.document);
+        self.rasterizar_vetores(&mut rgba, width as u32, height as u32);
+        let idx = |x: i32, y: i32| ((y * w + x) * 4) as usize;
+        let ti = idx(x0, y0);
+        let target = [rgba[ti], rgba[ti + 1], rgba[ti + 2], rgba[ti + 3]];
+        let tol = self.fill_tolerance;
+        let fill = self.brush_core_color();
+        self.push_undo();
+        let mut visited = vec![false; (w * h) as usize];
+        let mut stack: Vec<(i32, i32)> = vec![(x0, y0)];
+        while let Some((x, y)) = stack.pop() {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                continue;
+            }
+            let vi = (y * w + x) as usize;
+            if visited[vi] {
+                continue;
+            }
+            let ci = idx(x, y);
+            let d = (rgba[ci] as i32 - target[0] as i32)
+                .abs()
+                .max((rgba[ci + 1] as i32 - target[1] as i32).abs())
+                .max((rgba[ci + 2] as i32 - target[2] as i32).abs())
+                .max((rgba[ci + 3] as i32 - target[3] as i32).abs());
+            if d > tol {
+                continue;
+            }
+            visited[vi] = true;
+            if let Some(layer) = self.document.layer_mut(li) {
+                layer.set_pixel(x as u32, y as u32, fill);
+            }
+            stack.push((x + 1, y));
+            stack.push((x - 1, y));
+            stack.push((x, y + 1));
+            stack.push((x, y - 1));
+        }
+        self.dirty = true;
+        self.status = "Preenchido".into();
+    }
+
     /// Índice da alça da caixa do objeto `si` sob o ponto de tela `hp`.
     fn handle_at(&self, si: usize, hp: egui::Pos2, rect: egui::Rect, zoom: f32) -> Option<usize> {
         let obj = self.document.vectors.get(si)?;
@@ -1025,8 +1122,18 @@ impl SketchMotionApp {
                         (Tool::DirectSelect, icon::SELECTION, "Seleção direta — editar por pontos"),
                         (Tool::MagicWand, icon::MAGIC_WAND, "Varinha mágica — selecionar por cor"),
                     ] {
-                        let ativa = self.tool == t && self.eyedropper == Eyedropper::Off;
-                        if icon_button(ui, ativa, ic).on_hover_text(hint).clicked() {
+                        let bloq = self.bloqueada_pixel(t);
+                        let ativa =
+                            self.tool == t && self.eyedropper == Eyedropper::Off && !bloq;
+                        let resp = icon_button(ui, ativa, ic);
+                        if bloq {
+                            ui.painter().rect_filled(
+                                resp.rect,
+                                5.0,
+                                egui::Color32::from_black_alpha(130),
+                            );
+                            resp.on_hover_text("Indisponível no modo pixel art");
+                        } else if resp.on_hover_text(hint).clicked() {
                             self.tool = t;
                             self.eyedropper = Eyedropper::Off;
                         }
@@ -1041,9 +1148,20 @@ impl SketchMotionApp {
                         (Tool::Pencil, icon::PAINT_BRUSH, "Pincel"),
                         (Tool::Eraser, icon::ERASER, "Borracha"),
                         (Tool::Shapes, icon::SHAPES, "Formas geométricas"),
+                        (Tool::Fill, icon::PAINT_BUCKET, "Balde de preenchimento"),
                     ] {
-                        let ativa = self.tool == t && self.eyedropper == Eyedropper::Off;
-                        if icon_button(ui, ativa, ic).on_hover_text(hint).clicked() {
+                        let bloq = self.bloqueada_pixel(t);
+                        let ativa =
+                            self.tool == t && self.eyedropper == Eyedropper::Off && !bloq;
+                        let resp = icon_button(ui, ativa, ic);
+                        if bloq {
+                            ui.painter().rect_filled(
+                                resp.rect,
+                                5.0,
+                                egui::Color32::from_black_alpha(130),
+                            );
+                            resp.on_hover_text("Indisponível no modo pixel art");
+                        } else if resp.on_hover_text(hint).clicked() {
                             self.tool = t;
                             self.eyedropper = Eyedropper::Off;
                         }
@@ -1099,6 +1217,7 @@ impl SketchMotionApp {
                         Tool::MagicWand => self.opcoes_varinha(ui),
                         Tool::DirectSelect => self.opcoes_selecao_direta(ui),
                         Tool::Shapes => self.opcoes_formas(ui),
+                        Tool::Fill => self.opcoes_balde(ui),
                     }
                 }
             });
@@ -1324,6 +1443,16 @@ impl SketchMotionApp {
         ui.color_edit_button_srgba(&mut self.fill_color);
         ui.separator();
         ui.weak("Arraste no canvas para desenhar a forma.");
+    }
+
+    fn opcoes_balde(&mut self, ui: &mut egui::Ui) {
+        ui.label("Tolerância:");
+        ui.add(egui::Slider::new(&mut self.fill_tolerance, 0..=150));
+        ui.separator();
+        ui.label("Cor:");
+        self.swatch_cor(ui);
+        ui.separator();
+        ui.weak("Clique numa área fechada para preencher (respeita traços e formas).");
     }
 
     /// Pontos (coords do documento) da forma atual no retângulo start..end.
@@ -1931,6 +2060,9 @@ impl eframe::App for SketchMotionApp {
         if self.tool != Tool::Select && self.float_sel.is_some() {
             self.commit_float();
         }
+        if self.bloqueada_pixel(self.tool) {
+            self.tool = Tool::Pencil;
+        }
         let mut do_undo = false;
         let mut do_redo = false;
         let mut k_enter = false;
@@ -2431,6 +2563,14 @@ impl eframe::App for SketchMotionApp {
                             }
                         }
                         self.last_pos = None;
+                    } else if self.tool == Tool::Fill {
+                        if pressed {
+                            if let Some(p) = hover {
+                                let (x, y) = to_pixel(p);
+                                self.balde_preencher(x, y);
+                            }
+                        }
+                        self.last_pos = None;
                     } else if self.tool.paints()
                         && (response.is_pointer_button_down_on() || response.dragged())
                     {
@@ -2516,7 +2656,7 @@ impl eframe::App for SketchMotionApp {
                                     }
                                     ui.ctx().set_cursor_icon(CI::None);
                                 }
-                                Tool::Pen | Tool::Shapes => {
+                                Tool::Pen | Tool::Shapes | Tool::Fill => {
                                     ui.ctx().set_cursor_icon(CI::Crosshair);
                                 }
                                 Tool::Select => {

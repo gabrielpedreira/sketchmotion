@@ -21,6 +21,8 @@ pub enum Tool {
     Text,
     /// Formas geométricas (retângulo, elipse, triângulo, polígono).
     Shapes,
+    /// Balde de preenchimento (flood fill estilo Paint).
+    Fill,
     /// Pincel — desenho livre raster.
     Pencil,
     /// Borracha — pinta transparente, revelando o que está por baixo.
@@ -49,6 +51,7 @@ impl Tool {
             Tool::Pen => "Caneta",
             Tool::Text => "Texto",
             Tool::Shapes => "Formas",
+            Tool::Fill => "Balde",
             Tool::Pencil => "Pincel",
             Tool::Eraser => "Borracha",
         }
