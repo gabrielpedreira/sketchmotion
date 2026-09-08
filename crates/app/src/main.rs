@@ -120,6 +120,27 @@ fn float_local(cx: f32, cy: f32, ang: f32, wx: f32, wy: f32) -> (f32, f32) {
     (dx * c + dy * s, -dx * s + dy * c)
 }
 
+/// Teste ponto-dentro-do-polígono (ray casting) para a seleção livre.
+fn ponto_no_poligono(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if ((yi > y) != (yj > y))
+            && (x < (xj - xi) * (y - yi) / (yj - yi + f32::EPSILON) + xi)
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Para a alça `hi`: ponto agarrado, ponto fixo (oposto) e quais eixos escalam.
 fn handle_geometry(
     hi: usize,
@@ -467,6 +488,7 @@ struct SketchMotionApp {
     float_rot_grab: f32,
     marquee_start: Option<(i32, i32)>,
     marquee_cur: (i32, i32),
+    lasso_points: Vec<(f32, f32)>,
     fill_tolerance: i32,
 }
 
@@ -554,6 +576,7 @@ impl SketchMotionApp {
             float_rot_grab: 0.0,
             marquee_start: None,
             marquee_cur: (0, 0),
+            lasso_points: Vec::new(),
             fill_tolerance: 24,
         }
     }
@@ -994,6 +1017,168 @@ impl SketchMotionApp {
         }
     }
 
+    /// Detecção do clique sobre a seleção flutuante (rotação / alça / mover).
+    /// Devolve true se o clique foi consumido por ela.
+    fn float_press(&mut self, p: egui::Pos2, rect: egui::Rect, zoom: f32) -> bool {
+        let dp = ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+        let mut consumed = false;
+        if let Some(fs) = &self.float_sel {
+            let (cx, cy, hw, hh, ang) = (fs.cx, fs.cy, fs.hw, fs.hh, fs.angle);
+            let scr = |wx: f32, wy: f32| egui::pos2(rect.min.x + wx * zoom, rect.min.y + wy * zoom);
+            let (tmx, tmy) = float_corner(cx, cy, hw, hh, ang, 0.0, -1.0);
+            let tm = scr(tmx, tmy);
+            let cc = scr(cx, cy);
+            let dir = (tm - cc).normalized();
+            let roth = tm + dir * 22.0;
+            if roth.distance(p) <= 12.0 {
+                self.float_rotating = true;
+                self.float_rot_grab = (dp.1 - cy).atan2(dp.0 - cx) - ang;
+                consumed = true;
+            } else {
+                let mut grabbed_h = None;
+                for &(sx, sy) in HSIGNS.iter() {
+                    let (hx, hy) = float_corner(cx, cy, hw, hh, ang, sx, sy);
+                    if scr(hx, hy).distance(p) <= 8.0 {
+                        grabbed_h = Some((sx, sy));
+                        break;
+                    }
+                }
+                if let Some((sx, sy)) = grabbed_h {
+                    self.fr_fixed = float_corner(cx, cy, hw, hh, ang, -sx, -sy);
+                    self.fr_wh = (2.0 * hw, 2.0 * hh);
+                    self.fr_angle = ang;
+                    self.float_resize = Some((sx, sy));
+                    consumed = true;
+                } else {
+                    let (lx, ly) = float_local(cx, cy, ang, dp.0, dp.1);
+                    if lx.abs() <= hw && ly.abs() <= hh {
+                        self.float_grab = (dp.0 - cx, dp.1 - cy);
+                        self.float_dragging = true;
+                        consumed = true;
+                    }
+                }
+            }
+        }
+        consumed
+    }
+
+    /// Aplica a manipulação da seleção flutuante em andamento (redimensionar/
+    /// girar/mover). Devolve true se algo estava ativo.
+    fn float_down(&mut self, ppos: Option<egui::Pos2>, rect: egui::Rect, zoom: f32) -> bool {
+        if !(self.float_resize.is_some() || self.float_rotating || self.float_dragging) {
+            return false;
+        }
+        if let Some(pp) = ppos {
+            let cur = ((pp.x - rect.min.x) / zoom, (pp.y - rect.min.y) / zoom);
+            if let Some((gx, gy)) = self.float_resize {
+                let ang = self.fr_angle;
+                let (pfx, pfy) = self.fr_fixed;
+                let (w0, h0) = self.fr_wh;
+                let (s, c) = ang.sin_cos();
+                let (dx, dy) = (cur.0 - pfx, cur.1 - pfy);
+                let (lx, ly) = (dx * c + dy * s, -dx * s + dy * c);
+                let nw = if gx != 0.0 { lx.abs().max(1.0) } else { w0 };
+                let nh = if gy != 0.0 { ly.abs().max(1.0) } else { h0 };
+                let (hw, hh) = (nw / 2.0, nh / 2.0);
+                let (flx, fly) = (-gx * hw, -gy * hh);
+                let cxn = pfx - (flx * c - fly * s);
+                let cyn = pfy - (flx * s + fly * c);
+                if let Some(fs) = &mut self.float_sel {
+                    fs.cx = cxn;
+                    fs.cy = cyn;
+                    fs.hw = hw;
+                    fs.hh = hh;
+                }
+            } else if self.float_rotating {
+                let grab = self.float_rot_grab;
+                if let Some(fs) = &mut self.float_sel {
+                    fs.angle = (cur.1 - fs.cy).atan2(cur.0 - fs.cx) - grab;
+                }
+            } else if self.float_dragging {
+                let (gx, gy) = self.float_grab;
+                if let Some(fs) = &mut self.float_sel {
+                    fs.cx = cur.0 - gx;
+                    fs.cy = cur.1 - gy;
+                }
+            }
+            self.dirty = true;
+        }
+        true
+    }
+
+    fn float_release(&mut self) {
+        self.float_dragging = false;
+        self.float_resize = None;
+        self.float_rotating = false;
+    }
+
+    /// Recorta os pixels dentro do contorno (seleção livre) para uma flutuante.
+    fn lift_lasso(&mut self, pts: &[(f32, f32)]) {
+        if pts.len() < 3 {
+            return;
+        }
+        let (mut minx, mut miny) = (f32::INFINITY, f32::INFINITY);
+        let (mut maxx, mut maxy) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for &(x, y) in pts {
+            minx = minx.min(x);
+            miny = miny.min(y);
+            maxx = maxx.max(x);
+            maxy = maxy.max(y);
+        }
+        let x0 = (minx.floor() as i32).max(0);
+        let y0 = (miny.floor() as i32).max(0);
+        let x1 = (maxx.ceil() as i32).min(self.document.width as i32);
+        let y1 = (maxy.ceil() as i32).min(self.document.height as i32);
+        if x1 - x0 < 1 || y1 - y0 < 1 {
+            return;
+        }
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        self.push_undo();
+        let li = self.active_layer;
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        if let Some(layer) = self.document.layer_mut(li) {
+            for yy in 0..h {
+                for xx in 0..w {
+                    let wx = x0 as f32 + xx as f32 + 0.5;
+                    let wy = y0 as f32 + yy as f32 + 0.5;
+                    if ponto_no_poligono(wx, wy, pts) {
+                        let (px, py) = (x0 as u32 + xx, y0 as u32 + yy);
+                        if let Some(c) = layer.get_pixel(px, py) {
+                            let di = ((yy * w + xx) * 4) as usize;
+                            pixels[di] = c.r;
+                            pixels[di + 1] = c.g;
+                            pixels[di + 2] = c.b;
+                            pixels[di + 3] = c.a;
+                            layer.set_pixel(px, py, Color::TRANSPARENT);
+                        }
+                    }
+                }
+            }
+        }
+        self.float_sel = Some(FloatSel {
+            pixels,
+            ow: w,
+            oh: h,
+            cx: x0 as f32 + w as f32 / 2.0,
+            cy: y0 as f32 + h as f32 / 2.0,
+            hw: w as f32 / 2.0,
+            hh: h as f32 / 2.0,
+            angle: 0.0,
+            opacity: 1.0,
+        });
+        self.float_tex = None;
+        self.dirty = true;
+        self.status = "Seleção livre recortada — arraste para mover".into();
+    }
+
+    fn opcoes_laco(&mut self, ui: &mut egui::Ui) {
+        if self.float_sel.is_some() {
+            self.opcoes_selecao(ui);
+        } else {
+            ui.weak("Contorne uma área à mão livre (arraste) para selecionar os pixels.");
+        }
+    }
+
     /// Ferramentas que não trabalham em pixels ficam bloqueadas no pixel art.
     fn bloqueada_pixel(&self, t: Tool) -> bool {
         self.pixel_mode
@@ -1194,6 +1379,7 @@ impl SketchMotionApp {
                     // Grupo: seleção
                     for (t, ic, hint) in [
                         (Tool::Select, icon::CURSOR, "Seleção — selecionar e mover um elemento"),
+                        (Tool::Lasso, icon::LASSO, "Seleção livre (laço)"),
                         (Tool::DirectSelect, icon::SELECTION, "Seleção direta — editar por pontos"),
                         (Tool::MagicWand, icon::MAGIC_WAND, "Varinha mágica — selecionar por cor"),
                     ] {
@@ -1287,6 +1473,7 @@ impl SketchMotionApp {
                         Tool::Pencil => self.opcoes_pincel(ui),
                         Tool::Eraser => self.opcoes_borracha(ui),
                         Tool::Select => self.opcoes_selecao(ui),
+                        Tool::Lasso => self.opcoes_laco(ui),
                         Tool::Text => self.opcoes_texto(ui),
                         Tool::Pen => self.opcoes_caneta(ui),
                         Tool::MagicWand => self.opcoes_varinha(ui),
@@ -2157,7 +2344,7 @@ impl eframe::App for SketchMotionApp {
                 self.pen_drag_idx = None;
             }
         }
-        if self.tool != Tool::Select && self.float_sel.is_some() {
+        if !matches!(self.tool, Tool::Select | Tool::Lasso) && self.float_sel.is_some() {
             self.commit_float();
         }
         if self.bloqueada_pixel(self.tool) {
@@ -2308,7 +2495,7 @@ impl eframe::App for SketchMotionApp {
                 }
                 self.selected_obj = None;
             }
-            if k_del && self.tool == Tool::Select {
+            if k_del && matches!(self.tool, Tool::Select | Tool::Lasso) {
                 if self.float_sel.is_some() {
                     self.float_sel = None;
                     self.float_tex = None;
@@ -2449,49 +2636,8 @@ impl eframe::App for SketchMotionApp {
                         if pressed {
                             if let Some(p) = hover {
                                 let dp = to_doc(p);
-                                let mut consumed = false;
                                 // seleção flutuante (raster): dentro move; fora confirma
-                                if let Some(fs) = &self.float_sel {
-                                    let (cx, cy, hw, hh, ang) =
-                                        (fs.cx, fs.cy, fs.hw, fs.hh, fs.angle);
-                                    let scr = |wx: f32, wy: f32| {
-                                        egui::pos2(rect.min.x + wx * zoom, rect.min.y + wy * zoom)
-                                    };
-                                    let (tmx, tmy) = float_corner(cx, cy, hw, hh, ang, 0.0, -1.0);
-                                    let tm = scr(tmx, tmy);
-                                    let cc = scr(cx, cy);
-                                    let dir = (tm - cc).normalized();
-                                    let roth = tm + dir * 22.0;
-                                    if roth.distance(p) <= 12.0 {
-                                        self.float_rotating = true;
-                                        self.float_rot_grab = (dp.1 - cy).atan2(dp.0 - cx) - ang;
-                                        consumed = true;
-                                    } else {
-                                        let mut grabbed_h = None;
-                                        for &(sx, sy) in HSIGNS.iter() {
-                                            let (hx, hy) = float_corner(cx, cy, hw, hh, ang, sx, sy);
-                                            if scr(hx, hy).distance(p) <= 8.0 {
-                                                grabbed_h = Some((sx, sy));
-                                                break;
-                                            }
-                                        }
-                                        if let Some((sx, sy)) = grabbed_h {
-                                            self.fr_fixed =
-                                                float_corner(cx, cy, hw, hh, ang, -sx, -sy);
-                                            self.fr_wh = (2.0 * hw, 2.0 * hh);
-                                            self.fr_angle = ang;
-                                            self.float_resize = Some((sx, sy));
-                                            consumed = true;
-                                        } else {
-                                            let (lx, ly) = float_local(cx, cy, ang, dp.0, dp.1);
-                                            if lx.abs() <= hw && ly.abs() <= hh {
-                                                self.float_grab = (dp.0 - cx, dp.1 - cy);
-                                                self.float_dragging = true;
-                                                consumed = true;
-                                            }
-                                        }
-                                    }
-                                }
+                                let consumed = self.float_press(p, rect, zoom);
                                 if !consumed && self.float_sel.is_some() {
                                     self.commit_float();
                                 }
@@ -2652,48 +2798,8 @@ impl eframe::App for SketchMotionApp {
                                 }
                             }
                         }
-                        if down && self.float_resize.is_some() {
-                            if let (Some((gx, gy)), Some(pp)) = (self.float_resize, ppos) {
-                                let cur = to_doc(pp);
-                                let ang = self.fr_angle;
-                                let (pfx, pfy) = self.fr_fixed;
-                                let (w0, h0) = self.fr_wh;
-                                let (s, c) = ang.sin_cos();
-                                let (dx, dy) = (cur.0 - pfx, cur.1 - pfy);
-                                let (lx, ly) = (dx * c + dy * s, -dx * s + dy * c);
-                                let nw = if gx != 0.0 { lx.abs().max(1.0) } else { w0 };
-                                let nh = if gy != 0.0 { ly.abs().max(1.0) } else { h0 };
-                                let (hw, hh) = (nw / 2.0, nh / 2.0);
-                                let (flx, fly) = (-gx * hw, -gy * hh);
-                                let cxn = pfx - (flx * c - fly * s);
-                                let cyn = pfy - (flx * s + fly * c);
-                                if let Some(fs) = &mut self.float_sel {
-                                    fs.cx = cxn;
-                                    fs.cy = cyn;
-                                    fs.hw = hw;
-                                    fs.hh = hh;
-                                }
-                                self.dirty = true;
-                            }
-                        } else if down && self.float_rotating {
-                            if let Some(pp) = ppos {
-                                let cur = to_doc(pp);
-                                let grab = self.float_rot_grab;
-                                if let Some(fs) = &mut self.float_sel {
-                                    fs.angle = (cur.1 - fs.cy).atan2(cur.0 - fs.cx) - grab;
-                                }
-                                self.dirty = true;
-                            }
-                        } else if down && self.float_dragging {
-                            if let Some(pp) = ppos {
-                                let cur = to_doc(pp);
-                                let (gx, gy) = self.float_grab;
-                                if let Some(fs) = &mut self.float_sel {
-                                    fs.cx = cur.0 - gx;
-                                    fs.cy = cur.1 - gy;
-                                }
-                                self.dirty = true;
-                            }
+                        if down {
+                            self.float_down(ppos, rect, zoom);
                         }
                         if down && self.marquee_start.is_some() {
                             if let Some(pp) = ppos {
@@ -2705,11 +2811,36 @@ impl eframe::App for SketchMotionApp {
                             self.dragging_obj = false;
                             self.resize_handle = None;
                             self.rotating = false;
-                            self.float_dragging = false;
-                            self.float_resize = None;
-                            self.float_rotating = false;
+                            self.float_release();
                             if let Some(start) = self.marquee_start.take() {
                                 self.lift_selection(start, self.marquee_cur);
+                            }
+                        }
+                        self.last_pos = None;
+                    } else if self.tool == Tool::Lasso {
+                        if pressed {
+                            if let Some(pp) = hover {
+                                let consumed = self.float_press(pp, rect, zoom);
+                                if !consumed && self.float_sel.is_some() {
+                                    self.commit_float();
+                                }
+                                if !consumed {
+                                    self.lasso_points = vec![to_doc(pp)];
+                                }
+                            }
+                        }
+                        if down {
+                            if !self.float_down(ppos, rect, zoom) && !self.lasso_points.is_empty() {
+                                if let Some(pp) = ppos {
+                                    self.lasso_points.push(to_doc(pp));
+                                }
+                            }
+                        }
+                        if !down {
+                            self.float_release();
+                            if !self.lasso_points.is_empty() {
+                                let pts = std::mem::take(&mut self.lasso_points);
+                                self.lift_lasso(&pts);
                             }
                         }
                         self.last_pos = None;
@@ -2795,6 +2926,19 @@ impl eframe::App for SketchMotionApp {
                         }
                     }
 
+                    if self.tool == Tool::Lasso && self.lasso_points.len() >= 2 {
+                        let painter = ui.painter_at(rect);
+                        let pts: Vec<egui::Pos2> = self
+                            .lasso_points
+                            .iter()
+                            .map(|(x, y)| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom))
+                            .collect();
+                        painter.add(egui::Shape::line(
+                            pts,
+                            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0x2F, 0x84, 0xFE)),
+                        ));
+                    }
+
                     // Cursor personalizado por ferramenta + decorações no canvas.
                     if response.hovered() {
                         use egui::CursorIcon as CI;
@@ -2820,7 +2964,7 @@ impl eframe::App for SketchMotionApp {
                                     }
                                     ui.ctx().set_cursor_icon(CI::None);
                                 }
-                                Tool::Pen | Tool::Shapes | Tool::Fill => {
+                                Tool::Pen | Tool::Shapes | Tool::Fill | Tool::Lasso => {
                                     ui.ctx().set_cursor_icon(CI::Crosshair);
                                 }
                                 Tool::Select => {

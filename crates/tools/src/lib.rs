@@ -11,6 +11,8 @@ use sketchmotion_core::Color;
 pub enum Tool {
     /// Seta de seleção — selecionar e mover um elemento (em desenvolvimento).
     Select,
+    /// Seleção livre (laço) — recorta pixels dentro de um contorno.
+    Lasso,
     /// Seleção direta — editar por pontos (em desenvolvimento).
     DirectSelect,
     /// Varinha mágica — selecionar por cor (em desenvolvimento).
@@ -46,6 +48,7 @@ impl Tool {
     pub fn label(self) -> &'static str {
         match self {
             Tool::Select => "Seleção",
+            Tool::Lasso => "Laço",
             Tool::DirectSelect => "Seleção direta",
             Tool::MagicWand => "Varinha mágica",
             Tool::Pen => "Caneta",
