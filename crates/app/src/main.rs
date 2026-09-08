@@ -87,6 +87,159 @@ fn thumb_image(full: &PixelImage, tw: usize, th: usize) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([tw, th], &out)
 }
 
+// ---------- Prévia visual dos pincéis ----------
+
+fn pv_blend(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, c: Color, cover: f32) {
+    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+        return;
+    }
+    let i = ((y as usize) * w + x as usize) * 4;
+    let sa = (c.a as f32 / 255.0) * cover.clamp(0.0, 1.0);
+    if sa <= 0.0 {
+        return;
+    }
+    let da = buf[i + 3] as f32 / 255.0;
+    let oa = sa + da * (1.0 - sa);
+    if oa <= 0.0 {
+        return;
+    }
+    let ch = [c.r, c.g, c.b];
+    for k in 0..3 {
+        let sc = ch[k] as f32 / 255.0;
+        let dc = buf[i + k] as f32 / 255.0;
+        buf[i + k] = (((sc * sa + dc * da * (1.0 - sa)) / oa) * 255.0).round() as u8;
+    }
+    buf[i + 3] = (oa * 255.0).round() as u8;
+}
+
+fn pv_rng(state: &mut u32) -> f32 {
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    (x >> 8) as f32 / 16_777_216.0
+}
+
+fn pv_hard(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, r: i32, c: Color) {
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy <= r * r {
+                pv_blend(buf, w, h, x + dx, y + dy, c, 1.0);
+            }
+        }
+    }
+}
+
+fn pv_soft(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, r: i32, c: Color, master: f32) {
+    let rf = (r as f32).max(0.5);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d2 = (dx * dx + dy * dy) as f32;
+            if d2 > rf * rf {
+                continue;
+            }
+            let t = (1.0 - d2.sqrt() / rf).clamp(0.0, 1.0);
+            pv_blend(buf, w, h, x + dx, y + dy, c, t * t * master);
+        }
+    }
+}
+
+fn pv_spray(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, r: i32, c: Color, rng: &mut u32) {
+    let rf = r as f32;
+    let n = ((r as f32) * 2.2).max(6.0) as i32;
+    for _ in 0..n {
+        let a = pv_rng(rng) * std::f32::consts::TAU;
+        let rad = rf * pv_rng(rng).sqrt();
+        pv_blend(
+            buf,
+            w,
+            h,
+            x + (rad * a.cos()).round() as i32,
+            y + (rad * a.sin()).round() as i32,
+            c,
+            0.3,
+        );
+    }
+}
+
+fn pv_crayon(buf: &mut [u8], w: usize, h: usize, x: i32, y: i32, r: i32, c: Color, rng: &mut u32) {
+    let rf = (r as f32).max(0.5);
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d2 = (dx * dx + dy * dy) as f32;
+            if d2 > rf * rf {
+                continue;
+            }
+            let g = pv_rng(rng);
+            if g < 0.45 {
+                continue;
+            }
+            let t = (1.0 - d2.sqrt() / rf).clamp(0.0, 1.0);
+            pv_blend(buf, w, h, x + dx, y + dy, c, t * 0.9 * (0.55 + 0.45 * g));
+        }
+    }
+}
+
+/// Renderiza um traço de amostra representando a ponta `kind`.
+fn preview_brush(kind: usize) -> egui::ColorImage {
+    let (w, h) = (72usize, 26usize);
+    let mut buf = vec![0u8; w * h * 4];
+    for px in buf.chunks_exact_mut(4) {
+        px[0] = 250;
+        px[1] = 250;
+        px[2] = 250;
+        px[3] = 255;
+    }
+    if kind == 7 {
+        // Esfumador: gradiente horizontal (mistura de duas cores).
+        let a = Color::rgb(60, 110, 200);
+        let b = Color::rgb(220, 130, 40);
+        for y in 0..h {
+            for x in 0..w {
+                let t = x as f32 / (w as f32 - 1.0);
+                let vy = 1.0 - ((y as f32 / h as f32 - 0.5).abs() * 2.0);
+                let c = Color::rgb(
+                    (a.r as f32 * (1.0 - t) + b.r as f32 * t) as u8,
+                    (a.g as f32 * (1.0 - t) + b.g as f32 * t) as u8,
+                    (a.b as f32 * (1.0 - t) + b.b as f32 * t) as u8,
+                );
+                pv_blend(&mut buf, w, h, x as i32, y as i32, c, (vy * 0.9).clamp(0.0, 1.0));
+            }
+        }
+        return egui::ColorImage::from_rgba_unmultiplied([w, h], &buf);
+    }
+    let col = Color::rgb(40, 40, 40);
+    let mut rng: u32 = 0x9E37_79B9;
+    let (cx0, cx1) = (6.0f32, w as f32 - 6.0);
+    let steps = (cx1 - cx0) as i32;
+    let mut prev_dot = -100.0f32;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let x = cx0 + (cx1 - cx0) * t;
+        let y = h as f32 * 0.5 + (t * std::f32::consts::TAU * 1.1).sin() * (h as f32 * 0.30);
+        let r = if kind == 5 {
+            (1.0 + 3.0 * (1.0 - (2.0 * (t - 0.5)).abs())).round() as i32
+        } else {
+            3
+        };
+        match kind {
+            1 => pv_soft(&mut buf, w, h, x as i32, y as i32, r, col, 0.55),
+            2 => pv_soft(&mut buf, w, h, x as i32, y as i32, r, col, 0.30),
+            3 => pv_spray(&mut buf, w, h, x as i32, y as i32, r + 1, col, &mut rng),
+            4 => pv_crayon(&mut buf, w, h, x as i32, y as i32, r, col, &mut rng),
+            6 => {
+                if x - prev_dot >= 6.0 {
+                    prev_dot = x;
+                    pv_hard(&mut buf, w, h, x as i32, y as i32, 2, col);
+                }
+            }
+            _ => pv_hard(&mut buf, w, h, x as i32, y as i32, r, col),
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([w, h], &buf)
+}
+
 /// Distância de um ponto (px,py) ao segmento (x1,y1)-(x2,y2).
 fn dist_point_seg(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
     let dx = x2 - x1;
@@ -525,6 +678,7 @@ struct SketchMotionApp {
     brush_kind: usize,
     rng: u32,
     smudge: Option<[f32; 4]>,
+    brush_prev: Vec<Option<egui::TextureHandle>>,
     playing: bool,
     play_frame: usize,
     play_accum: f32,
@@ -626,6 +780,7 @@ impl SketchMotionApp {
             brush_kind: 0,
             rng: 0x2545_F491,
             smudge: None,
+            brush_prev: Vec::new(),
             playing: false,
             play_frame: 0,
             play_accum: 0.0,
@@ -2035,12 +2190,40 @@ impl SketchMotionApp {
     }
 
     fn opcoes_pincel(&mut self, ui: &mut egui::Ui) {
+        if self.brush_prev.len() != BRUSHES.len() {
+            self.brush_prev = vec![None; BRUSHES.len()];
+        }
+        for i in 0..BRUSHES.len() {
+            if self.brush_prev[i].is_none() {
+                let img = preview_brush(i);
+                self.brush_prev[i] = Some(ui.ctx().load_texture(
+                    format!("brush_prev{i}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
         ui.label("Pincel:");
+        if let Some(tex) = &self.brush_prev[self.brush_kind] {
+            ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                tex.id(),
+                egui::vec2(50.0, 18.0),
+            )));
+        }
         egui::ComboBox::from_id_salt("tipo_pincel")
             .selected_text(BRUSHES[self.brush_kind])
+            .width(190.0)
             .show_ui(ui, |ui| {
-                for (i, b) in BRUSHES.iter().enumerate() {
-                    ui.selectable_value(&mut self.brush_kind, i, *b);
+                for i in 0..BRUSHES.len() {
+                    ui.horizontal(|ui| {
+                        if let Some(tex) = &self.brush_prev[i] {
+                            ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                                tex.id(),
+                                egui::vec2(64.0, 20.0),
+                            )));
+                        }
+                        ui.selectable_value(&mut self.brush_kind, i, BRUSHES[i]);
+                    });
                 }
             });
         ui.separator();
