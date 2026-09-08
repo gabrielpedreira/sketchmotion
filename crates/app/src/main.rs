@@ -286,6 +286,16 @@ const HSIGNS: [(f32, f32); 8] = [
 ];
 
 /// Ponto (mundo) de um canto/lado da seleção flutuante girada.
+fn resize_cursor(sx: f32, sy: f32) -> egui::CursorIcon {
+    use egui::CursorIcon as CI;
+    match (sx as i32, sy as i32) {
+        (0, _) => CI::ResizeVertical,
+        (_, 0) => CI::ResizeHorizontal,
+        (a, b) if a == b => CI::ResizeNwSe,
+        _ => CI::ResizeNeSw,
+    }
+}
+
 fn float_corner(cx: f32, cy: f32, hw: f32, hh: f32, ang: f32, sx: f32, sy: f32) -> (f32, f32) {
     let (s, c) = ang.sin_cos();
     let (lx, ly) = (sx * hw, sy * hh);
@@ -629,6 +639,7 @@ struct SketchMotionApp {
     text_underline: bool,
     text_outline: bool,
     wand_tolerance: i32,
+    wand_contiguo: bool,
     pen_width: i32,
     // estado vetorial
     selected_obj: Option<usize>,
@@ -738,6 +749,7 @@ impl SketchMotionApp {
             text_underline: false,
             text_outline: false,
             wand_tolerance: 32,
+            wand_contiguo: true,
             pen_width: 2,
             selected_obj: None,
             pen_anchors: Vec::new(),
@@ -1512,6 +1524,49 @@ impl SketchMotionApp {
         true
     }
 
+    /// Cursor apropriado quando o ponteiro está sobre a seleção flutuante
+    /// (alça de rotação, quadradinhos de redimensionar ou corpo p/ mover).
+    /// Devolve None se o ponteiro não estiver sobre o gizmo.
+    fn float_cursor(&self, p: egui::Pos2, rect: egui::Rect, zoom: f32) -> Option<egui::CursorIcon> {
+        use egui::CursorIcon as CI;
+        // Interação em andamento vence a detecção por hover.
+        if self.float_rotating {
+            return Some(CI::Grabbing);
+        }
+        if let Some((sx, sy)) = self.float_resize {
+            return Some(resize_cursor(sx, sy));
+        }
+        if self.float_dragging {
+            return Some(CI::Grabbing);
+        }
+        let fs = self.float_sel.as_ref()?;
+        let (cx, cy, hw, hh, ang) = (fs.cx, fs.cy, fs.hw, fs.hh, fs.angle);
+        let dp = ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+        let scr = |wx: f32, wy: f32| egui::pos2(rect.min.x + wx * zoom, rect.min.y + wy * zoom);
+        // Alça de rotação.
+        let (tmx, tmy) = float_corner(cx, cy, hw, hh, ang, 0.0, -1.0);
+        let tm = scr(tmx, tmy);
+        let cc = scr(cx, cy);
+        let dir = (tm - cc).normalized();
+        let roth = tm + dir * 22.0;
+        if roth.distance(p) <= 12.0 {
+            return Some(CI::Grab);
+        }
+        // Quadradinhos de redimensionar.
+        for &(sx, sy) in HSIGNS.iter() {
+            let (hx, hy) = float_corner(cx, cy, hw, hh, ang, sx, sy);
+            if scr(hx, hy).distance(p) <= 8.0 {
+                return Some(resize_cursor(sx, sy));
+            }
+        }
+        // Corpo da seleção.
+        let (lx, ly) = float_local(cx, cy, ang, dp.0, dp.1);
+        if lx.abs() <= hw && ly.abs() <= hh {
+            return Some(CI::Grab);
+        }
+        None
+    }
+
     fn float_release(&mut self) {
         self.float_dragging = false;
         self.float_resize = None;
@@ -1577,6 +1632,117 @@ impl SketchMotionApp {
         self.status = "Seleção livre recortada — arraste para mover".into();
     }
 
+    /// Varinha mágica: seleciona a região de cor semelhante (contígua ou toda a
+    /// camada) e recorta para uma seleção flutuante.
+    fn lift_wand(&mut self, x0: i32, y0: i32) {
+        let w = self.document.width as i32;
+        let h = self.document.height as i32;
+        if x0 < 0 || y0 < 0 || x0 >= w || y0 >= h {
+            return;
+        }
+        let li = self.active_layer;
+        if self.document.layer(li).map_or(true, |l| l.locked) {
+            return;
+        }
+        let target = match self
+            .document
+            .layer(li)
+            .and_then(|l| l.get_pixel(x0 as u32, y0 as u32))
+        {
+            Some(c) => c,
+            None => return,
+        };
+        let tol = self.wand_tolerance;
+        let close = |c: Color| {
+            (c.r as i32 - target.r as i32)
+                .abs()
+                .max((c.g as i32 - target.g as i32).abs())
+                .max((c.b as i32 - target.b as i32).abs())
+                .max((c.a as i32 - target.a as i32).abs())
+                <= tol
+        };
+        let mut mask = vec![false; (w * h) as usize];
+        if self.wand_contiguo {
+            let mut stack = vec![(x0, y0)];
+            while let Some((x, y)) = stack.pop() {
+                if x < 0 || y < 0 || x >= w || y >= h {
+                    continue;
+                }
+                let idx = (y * w + x) as usize;
+                if mask[idx] {
+                    continue;
+                }
+                match self.document.layer(li).and_then(|l| l.get_pixel(x as u32, y as u32)) {
+                    Some(c) if close(c) => {}
+                    _ => continue,
+                }
+                mask[idx] = true;
+                stack.push((x + 1, y));
+                stack.push((x - 1, y));
+                stack.push((x, y + 1));
+                stack.push((x, y - 1));
+            }
+        } else if let Some(layer) = self.document.layer(li) {
+            for y in 0..h {
+                for x in 0..w {
+                    if let Some(c) = layer.get_pixel(x as u32, y as u32) {
+                        if close(c) {
+                            mask[(y * w + x) as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+        let (mut minx, mut miny, mut maxx, mut maxy) = (w, h, -1, -1);
+        for y in 0..h {
+            for x in 0..w {
+                if mask[(y * w + x) as usize] {
+                    minx = minx.min(x);
+                    miny = miny.min(y);
+                    maxx = maxx.max(x);
+                    maxy = maxy.max(y);
+                }
+            }
+        }
+        if maxx < minx {
+            return;
+        }
+        let (bw, bh) = ((maxx - minx + 1) as u32, (maxy - miny + 1) as u32);
+        self.push_undo();
+        let mut pixels = vec![0u8; (bw * bh * 4) as usize];
+        if let Some(layer) = self.document.layer_mut(li) {
+            for yy in 0..bh {
+                for xx in 0..bw {
+                    let (gx, gy) = (minx + xx as i32, miny + yy as i32);
+                    if mask[(gy * w + gx) as usize] {
+                        if let Some(c) = layer.get_pixel(gx as u32, gy as u32) {
+                            let di = ((yy * bw + xx) * 4) as usize;
+                            pixels[di] = c.r;
+                            pixels[di + 1] = c.g;
+                            pixels[di + 2] = c.b;
+                            pixels[di + 3] = c.a;
+                            layer.set_pixel(gx as u32, gy as u32, Color::TRANSPARENT);
+                        }
+                    }
+                }
+            }
+        }
+        self.float_sel = Some(FloatSel {
+            pixels,
+            ow: bw,
+            oh: bh,
+            cx: minx as f32 + bw as f32 / 2.0,
+            cy: miny as f32 + bh as f32 / 2.0,
+            hw: bw as f32 / 2.0,
+            hh: bh as f32 / 2.0,
+            angle: 0.0,
+            opacity: 1.0,
+        });
+        self.float_tex = None;
+        self.dirty = true;
+        self.status = "Seleção por cor — arraste para mover".into();
+    }
+
     fn opcoes_laco(&mut self, ui: &mut egui::Ui) {
         if self.float_sel.is_some() {
             self.opcoes_selecao(ui);
@@ -1588,10 +1754,7 @@ impl SketchMotionApp {
     /// Ferramentas que não trabalham em pixels ficam bloqueadas no pixel art.
     fn bloqueada_pixel(&self, t: Tool) -> bool {
         self.pixel_mode
-            && matches!(
-                t,
-                Tool::Pen | Tool::Shapes | Tool::Text | Tool::DirectSelect | Tool::MagicWand
-            )
+            && matches!(t, Tool::Pen | Tool::Shapes | Tool::Text | Tool::DirectSelect)
     }
 
     /// Desenha os traços vetoriais no buffer RGBA (borda para o flood fill).
@@ -2407,7 +2570,10 @@ impl SketchMotionApp {
         ui.label("Tolerância:");
         ui.add(egui::Slider::new(&mut self.wand_tolerance, 0..=255));
         ui.separator();
-        ui.weak("Seleção por cor: em desenvolvimento.");
+        ui.checkbox(&mut self.wand_contiguo, "Contíguo")
+            .on_hover_text("Ligado: só a região conectada da cor. Desligado: toda a cor na camada.");
+        ui.separator();
+        ui.weak("Clique numa cor para selecioná-la (vira seleção móvel).");
     }
 
     fn opcoes_selecao_direta(&mut self, ui: &mut egui::Ui) {
@@ -3053,7 +3219,7 @@ impl eframe::App for SketchMotionApp {
                 self.pen_drag_idx = None;
             }
         }
-        if !matches!(self.tool, Tool::Select | Tool::Lasso) && self.float_sel.is_some() {
+        if !matches!(self.tool, Tool::Select | Tool::Lasso | Tool::MagicWand) && self.float_sel.is_some() {
             self.commit_float();
         }
         if self.bloqueada_pixel(self.tool) {
@@ -3209,7 +3375,7 @@ impl eframe::App for SketchMotionApp {
                 }
                 self.selected_obj = None;
             }
-            if k_del && matches!(self.tool, Tool::Select | Tool::Lasso) {
+            if k_del && matches!(self.tool, Tool::Select | Tool::Lasso | Tool::MagicWand) {
                 if self.float_sel.is_some() {
                     self.float_sel = None;
                     self.float_tex = None;
@@ -3590,6 +3756,26 @@ impl eframe::App for SketchMotionApp {
                             }
                         }
                         self.last_pos = None;
+                    } else if self.tool == Tool::MagicWand {
+                        if pressed {
+                            if let Some(pp) = hover {
+                                let consumed = self.float_press(pp, rect, zoom);
+                                if !consumed {
+                                    if self.float_sel.is_some() {
+                                        self.commit_float();
+                                    }
+                                    let (x, y) = to_pixel(pp);
+                                    self.lift_wand(x, y);
+                                }
+                            }
+                        }
+                        if down {
+                            self.float_down(ppos, rect, zoom);
+                        }
+                        if !down {
+                            self.float_release();
+                        }
+                        self.last_pos = None;
                     } else if self.tool == Tool::Shapes {
                         if pressed {
                             if let Some(p) = hover {
@@ -3711,10 +3897,22 @@ impl eframe::App for SketchMotionApp {
                                     }
                                     ui.ctx().set_cursor_icon(CI::None);
                                 }
-                                Tool::Pen | Tool::Shapes | Tool::Fill | Tool::Lasso => {
+                                Tool::Pen | Tool::Shapes | Tool::Fill => {
                                     ui.ctx().set_cursor_icon(CI::Crosshair);
                                 }
-                                Tool::Select => {
+                                Tool::Lasso | Tool::MagicWand => {
+                                    let c = hover
+                                        .and_then(|hp| self.float_cursor(hp, rect, zoom))
+                                        .unwrap_or(CI::Crosshair);
+                                    ui.ctx().set_cursor_icon(c);
+                                }
+                                Tool::Select => 'sel: {
+                                    if let Some(c) =
+                                        hover.and_then(|hp| self.float_cursor(hp, rect, zoom))
+                                    {
+                                        ui.ctx().set_cursor_icon(c);
+                                        break 'sel;
+                                    }
                                     let rot_zone = self.rotating
                                         || match (self.selected_obj, hover) {
                                             (Some(si), Some(hp)) => {
