@@ -10,7 +10,7 @@
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{Anchor, Color, Document, VectorObject};
-use sketchmotion_render::{render_document, render_layers, render_layers_alpha, PixelImage};
+use sketchmotion_render::{render_document, render_frame, render_frame_alpha, PixelImage};
 use sketchmotion_tools::Tool;
 
 const CANVAS_W: u32 = 800;
@@ -809,7 +809,13 @@ impl SketchMotionApp {
             .set_file_name("desenho.png")
             .save_file()
         {
-            let img = render_document(&self.document);
+            let img = render_frame(
+                self.document.width,
+                self.document.height,
+                self.document.background,
+                &self.document.layers,
+                &self.document.vectors,
+            );
             self.status = match sketchmotion_io::export_png(
                 img.width as u32,
                 img.height as u32,
@@ -1530,11 +1536,12 @@ impl SketchMotionApp {
         }
         ctx.request_repaint();
         let pf = self.play_frame.min(n.saturating_sub(1));
-        let img = render_layers(
+        let img = render_frame(
             self.document.width,
             self.document.height,
             self.document.background,
             &self.document.frames[pf].layers,
+            &self.document.frames[pf].vectors,
         );
         let ci = egui::ColorImage::from_rgba_unmultiplied(
             [img.width as usize, img.height as usize],
@@ -1598,9 +1605,15 @@ impl SketchMotionApp {
         for i in 0..n {
             if self.frame_thumbs[i].is_none() {
                 let full = if i == self.document.current {
-                    render_layers(dw, dh, bg, &self.document.layers)
+                    render_frame(dw, dh, bg, &self.document.layers, &self.document.vectors)
                 } else {
-                    render_layers(dw, dh, bg, &self.document.frames[i].layers)
+                    render_frame(
+                        dw,
+                        dh,
+                        bg,
+                        &self.document.frames[i].layers,
+                        &self.document.frames[i].vectors,
+                    )
                 };
                 let img = thumb_image(&full, th_w, th_h);
                 self.frame_thumbs[i] =
@@ -2870,10 +2883,11 @@ impl eframe::App for SketchMotionApp {
                     if self.onion && self.document.current > 0 {
                         let prev = self.document.current - 1;
                         if self.onion_for != Some(prev) || self.onion_tex.is_none() {
-                            let oi = render_layers_alpha(
+                            let oi = render_frame_alpha(
                                 self.document.width,
                                 self.document.height,
                                 &self.document.frames[prev].layers,
+                                &self.document.frames[prev].vectors,
                             );
                             let ci = egui::ColorImage::from_rgba_unmultiplied(
                                 [oi.width as usize, oi.height as usize],
