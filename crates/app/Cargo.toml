@@ -15,3 +15,5 @@ eframe = "0.29"
 # Ícones prontos (estilo Lucide) como fonte para o egui.
 egui-phosphor = "0.7"
 rfd = "0.14"
+# Leitura do ícone .ico da janela.
+image = { version = "0.25", default-features = false, features = ["ico"] }

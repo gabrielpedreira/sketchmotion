@@ -64,3 +64,23 @@ pincel, borracha, **conta-gotas**, **balde de preenchimento**, formas
 (linha, retângulo, elipse), texto, mão (pan) e zoom. Cada ferramenta é um
 botão/ícone; a arquitetura (crate `tools`) deve permitir adicionar novas sem
 mexer nas existentes. No rodapé, os seletores de cor de preenchimento/traço.
+
+### Ferramentas da barra esquerda ainda sem lógica (stubs → etapas próprias)
+A barra de ferramentas à esquerda já foi construída (estrutura + ícones) e a
+barra de opções no topo (controles da ferramenta ativa). Já funcionam: Pincel,
+Borracha e Conta-gotas. Entraram como ícone, mas **sem lógica**, aguardando
+etapa dedicada (cada uma é um módulo/estado próprio no crate `tools`):
+
+- **Seleção (seta)** — selecionar um elemento/região e movê-lo. Depende do
+  sistema de seleção (retângulo/mover conteúdo). Base da v0.2.
+- **Seleção direta** — editar por pontos. Depende de um modelo vetorial/pontos
+  (hoje o canvas é raster); vem junto com Caneta.
+- **Varinha mágica** — selecionar pixels da mesma cor (flood/contíguo ou global)
+  a partir de um clique. Depende do sistema de seleção.
+- **Caneta (pen)** — desenhar por pontos/bézier (traçados vetoriais). Módulo
+  vetorial novo.
+- **Texto** — inserir e editar texto no canvas (fonte, tamanho, cor). Módulo de
+  texto novo; a espessura/tamanho vai na barra de opções do topo.
+
+Ordem sugerida quando forem implementadas: Seleção (mover) → Varinha mágica →
+Caneta → Seleção direta → Texto.

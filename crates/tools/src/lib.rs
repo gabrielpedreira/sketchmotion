@@ -1,30 +1,52 @@
-//! sketchmotion-tools — ferramentas de desenho.
+//! sketchmotion-tools — ferramentas de desenho e edição.
 //!
-//! v0.1: lápis e borracha, como um enum simples. Quando surgirem ferramentas
-//! com estado próprio (seleção, formas — v0.2), isto vira uma máquina de estado
-//! por trait, uma por ferramenta, sem alterar as demais.
+//! v0.2: além de pincel e borracha (raster), o enum passa a listar as
+//! ferramentas da barra lateral (seleção, seleção direta, varinha, caneta,
+//! texto). As que ainda não têm lógica ficam marcadas por `em_desenvolvimento`
+//! e serão implementadas, cada uma no seu módulo, nas próximas versões.
 
 use sketchmotion_core::Color;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
+    /// Seta de seleção — selecionar e mover um elemento (em desenvolvimento).
+    Select,
+    /// Seleção direta — editar por pontos (em desenvolvimento).
+    DirectSelect,
+    /// Varinha mágica — selecionar por cor (em desenvolvimento).
+    MagicWand,
+    /// Caneta — desenhar por pontos (em desenvolvimento).
+    Pen,
+    /// Texto (em desenvolvimento).
+    Text,
+    /// Pincel — desenho livre raster.
     Pencil,
+    /// Borracha — pinta transparente, revelando o que está por baixo.
     Eraser,
 }
 
 impl Tool {
     /// Cor efetivamente aplicada, dada a cor atual do pincel.
-    /// A borracha pinta transparente, revelando o que está por baixo.
     pub fn effective_color(self, brush: Color) -> Color {
         match self {
-            Tool::Pencil => brush,
             Tool::Eraser => Color::TRANSPARENT,
+            _ => brush,
         }
+    }
+
+    /// True quando a ferramenta pinta livremente no canvas (pincel/borracha).
+    pub fn paints(self) -> bool {
+        matches!(self, Tool::Pencil | Tool::Eraser)
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Tool::Pencil => "Lápis",
+            Tool::Select => "Seleção",
+            Tool::DirectSelect => "Seleção direta",
+            Tool::MagicWand => "Varinha mágica",
+            Tool::Pen => "Caneta",
+            Tool::Text => "Texto",
+            Tool::Pencil => "Pincel",
             Tool::Eraser => "Borracha",
         }
     }

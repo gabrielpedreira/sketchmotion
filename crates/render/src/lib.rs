@@ -37,11 +37,15 @@ pub fn render_document(doc: &Document) -> PixelImage {
         if !layer.visible {
             continue;
         }
+        let op = layer.opacity();
+        if op <= 0.0 {
+            continue;
+        }
         let src = layer.pixels();
         for (dst, s) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-            let sa = s[3] as u32;
+            let sa = ((s[3] as f32) * op).round() as u32;
             if sa == 0 {
-                continue; // pixel transparente da camada: não altera o fundo
+                continue; // transparente ou opacidade 0: não altera o fundo
             }
             let ia = 255 - sa; // inverso do alpha
             dst[0] = ((s[0] as u32 * sa + dst[0] as u32 * ia) / 255) as u8;

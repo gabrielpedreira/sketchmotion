@@ -9,7 +9,7 @@
 
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
-use sketchmotion_core::{Color, Document};
+use sketchmotion_core::{Anchor, Color, Document, VectorObject};
 use sketchmotion_render::{render_document, PixelImage};
 use sketchmotion_tools::Tool;
 
@@ -20,9 +20,14 @@ const MAX_UNDO: usize = 10;
 /// Nº de colunas da grade de cores básicas.
 const BASICAS_COLS: usize = 16;
 
+/// Fontes exibidas no painel de texto (aplicação real virá com o módulo de texto).
+const FONTES: [&str; 4] = ["Sans", "Serif", "Monospace", "Manuscrito"];
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1120.0, 760.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1120.0, 760.0])
+            .with_icon(std::sync::Arc::new(load_icon())),
         ..Default::default()
     };
     eframe::run_native(
@@ -38,8 +43,35 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// Carrega o ícone da janela a partir do .ico embutido no binário.
+fn load_icon() -> egui::IconData {
+    let bytes = include_bytes!("../../../assets/logo-oficial.ico");
+    match image::load_from_memory(bytes) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            egui::IconData { rgba: rgba.into_raw(), width: w, height: h }
+        }
+        Err(_) => egui::IconData { rgba: vec![0, 0, 0, 0], width: 1, height: 1 },
+    }
+}
+
 fn to_color32(c: Color) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+/// Distância de um ponto (px,py) ao segmento (x1,y1)-(x2,y2).
+fn dist_point_seg(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {
+    let dx = x2 - x1;
+    let dy = y2 - y1;
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f32::EPSILON {
+        return ((px - x1).powi(2) + (py - y1).powi(2)).sqrt();
+    }
+    let t = (((px - x1) * dx + (py - y1) * dy) / len2).clamp(0.0, 1.0);
+    let cx = x1 + t * dx;
+    let cy = y1 + t * dy;
+    ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
 /// Gera a grade de cores básicas: uma linha de tons de cinza + linhas de
@@ -230,7 +262,6 @@ struct SketchMotionApp {
     custom_colors: Vec<egui::Color32>,
     picker_hsva: egui::ecolor::Hsva,
     // janelas de ferramenta (abrir/ocultar pela barra de ícones)
-    win_tools: bool,
     win_color: bool,
     win_palette: bool,
     // paletas por personagem
@@ -239,10 +270,8 @@ struct SketchMotionApp {
     selected_char: Option<usize>,
     new_char_name: String,
     new_group_name: String,
-    icon_r_tools: Option<egui::Rect>,
     icon_r_color: Option<egui::Rect>,
     icon_r_palette: Option<egui::Rect>,
-    reopen_tools: bool,
     reopen_color: bool,
     reopen_palette: bool,
     eyedropper: Eyedropper,
@@ -259,6 +288,19 @@ struct SketchMotionApp {
     undo_stack: Vec<Document>,
     redo_stack: Vec<Document>,
     zoom: f32,
+    // configurações por ferramenta (barra de opções do topo)
+    text_font: usize,
+    text_size: f32,
+    text_bold: bool,
+    text_italic: bool,
+    text_underline: bool,
+    text_outline: bool,
+    wand_tolerance: i32,
+    pen_width: i32,
+    // estado vetorial
+    selected_obj: Option<usize>,
+    pen_points: Vec<(f32, f32)>,
+    dragging_obj: bool,
 }
 
 impl SketchMotionApp {
@@ -280,7 +322,6 @@ impl SketchMotionApp {
             status: String::new(),
             custom_colors: Vec::new(),
             picker_hsva: egui::ecolor::Hsva::from(egui::Color32::BLACK),
-            win_tools: true,
             win_color: false,
             win_palette: false,
             library,
@@ -288,10 +329,8 @@ impl SketchMotionApp {
             selected_char,
             new_char_name: String::new(),
             new_group_name: String::new(),
-            icon_r_tools: None,
             icon_r_color: None,
             icon_r_palette: None,
-            reopen_tools: false,
             reopen_color: false,
             reopen_palette: false,
             eyedropper: Eyedropper::Off,
@@ -308,6 +347,17 @@ impl SketchMotionApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             zoom: 1.0,
+            text_font: 0,
+            text_size: 24.0,
+            text_bold: false,
+            text_italic: false,
+            text_underline: false,
+            text_outline: false,
+            wand_tolerance: 32,
+            pen_width: 2,
+            selected_obj: None,
+            pen_points: Vec::new(),
+            dragging_obj: false,
         }
     }
 
@@ -531,6 +581,348 @@ impl SketchMotionApp {
     }
 
     /// Barra direita de ícones (uma ferramenta por ícone).
+    /// Finaliza o traço da Caneta, criando um objeto vetorial.
+    fn finalizar_caneta(&mut self) {
+        if self.pen_points.len() >= 2 {
+            self.push_undo();
+            let mut obj = VectorObject::new(self.brush_core_color(), self.pen_width as f32);
+            obj.points = self
+                .pen_points
+                .iter()
+                .map(|(x, y)| Anchor::new(*x, *y))
+                .collect();
+            self.document.vectors.push(obj);
+            self.selected_obj = Some(self.document.vectors.len() - 1);
+            self.status = "Traço vetorial criado".into();
+        }
+        self.pen_points.clear();
+        self.dirty = true;
+    }
+
+    /// Índice do objeto vetorial mais próximo do ponto (coords do documento),
+    /// dentro da tolerância `thr`; None se nenhum estiver perto.
+    fn hit_test(&self, ponto: (f32, f32), thr: f32) -> Option<usize> {
+        let (px, py) = ponto;
+        let mut best: Option<(usize, f32)> = None;
+        for (i, obj) in self.document.vectors.iter().enumerate() {
+            let mut dmin = f32::INFINITY;
+            if obj.points.len() == 1 {
+                let a = &obj.points[0];
+                dmin = ((a.x - px).powi(2) + (a.y - py).powi(2)).sqrt();
+            } else {
+                for w in obj.points.windows(2) {
+                    let d = dist_point_seg(px, py, w[0].x, w[0].y, w[1].x, w[1].y);
+                    if d < dmin {
+                        dmin = d;
+                    }
+                }
+            }
+            let tol = thr + obj.stroke_width * 0.5;
+            if dmin <= tol && best.map_or(true, |(_, bd)| dmin < bd) {
+                best = Some((i, dmin));
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Desenha os objetos vetoriais, a caixa de seleção e o traço em progresso
+    /// como overlay sobre o canvas (coordenadas do documento -> tela).
+    fn desenhar_vetores(&self, ui: &egui::Ui, rect: egui::Rect, zoom: f32) {
+        let painter = ui.painter_at(rect);
+        let sp = |x: f32, y: f32| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom);
+        let azul = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+        for (idx, obj) in self.document.vectors.iter().enumerate() {
+            let col = to_color32(obj.stroke).linear_multiply(obj.opacity.clamp(0.0, 1.0));
+            let w = (obj.stroke_width * zoom).max(1.0);
+            let pts: Vec<egui::Pos2> = obj.points.iter().map(|a| sp(a.x, a.y)).collect();
+            if pts.len() >= 2 {
+                painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(w, col)));
+            } else if pts.len() == 1 {
+                painter.circle_filled(pts[0], (w / 2.0).max(1.5), col);
+            }
+            if Some(idx) == self.selected_obj {
+                if let Some((minx, miny, maxx, maxy)) = obj.bounds() {
+                    let r = egui::Rect::from_min_max(sp(minx, miny), sp(maxx, maxy)).expand(3.0);
+                    painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0_f32, azul));
+                    for c in [
+                        r.left_top(),
+                        r.center_top(),
+                        r.right_top(),
+                        r.right_center(),
+                        r.right_bottom(),
+                        r.center_bottom(),
+                        r.left_bottom(),
+                        r.left_center(),
+                    ] {
+                        let h = egui::Rect::from_center_size(c, egui::vec2(7.0, 7.0));
+                        painter.rect_filled(h, 0.0, egui::Color32::WHITE);
+                        painter.rect_stroke(h, 0.0, egui::Stroke::new(1.0_f32, azul));
+                    }
+                }
+            }
+        }
+        if self.tool == Tool::Pen && !self.pen_points.is_empty() {
+            let pts: Vec<egui::Pos2> = self.pen_points.iter().map(|(x, y)| sp(*x, *y)).collect();
+            if pts.len() >= 2 {
+                painter.add(egui::Shape::line(
+                    pts.clone(),
+                    egui::Stroke::new(
+                        (self.pen_width as f32 * zoom).max(1.0),
+                        to_color32(self.brush_core_color()),
+                    ),
+                ));
+            }
+            for pt in &pts {
+                painter.circle_filled(*pt, 3.5, azul);
+                painter.circle_stroke(*pt, 3.5, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
+            }
+        }
+    }
+
+    /// Barra de ferramentas à esquerda (estilo Illustrator): ícones de uso
+    /// direto. Clicar seleciona a ferramenta na hora, sem abrir janela.
+    fn barra_ferramentas(&mut self, ctx: &egui::Context) {
+        use egui_phosphor::regular as icon;
+        egui::SidePanel::left("barra_ferramentas")
+            .exact_width(46.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.vertical_centered(|ui| {
+                    // Grupo: seleção
+                    for (t, ic, hint) in [
+                        (Tool::Select, icon::CURSOR, "Seleção — selecionar e mover um elemento"),
+                        (Tool::DirectSelect, icon::SELECTION, "Seleção direta — editar por pontos"),
+                        (Tool::MagicWand, icon::MAGIC_WAND, "Varinha mágica — selecionar por cor"),
+                    ] {
+                        let ativa = self.tool == t && self.eyedropper == Eyedropper::Off;
+                        if icon_button(ui, ativa, ic).on_hover_text(hint).clicked() {
+                            self.tool = t;
+                            self.eyedropper = Eyedropper::Off;
+                        }
+                        ui.add_space(4.0);
+                    }
+                    ui.separator();
+                    ui.add_space(4.0);
+                    // Grupo: desenho
+                    for (t, ic, hint) in [
+                        (Tool::Pen, icon::PEN_NIB, "Caneta — desenhar por pontos"),
+                        (Tool::Text, icon::TEXT_T, "Texto"),
+                        (Tool::Pencil, icon::PAINT_BRUSH, "Pincel"),
+                        (Tool::Eraser, icon::ERASER, "Borracha"),
+                    ] {
+                        let ativa = self.tool == t && self.eyedropper == Eyedropper::Off;
+                        if icon_button(ui, ativa, ic).on_hover_text(hint).clicked() {
+                            self.tool = t;
+                            self.eyedropper = Eyedropper::Off;
+                        }
+                        ui.add_space(4.0);
+                    }
+                    ui.separator();
+                    ui.add_space(4.0);
+                    // Conta-gotas (reaproveita o mecanismo de captura de cor)
+                    let ativa_ed = self.eyedropper != Eyedropper::Off;
+                    if icon_button(ui, ativa_ed, icon::EYEDROPPER)
+                        .on_hover_text("Conta-gotas — capturar cor do desenho")
+                        .clicked()
+                    {
+                        self.eyedropper = Eyedropper::ToBrush;
+                        self.status = "Conta-gotas: clique no desenho para capturar a cor".into();
+                    }
+                    ui.add_space(10.0);
+                    // Amostra da cor atual (clique abre a seleção de cores)
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
+                    ui.painter().rect_filled(rect, 4.0, self.brush_color);
+                    ui.painter().rect_stroke(
+                        rect,
+                        4.0,
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120)),
+                    );
+                    if resp.on_hover_text("Cor atual — clique para escolher").clicked() {
+                        self.win_color = true;
+                        self.reopen_color = true;
+                    }
+                });
+            });
+    }
+
+    /// Barra de opções (abaixo do menu): cada ferramenta abre aqui o seu
+    /// próprio painel, com os controles que fazem sentido para ela.
+    fn barra_opcoes(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("opcoes").show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(4.0);
+                ui.strong(self.tool.label());
+                ui.separator();
+                if self.eyedropper != Eyedropper::Off {
+                    ui.weak("Clique no desenho para capturar uma cor.");
+                } else {
+                    match self.tool {
+                        Tool::Pencil => self.opcoes_pincel(ui),
+                        Tool::Eraser => self.opcoes_borracha(ui),
+                        Tool::Select => self.opcoes_selecao(ui),
+                        Tool::Text => self.opcoes_texto(ui),
+                        Tool::Pen => self.opcoes_caneta(ui),
+                        Tool::MagicWand => self.opcoes_varinha(ui),
+                        Tool::DirectSelect => self.opcoes_selecao_direta(ui),
+                    }
+                }
+            });
+            ui.add_space(2.0);
+        });
+    }
+
+    /// Amostra da cor atual; clicar abre a janela de seleção de cores.
+    fn swatch_cor(&mut self, ui: &mut egui::Ui) {
+        ui.label("Cor:");
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(24.0, 18.0), egui::Sense::click());
+        ui.painter().rect_filled(rect, 3.0, self.brush_color);
+        ui.painter().rect_stroke(
+            rect,
+            3.0,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120)),
+        );
+        if resp.on_hover_text("Cor atual — clique para escolher").clicked() {
+            self.win_color = true;
+            self.reopen_color = true;
+        }
+    }
+
+    /// Botão "Limpar tudo": recomeça o documento (mantendo tamanho e fundo).
+    fn botao_limpar(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button("Limpar tudo")
+            .on_hover_text("Apaga tudo e recomeça o documento")
+            .clicked()
+        {
+            self.push_undo();
+            let (w, h) = (self.document.width, self.document.height);
+            let bg = self.document.background;
+            self.document = Document::new(w, h, bg);
+            self.active_layer = 0;
+            self.last_pos = None;
+            self.dirty = true;
+        }
+    }
+
+    fn opcoes_pincel(&mut self, ui: &mut egui::Ui) {
+        ui.label("Tamanho:");
+        ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30));
+        ui.separator();
+        self.swatch_cor(ui);
+        ui.separator();
+        self.botao_limpar(ui);
+    }
+
+    fn opcoes_borracha(&mut self, ui: &mut egui::Ui) {
+        ui.label("Tamanho:");
+        ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30));
+        ui.separator();
+        self.botao_limpar(ui);
+    }
+
+    /// Ferramenta Seleção: opera sobre o objeto vetorial selecionado.
+    fn opcoes_selecao(&mut self, ui: &mut egui::Ui) {
+        match self.selected_obj {
+            Some(idx) if idx < self.document.vectors.len() => {
+                ui.label("Traço selecionado.");
+                ui.separator();
+                ui.label("Espessura:");
+                let mut w = self.document.vectors[idx].stroke_width;
+                if ui.add(egui::Slider::new(&mut w, 1.0..=40.0)).changed() {
+                    self.document.vectors[idx].stroke_width = w;
+                }
+                ui.separator();
+                ui.label("Opacidade:");
+                let mut pct = self.document.vectors[idx].opacity * 100.0;
+                if ui
+                    .add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    self.document.vectors[idx].opacity = (pct / 100.0).clamp(0.0, 1.0);
+                }
+                ui.separator();
+                if ui.button("Aplicar cor atual").clicked() {
+                    self.document.vectors[idx].stroke = self.brush_core_color();
+                }
+                if ui
+                    .button("Excluir")
+                    .on_hover_text("Excluir o traço (tecla Del)")
+                    .clicked()
+                {
+                    self.push_undo();
+                    self.document.vectors.remove(idx);
+                    self.selected_obj = None;
+                }
+            }
+            _ => {
+                ui.weak("Clique num traço para selecionar; arraste para mover (Del apaga).");
+            }
+        }
+    }
+
+    fn opcoes_texto(&mut self, ui: &mut egui::Ui) {
+        ui.label("Fonte:");
+        egui::ComboBox::from_id_salt("fonte_texto")
+            .selected_text(FONTES[self.text_font])
+            .show_ui(ui, |ui| {
+                for (i, f) in FONTES.iter().enumerate() {
+                    ui.selectable_value(&mut self.text_font, i, *f);
+                }
+            });
+        ui.separator();
+        ui.label("Tamanho:");
+        ui.add(egui::Slider::new(&mut self.text_size, 6.0..=200.0).suffix(" pt"));
+        ui.separator();
+        ui.toggle_value(&mut self.text_bold, "N").on_hover_text("Negrito");
+        ui.toggle_value(&mut self.text_italic, "I").on_hover_text("Itálico");
+        ui.toggle_value(&mut self.text_underline, "S")
+            .on_hover_text("Sublinhado");
+        ui.separator();
+        ui.checkbox(&mut self.text_outline, "Bordas");
+        ui.separator();
+        self.swatch_cor(ui);
+        ui.separator();
+        ui.weak("Clique no canvas para inserir texto: em desenvolvimento.");
+    }
+
+    fn opcoes_caneta(&mut self, ui: &mut egui::Ui) {
+        ui.label("Espessura:");
+        ui.add(egui::Slider::new(&mut self.pen_width, 1..=30));
+        ui.separator();
+        self.swatch_cor(ui);
+        ui.separator();
+        let n = self.pen_points.len();
+        if ui
+            .add_enabled(n >= 2, egui::Button::new("Finalizar traço"))
+            .clicked()
+        {
+            self.finalizar_caneta();
+        }
+        if ui.add_enabled(n > 0, egui::Button::new("Cancelar")).clicked() {
+            self.pen_points.clear();
+            self.dirty = true;
+        }
+        ui.separator();
+        ui.weak(format!(
+            "Clique para adicionar pontos ({n}); Enter/Finalizar cria o traço; Esc cancela."
+        ));
+    }
+
+    fn opcoes_varinha(&mut self, ui: &mut egui::Ui) {
+        ui.label("Tolerância:");
+        ui.add(egui::Slider::new(&mut self.wand_tolerance, 0..=255));
+        ui.separator();
+        ui.weak("Seleção por cor: em desenvolvimento.");
+    }
+
+    fn opcoes_selecao_direta(&mut self, ui: &mut egui::Ui) {
+        ui.weak("Edição por pontos (vetorial): em desenvolvimento.");
+    }
+
     fn barra_icones(&mut self, ctx: &egui::Context) {
         use egui_phosphor::regular as icon;
         egui::SidePanel::right("barra_icones")
@@ -539,17 +931,6 @@ impl SketchMotionApp {
             .show(ctx, |ui| {
                 ui.add_space(8.0);
                 ui.vertical_centered(|ui| {
-                    let resp_t = icon_button(ui, self.win_tools, icon::PENCIL)
-                        .on_hover_text("Ferramentas de desenho");
-                    self.icon_r_tools = Some(resp_t.rect);
-                    if resp_t.clicked() {
-                        self.win_tools = !self.win_tools;
-                        if self.win_tools {
-                            self.reopen_tools = true;
-                        }
-                    }
-                    ui.add_space(6.0);
-
                     let resp_c = icon_button(ui, self.win_color, icon::PALETTE)
                         .on_hover_text("Seleção de cores");
                     self.icon_r_color = Some(resp_c.rect);
@@ -583,33 +964,6 @@ impl SketchMotionApp {
                     }
                 });
             });
-    }
-
-    /// Janela: Ferramentas de desenho.
-    fn janela_ferramentas(&mut self, ctx: &egui::Context) {
-        let mut open = self.win_tools;
-        let mut win = egui::Window::new("Ferramentas")
-            .open(&mut open)
-            .default_width(220.0);
-        if let Some(r) = self.icon_r_tools {
-            let pos = egui::pos2(r.left() - 8.0, r.top());
-            win = win.pivot(egui::Align2::RIGHT_TOP);
-            win = if self.reopen_tools { win.current_pos(pos) } else { win.default_pos(pos) };
-        }
-        win.show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tool, Tool::Pencil, "Lápis");
-                    ui.selectable_value(&mut self.tool, Tool::Eraser, "Borracha");
-                });
-                ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30).text("Tamanho"));
-                if ui.button("Limpar tudo").clicked() {
-                    self.document = Document::new(CANVAS_W, CANVAS_H, Color::WHITE);
-                    self.last_pos = None;
-                    self.dirty = true;
-                }
-            });
-        self.reopen_tools = false;
-        self.win_tools = open;
     }
 
     /// Janela: Seleção de cores (visual + código + cores personalizadas).
@@ -1112,6 +1466,9 @@ impl eframe::App for SketchMotionApp {
         }
         let mut do_undo = false;
         let mut do_redo = false;
+        let mut k_enter = false;
+        let mut k_esc = false;
+        let mut k_del = false;
         ctx.input(|i| {
             if i.modifiers.command && i.key_pressed(egui::Key::Z) {
                 if i.modifiers.shift {
@@ -1123,7 +1480,17 @@ impl eframe::App for SketchMotionApp {
             if i.modifiers.command && i.key_pressed(egui::Key::Y) {
                 do_redo = true;
             }
+            if i.key_pressed(egui::Key::Enter) {
+                k_enter = true;
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                k_esc = true;
+            }
+            if i.key_pressed(egui::Key::Delete) {
+                k_del = true;
+            }
         });
+        let editando = ctx.wants_keyboard_input();
         if self.dirty || self.texture.is_none() {
             let PixelImage { width, height, rgba } = render_document(&self.document);
             let image =
@@ -1144,6 +1511,11 @@ impl eframe::App for SketchMotionApp {
         let mut a_salvar = false;
         let mut a_salvar_como = false;
         let mut a_exportar = false;
+        let mut img_rccw = false;
+        let mut img_rcw = false;
+        let mut img_r180 = false;
+        let mut img_fh = false;
+        let mut img_fv = false;
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("Arquivo", |ui| {
@@ -1170,6 +1542,29 @@ impl eframe::App for SketchMotionApp {
                         ui.close_menu();
                     }
                 });
+                ui.menu_button("Imagem", |ui| {
+                    if ui.button("Girar 90° à esquerda").clicked() {
+                        img_rccw = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Girar 90° à direita").clicked() {
+                        img_rcw = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Girar 180°").clicked() {
+                        img_r180 = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Espelhar horizontal").clicked() {
+                        img_fh = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Espelhar vertical").clicked() {
+                        img_fv = true;
+                        ui.close_menu();
+                    }
+                });
                 if !self.status.is_empty() {
                     ui.separator();
                     ui.label(&self.status);
@@ -1191,10 +1586,45 @@ impl eframe::App for SketchMotionApp {
         if a_exportar {
             self.exportar();
         }
+        if img_rccw || img_rcw || img_r180 || img_fh || img_fv {
+            self.push_undo();
+            if img_rccw { self.document.rotate_90_ccw(); }
+            if img_rcw { self.document.rotate_90_cw(); }
+            if img_r180 { self.document.rotate_180(); }
+            if img_fh { self.document.flip_h(); }
+            if img_fv { self.document.flip_v(); }
+            self.last_pos = None;
+            self.dirty = true;
+            self.status = "Transformação aplicada ao desenho".into();
+        }
+        if !editando {
+            if k_enter && self.tool == Tool::Pen {
+                self.finalizar_caneta();
+            }
+            if k_esc {
+                if !self.pen_points.is_empty() {
+                    self.pen_points.clear();
+                    self.dirty = true;
+                }
+                self.selected_obj = None;
+            }
+            if k_del && self.tool == Tool::Select {
+                if let Some(i) = self.selected_obj {
+                    if i < self.document.vectors.len() {
+                        self.push_undo();
+                        self.document.vectors.remove(i);
+                        self.selected_obj = None;
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
 
-        // Barra de ícones (sempre visível) e janelas de ferramenta (flutuantes).
+        // Barra de opções da ferramenta ativa (abaixo do menu).
+        self.barra_opcoes(ctx);
+        // Ferramentas (esquerda) e painéis (direita), sempre visíveis.
+        self.barra_ferramentas(ctx);
         self.barra_icones(ctx);
-        self.janela_ferramentas(ctx);
         self.janela_cor(ctx);
         self.janela_paletas(ctx);
         self.janela_camadas(ctx);
@@ -1243,10 +1673,19 @@ impl eframe::App for SketchMotionApp {
                         let l = pos - rect.min;
                         ((l.x / zoom).floor() as i32, (l.y / zoom).floor() as i32)
                     };
+                    let to_doc = |pos: egui::Pos2| -> (f32, f32) {
+                        ((pos.x - rect.min.x) / zoom, (pos.y - rect.min.y) / zoom)
+                    };
+                    // Leitura do ponteiro em baixo nível (a ScrollArea filtra
+                    // clicked()/drag_started(); estes primitivos não passam por ela).
+                    let hover = response.hover_pos();
+                    let pressed = ui.input(|i| i.pointer.primary_pressed());
+                    let down = ui.input(|i| i.pointer.primary_down());
+                    let pdelta = ui.input(|i| i.pointer.delta());
 
                     if self.eyedropper != Eyedropper::Off {
-                        if response.clicked() {
-                            if let Some(pointer) = response.interact_pointer_pos() {
+                        if pressed {
+                            if let Some(pointer) = hover {
                                 let (x, y) = to_pixel(pointer);
                                 let cor = self.cor_no_pixel(x, y);
                                 self.brush_color = to_color32(cor);
@@ -1269,7 +1708,49 @@ impl eframe::App for SketchMotionApp {
                             }
                         }
                         self.last_pos = None;
-                    } else if response.is_pointer_button_down_on() || response.dragged() {
+                    } else if self.tool == Tool::Pen {
+                        if response.double_clicked() {
+                            self.finalizar_caneta();
+                        } else if pressed {
+                            if let Some(p) = hover {
+                                self.pen_points.push(to_doc(p));
+                            }
+                        }
+                        self.last_pos = None;
+                    } else if self.tool == Tool::Select {
+                        let thr = 6.0 / zoom;
+                        if pressed {
+                            if let Some(p) = hover {
+                                match self.hit_test(to_doc(p), thr) {
+                                    Some(i) => {
+                                        self.selected_obj = Some(i);
+                                        self.push_undo();
+                                        self.dragging_obj = true;
+                                    }
+                                    None => {
+                                        self.selected_obj = None;
+                                        self.dragging_obj = false;
+                                    }
+                                }
+                            }
+                        }
+                        if down && self.dragging_obj {
+                            if let Some(i) = self.selected_obj {
+                                if i < self.document.vectors.len()
+                                    && (pdelta.x != 0.0 || pdelta.y != 0.0)
+                                {
+                                    self.document.vectors[i]
+                                        .translate(pdelta.x / zoom, pdelta.y / zoom);
+                                }
+                            }
+                        }
+                        if !down {
+                            self.dragging_obj = false;
+                        }
+                        self.last_pos = None;
+                    } else if self.tool.paints()
+                        && (response.is_pointer_button_down_on() || response.dragged())
+                    {
                         let mut pontos: Vec<(i32, i32)> = ui.input(|i| {
                             i.events
                                 .iter()
@@ -1298,6 +1779,9 @@ impl eframe::App for SketchMotionApp {
                     } else {
                         self.last_pos = None;
                     }
+
+                    // Overlay vetorial: objetos, seleção e traço em progresso.
+                    self.desenhar_vetores(ui, rect, zoom);
                 });
         });
         let mut do_zoom_in = false;

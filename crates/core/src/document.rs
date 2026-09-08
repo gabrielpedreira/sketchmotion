@@ -5,6 +5,7 @@
 
 use crate::color::Color;
 use crate::layer::Layer;
+use crate::vector::VectorObject;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +15,9 @@ pub struct Document {
     pub background: Color,
     /// Camadas de baixo (índice 0) para cima (última é a do topo).
     pub layers: Vec<Layer>,
+    /// Objetos vetoriais (ilustração vetorial), desenhados sobre as camadas.
+    #[serde(default)]
+    pub vectors: Vec<VectorObject>,
 }
 
 impl Document {
@@ -24,6 +28,7 @@ impl Document {
             height,
             background,
             layers: Vec::new(),
+            vectors: Vec::new(),
         };
         doc.add_layer("Camada 1");
         doc
@@ -64,5 +69,62 @@ impl Document {
         if a < self.layers.len() && b < self.layers.len() {
             self.layers.swap(a, b);
         }
+    }
+
+    /// Espelha todo o documento horizontalmente.
+    pub fn flip_h(&mut self) {
+        for l in &mut self.layers {
+            l.flip_h();
+        }
+        let w = self.width as f32;
+        for v in &mut self.vectors {
+            v.flip_h(w);
+        }
+    }
+
+    /// Espelha todo o documento verticalmente.
+    pub fn flip_v(&mut self) {
+        for l in &mut self.layers {
+            l.flip_v();
+        }
+        let h = self.height as f32;
+        for v in &mut self.vectors {
+            v.flip_v(h);
+        }
+    }
+
+    /// Gira todo o documento 180°.
+    pub fn rotate_180(&mut self) {
+        for l in &mut self.layers {
+            l.rotate_180();
+        }
+        let (w, h) = (self.width as f32, self.height as f32);
+        for v in &mut self.vectors {
+            v.rotate_180(w, h);
+        }
+    }
+
+    /// Gira todo o documento 90° horário (troca largura/altura).
+    pub fn rotate_90_cw(&mut self) {
+        let old_h = self.height as f32;
+        for l in &mut self.layers {
+            l.rotate_90_cw();
+        }
+        for v in &mut self.vectors {
+            v.rotate_90_cw(old_h);
+        }
+        std::mem::swap(&mut self.width, &mut self.height);
+    }
+
+    /// Gira todo o documento 90° anti-horário (troca largura/altura).
+    pub fn rotate_90_ccw(&mut self) {
+        let old_w = self.width as f32;
+        for l in &mut self.layers {
+            l.rotate_90_ccw();
+        }
+        for v in &mut self.vectors {
+            v.rotate_90_ccw(old_w);
+        }
+        std::mem::swap(&mut self.width, &mut self.height);
     }
 }

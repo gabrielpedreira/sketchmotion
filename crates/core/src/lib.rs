@@ -7,10 +7,12 @@
 mod color;
 mod document;
 mod layer;
+mod vector;
 
 pub use color::Color;
 pub use document::Document;
 pub use layer::Layer;
+pub use vector::{Anchor, VectorObject};
 
 #[cfg(test)]
 mod tests {
