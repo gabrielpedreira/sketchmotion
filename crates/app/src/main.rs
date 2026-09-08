@@ -679,6 +679,20 @@ impl SketchMotionApp {
         best.map(|(i, _)| i)
     }
 
+    /// Índice da alça da caixa do objeto `si` sob o ponto de tela `hp`.
+    fn handle_at(&self, si: usize, hp: egui::Pos2, rect: egui::Rect, zoom: f32) -> Option<usize> {
+        let obj = self.document.vectors.get(si)?;
+        let (minx, miny, maxx, maxy) = obj.bounds()?;
+        let r = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + minx * zoom, rect.min.y + miny * zoom),
+            egui::pos2(rect.min.x + maxx * zoom, rect.min.y + maxy * zoom),
+        )
+        .expand(3.0);
+        handle_positions(r)
+            .iter()
+            .position(|hc| hc.distance(hp) <= 8.0)
+    }
+
     /// Desenha os objetos vetoriais (curvas), a caixa/alças de seleção e o
     /// traço em progresso da Caneta, como overlay sobre o canvas.
     fn desenhar_vetores(&self, ui: &egui::Ui, rect: egui::Rect, zoom: f32) {
@@ -1952,6 +1966,47 @@ impl eframe::App for SketchMotionApp {
                         }
                     } else {
                         self.last_pos = None;
+                    }
+
+                    // Cursor contextual: muda conforme a ferramenta e o que
+                    // está sob o ponteiro (objeto interativo / alça).
+                    if response.hovered() {
+                        use egui::CursorIcon as CI;
+                        let ci = if self.eyedropper != Eyedropper::Off {
+                            CI::Crosshair
+                        } else {
+                            match self.tool {
+                                Tool::Pen | Tool::Pencil | Tool::Eraser => CI::Crosshair,
+                                Tool::Select => {
+                                    if self.dragging_obj || self.resize_handle.is_some() {
+                                        CI::Grabbing
+                                    } else if let (Some(si), Some(hp)) = (self.selected_obj, hover) {
+                                        if let Some(hi) = self.handle_at(si, hp, rect, zoom) {
+                                            match hi {
+                                                0 | 4 => CI::ResizeNwSe,
+                                                2 | 6 => CI::ResizeNeSw,
+                                                1 | 5 => CI::ResizeVertical,
+                                                _ => CI::ResizeHorizontal,
+                                            }
+                                        } else if self.hit_test(to_doc(hp), 6.0 / zoom).is_some() {
+                                            CI::Grab
+                                        } else {
+                                            CI::Default
+                                        }
+                                    } else if let Some(hp) = hover {
+                                        if self.hit_test(to_doc(hp), 6.0 / zoom).is_some() {
+                                            CI::Grab
+                                        } else {
+                                            CI::Default
+                                        }
+                                    } else {
+                                        CI::Default
+                                    }
+                                }
+                                _ => CI::Default,
+                            }
+                        };
+                        ui.ctx().set_cursor_icon(ci);
                     }
 
                     // Overlay vetorial: objetos, seleção e traço em progresso.
