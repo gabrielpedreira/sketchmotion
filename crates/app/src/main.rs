@@ -23,6 +23,16 @@ const BASICAS_COLS: usize = 16;
 /// Fontes exibidas no painel de texto (aplicação real virá com o módulo de texto).
 const FONTES: [&str; 4] = ["Sans", "Serif", "Monospace", "Manuscrito"];
 const FORMAS: [&str; 4] = ["Retângulo", "Elipse", "Triângulo", "Polígono"];
+const BRUSHES: [&str; 8] = [
+    "Duro",
+    "Macio",
+    "Aquarela",
+    "Aerógrafo",
+    "Giz de cera",
+    "Caneta (fino-grosso)",
+    "Pontilhado",
+    "Esfumador",
+];
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -511,6 +521,10 @@ struct SketchMotionApp {
     frame_thumbs: Vec<Option<egui::TextureHandle>>,
     onion_tex: Option<egui::TextureHandle>,
     onion_for: Option<usize>,
+    // pincéis
+    brush_kind: usize,
+    rng: u32,
+    smudge: Option<[f32; 4]>,
     playing: bool,
     play_frame: usize,
     play_accum: f32,
@@ -609,6 +623,9 @@ impl SketchMotionApp {
             frame_thumbs: Vec::new(),
             onion_tex: None,
             onion_for: None,
+            brush_kind: 0,
+            rng: 0x2545_F491,
+            smudge: None,
             playing: false,
             play_frame: 0,
             play_accum: 0.0,
@@ -697,55 +714,238 @@ impl SketchMotionApp {
         }
     }
 
-    fn paint_dab(&mut self, x: i32, y: i32) {
-        let color = self.active_color();
-        let r = self.active_radius();
-        let li = self.active_layer;
-        let pixel = self.pixel_mode;
-        let mut pintou = false;
+    fn rand_u32(&mut self) -> u32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        x
+    }
+    fn rand_f(&mut self) -> f32 {
+        (self.rand_u32() >> 8) as f32 / 16_777_216.0
+    }
+
+    /// Mistura uma cor sobre um pixel da camada ativa (alpha over com cobertura).
+    fn blend_px(&mut self, li: usize, x: i32, y: i32, c: Color, cover: f32) {
+        if x < 0 || y < 0 {
+            return;
+        }
+        let sa = (c.a as f32 / 255.0) * cover.clamp(0.0, 1.0);
+        if sa <= 0.0 {
+            return;
+        }
         if let Some(layer) = self.document.layer_mut(li) {
-            if !layer.locked {
-                if pixel {
-                    // Pixel art: quadrado de lado `r` células, encaixado no grid.
-                    let half = (r - 1) / 2;
-                    for dy in 0..r {
-                        for dx in 0..r {
-                            let px = x + dx - half;
-                            let py = y + dy - half;
-                            if px >= 0 && py >= 0 {
-                                layer.set_pixel(px as u32, py as u32, color);
-                            }
-                        }
-                    }
-                } else {
-                    for dy in -r..=r {
-                        for dx in -r..=r {
-                            if dx * dx + dy * dy <= r * r {
-                                let (px, py) = (x + dx, y + dy);
-                                if px >= 0 && py >= 0 {
-                                    layer.set_pixel(px as u32, py as u32, color);
-                                }
-                            }
+            if let Some(d) = layer.get_pixel(x as u32, y as u32) {
+                let da = d.a as f32 / 255.0;
+                let oa = sa + da * (1.0 - sa);
+                if oa <= 0.0 {
+                    return;
+                }
+                let bl = |sc: u8, dc: u8| {
+                    (((sc as f32 / 255.0 * sa + dc as f32 / 255.0 * da * (1.0 - sa)) / oa) * 255.0)
+                        .round() as u8
+                };
+                layer.set_pixel(
+                    x as u32,
+                    y as u32,
+                    Color::rgba(bl(c.r, d.r), bl(c.g, d.g), bl(c.b, d.b), (oa * 255.0).round() as u8),
+                );
+            }
+        }
+    }
+
+    fn stamp_hard(&mut self, x: i32, y: i32, r: i32) {
+        let color = self.active_color();
+        let li = self.active_layer;
+        if let Some(layer) = self.document.layer_mut(li) {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx * dx + dy * dy <= r * r {
+                        let (px, py) = (x + dx, y + dy);
+                        if px >= 0 && py >= 0 {
+                            layer.set_pixel(px as u32, py as u32, color);
                         }
                     }
                 }
-                pintou = true;
             }
         }
-        if pintou {
-            self.dirty = true;
+    }
+
+    fn stamp_soft(&mut self, x: i32, y: i32, r: i32, master: f32) {
+        let color = self.active_color();
+        let li = self.active_layer;
+        let rf = (r as f32).max(0.5);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let d2 = (dx * dx + dy * dy) as f32;
+                if d2 > rf * rf {
+                    continue;
+                }
+                let t = (1.0 - d2.sqrt() / rf).clamp(0.0, 1.0);
+                self.blend_px(li, x + dx, y + dy, color, t * t * master);
+            }
         }
+    }
+
+    fn stamp_spray(&mut self, x: i32, y: i32, r: i32) {
+        let color = self.active_color();
+        let li = self.active_layer;
+        let rf = r as f32;
+        let n = ((r as f32) * 1.6).max(4.0) as i32;
+        for _ in 0..n {
+            let a = self.rand_f() * std::f32::consts::TAU;
+            let rad = rf * self.rand_f().sqrt();
+            let px = x + (rad * a.cos()).round() as i32;
+            let py = y + (rad * a.sin()).round() as i32;
+            self.blend_px(li, px, py, color, 0.22);
+        }
+    }
+
+    fn stamp_crayon(&mut self, x: i32, y: i32, r: i32) {
+        let color = self.active_color();
+        let li = self.active_layer;
+        let rf = (r as f32).max(0.5);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let d2 = (dx * dx + dy * dy) as f32;
+                if d2 > rf * rf {
+                    continue;
+                }
+                let g = self.rand_f();
+                if g < 0.45 {
+                    continue;
+                }
+                let t = (1.0 - d2.sqrt() / rf).clamp(0.0, 1.0);
+                self.blend_px(li, x + dx, y + dy, color, t * 0.9 * (0.55 + 0.45 * g));
+            }
+        }
+    }
+
+    fn stamp_smudge(&mut self, x: i32, y: i32, r: i32) {
+        let li = self.active_layer;
+        let rf = (r as f32).max(0.5);
+        let (mut sr, mut sg, mut sb, mut sa, mut cnt) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        if let Some(layer) = self.document.layer(li) {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if (dx * dx + dy * dy) as f32 > rf * rf {
+                        continue;
+                    }
+                    let (px, py) = (x + dx, y + dy);
+                    if px < 0 || py < 0 {
+                        continue;
+                    }
+                    if let Some(c) = layer.get_pixel(px as u32, py as u32) {
+                        sr += c.r as f32;
+                        sg += c.g as f32;
+                        sb += c.b as f32;
+                        sa += c.a as f32;
+                        cnt += 1.0;
+                    }
+                }
+            }
+        }
+        if cnt <= 0.0 {
+            return;
+        }
+        let avg = [sr / cnt, sg / cnt, sb / cnt, sa / cnt];
+        let carried = match self.smudge {
+            Some(c) => {
+                let m = [
+                    c[0] * 0.5 + avg[0] * 0.5,
+                    c[1] * 0.5 + avg[1] * 0.5,
+                    c[2] * 0.5 + avg[2] * 0.5,
+                    c[3] * 0.5 + avg[3] * 0.5,
+                ];
+                self.smudge = Some(m);
+                m
+            }
+            None => {
+                self.smudge = Some(avg);
+                avg
+            }
+        };
+        let cc = Color::rgba(carried[0] as u8, carried[1] as u8, carried[2] as u8, carried[3] as u8);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let d2 = (dx * dx + dy * dy) as f32;
+                if d2 > rf * rf {
+                    continue;
+                }
+                let t = (1.0 - d2.sqrt() / rf).clamp(0.0, 1.0);
+                self.blend_px(li, x + dx, y + dy, cc, t * 0.35);
+            }
+        }
+    }
+
+    /// Carimba um dab conforme o tipo de pincel (ou quadrado no pixel art).
+    fn stamp(&mut self, x: i32, y: i32, r: i32) {
+        let li = self.active_layer;
+        if self.document.layer(li).map_or(true, |l| l.locked) {
+            return;
+        }
+        if self.pixel_mode {
+            let color = self.active_color();
+            let half = (r - 1) / 2;
+            if let Some(layer) = self.document.layer_mut(li) {
+                for dy in 0..r {
+                    for dx in 0..r {
+                        let (px, py) = (x + dx - half, y + dy - half);
+                        if px >= 0 && py >= 0 {
+                            layer.set_pixel(px as u32, py as u32, color);
+                        }
+                    }
+                }
+            }
+            self.dirty = true;
+            return;
+        }
+        if self.tool == Tool::Eraser {
+            self.stamp_hard(x, y, r);
+            self.dirty = true;
+            return;
+        }
+        match self.brush_kind {
+            1 => self.stamp_soft(x, y, r, 0.55),
+            2 => self.stamp_soft(x, y, r, 0.22),
+            3 => self.stamp_spray(x, y, r),
+            4 => self.stamp_crayon(x, y, r),
+            7 => self.stamp_smudge(x, y, r),
+            _ => self.stamp_hard(x, y, r),
+        }
+        self.dirty = true;
+    }
+
+    fn paint_dab(&mut self, x: i32, y: i32) {
+        let r = self.active_radius();
+        self.stamp(x, y, r);
     }
 
     fn paint_line(&mut self, from: (i32, i32), to: (i32, i32)) {
         let (x0, y0) = from;
         let (x1, y1) = to;
-        let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
+        let (dxf, dyf) = ((x1 - x0) as f32, (y1 - y0) as f32);
+        let seg = (dxf * dxf + dyf * dyf).sqrt();
+        let base = self.active_radius();
+        // Caneta fino-grosso: afina quando o traço é rápido (segmento longo).
+        let r_eff = if !self.pixel_mode && self.tool != Tool::Eraser && self.brush_kind == 5 {
+            (((base as f32) * (1.0 - (seg / 40.0).min(0.75))).round() as i32).max(1)
+        } else {
+            base
+        };
+        // Pontilhado: dabs espaçados.
+        let spacing = if !self.pixel_mode && self.tool != Tool::Eraser && self.brush_kind == 6 {
+            (base as f32 * 1.8).max(3.0)
+        } else {
+            1.0
+        };
+        let steps = (seg / spacing).ceil().max(1.0) as i32;
         for i in 0..=steps {
             let t = i as f32 / steps as f32;
-            let x = (x0 as f32 + (x1 - x0) as f32 * t).round() as i32;
-            let y = (y0 as f32 + (y1 - y0) as f32 * t).round() as i32;
-            self.paint_dab(x, y);
+            let x = (x0 as f32 + dxf * t).round() as i32;
+            let y = (y0 as f32 + dyf * t).round() as i32;
+            self.stamp(x, y, r_eff);
         }
     }
 
@@ -1835,8 +2035,17 @@ impl SketchMotionApp {
     }
 
     fn opcoes_pincel(&mut self, ui: &mut egui::Ui) {
+        ui.label("Pincel:");
+        egui::ComboBox::from_id_salt("tipo_pincel")
+            .selected_text(BRUSHES[self.brush_kind])
+            .show_ui(ui, |ui| {
+                for (i, b) in BRUSHES.iter().enumerate() {
+                    ui.selectable_value(&mut self.brush_kind, i, *b);
+                }
+            });
+        ui.separator();
         ui.label("Tamanho:");
-        ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30));
+        ui.add(egui::Slider::new(&mut self.brush_radius, 1..=40));
         ui.separator();
         self.swatch_cor(ui);
         ui.separator();
@@ -3236,6 +3445,7 @@ impl eframe::App for SketchMotionApp {
                         }
                         if self.last_pos.is_none() && !pontos.is_empty() {
                             self.push_undo();
+                            self.smudge = None;
                         }
                         for p in pontos {
                             match self.last_pos {

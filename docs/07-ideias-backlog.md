@@ -114,3 +114,14 @@ A seleção flutuante já recorta/move. Falta deixá-la como a seleção vetoria
 - Alças que redimensionam a região (escala do bitmap; render escala a textura, commit reamostra).
 - Ponto de rotação (girar o bitmap — precisa desenhar o quad via mesh e rasterizar girado no commit).
 - Opacidade da seleção flutuante (tint no desenho + multiplicar no commit).
+
+### Mais tipos de pincel (referências do Gabriel) — pós-MVP
+Já implementados: Duro, Macio, Aquarela, Aerógrafo, Giz de cera, Caneta
+fino-grosso (afina na velocidade), Pontilhado, Esfumador (mistura/suaviza).
+Fila (das imagens de referência): Caneta cartográfica, Pena G, Caneta
+tinteiro, Caneta de borda, Acrílico, Aquarela molhada (sangramento), Desfoque,
+Dedo, Brilho (estrelinhas), Giro simétrico; e formatos de ponta (plano,
+redondo, abanico, língua de gato, angular, stripper, mop, delineador).
+Ideia: pincel = struct com parâmetros (formato da ponta, textura/grão,
+espaçamento, jitter, build-up, mistura) em vez de enum fixo, e ícone na barra
+direita se o menu ficar cheio.
