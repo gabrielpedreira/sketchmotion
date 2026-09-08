@@ -307,6 +307,16 @@ fn seletor_hue(ui: &mut egui::Ui, hsva: &mut egui::ecolor::Hsva, largura: f32, a
 /// Estado do conta-gotas: desligado, capturar para o pincel, ou capturar e
 /// adicionar a uma área (índice do grupo) do personagem selecionado.
 /// Tela atual do app: inicial (escolher documento) ou editor.
+/// Seleção retangular de pixels recortada de uma camada (raster), flutuando
+/// sobre o canvas até ser movida e confirmada (estilo Paint).
+struct FloatSel {
+    pixels: Vec<u8>,
+    w: u32,
+    h: u32,
+    x: i32,
+    y: i32,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
     Home,
@@ -392,6 +402,13 @@ struct SketchMotionApp {
     rotate_center: (f32, f32),
     rotate_start: f32,
     rotate_orig: Vec<Anchor>,
+    // seleção retangular raster (estilo Paint)
+    float_sel: Option<FloatSel>,
+    float_tex: Option<egui::TextureHandle>,
+    float_dragging: bool,
+    float_grab: (f32, f32),
+    marquee_start: Option<(i32, i32)>,
+    marquee_cur: (i32, i32),
 }
 
 impl SketchMotionApp {
@@ -466,6 +483,12 @@ impl SketchMotionApp {
             rotate_center: (0.0, 0.0),
             rotate_start: 0.0,
             rotate_orig: Vec::new(),
+            float_sel: None,
+            float_tex: None,
+            float_dragging: false,
+            float_grab: (0.0, 0.0),
+            marquee_start: None,
+            marquee_cur: (0, 0),
         }
     }
 
@@ -793,6 +816,81 @@ impl SketchMotionApp {
         self.document.vectors = result;
         if mudou {
             self.selected_obj = None;
+            self.dirty = true;
+        }
+    }
+
+    /// Recorta a região retangular (coords do documento) da camada ativa para
+    /// uma seleção flutuante e limpa esses pixels na camada.
+    fn lift_selection(&mut self, start: (i32, i32), end: (i32, i32)) {
+        let x0 = start.0.min(end.0).max(0);
+        let y0 = start.1.min(end.1).max(0);
+        let x1 = start.0.max(end.0).min(self.document.width as i32);
+        let y1 = start.1.max(end.1).min(self.document.height as i32);
+        if x1 - x0 < 1 || y1 - y0 < 1 {
+            return;
+        }
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        self.push_undo();
+        let li = self.active_layer;
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        if let Some(layer) = self.document.layer_mut(li) {
+            for yy in 0..h {
+                for xx in 0..w {
+                    let (px, py) = (x0 as u32 + xx, y0 as u32 + yy);
+                    if let Some(c) = layer.get_pixel(px, py) {
+                        let di = ((yy * w + xx) * 4) as usize;
+                        pixels[di] = c.r;
+                        pixels[di + 1] = c.g;
+                        pixels[di + 2] = c.b;
+                        pixels[di + 3] = c.a;
+                        layer.set_pixel(px, py, Color::TRANSPARENT);
+                    }
+                }
+            }
+        }
+        self.float_sel = Some(FloatSel { pixels, w, h, x: x0, y: y0 });
+        self.float_tex = None;
+        self.dirty = true;
+        self.status = "Seleção recortada — arraste para mover".into();
+    }
+
+    /// Carimba a seleção flutuante de volta na camada ativa (alpha over).
+    fn commit_float(&mut self) {
+        if let Some(fs) = self.float_sel.take() {
+            let li = self.active_layer;
+            let (dw, dh) = (self.document.width as i32, self.document.height as i32);
+            if let Some(layer) = self.document.layer_mut(li) {
+                for yy in 0..fs.h {
+                    for xx in 0..fs.w {
+                        let di = ((yy * fs.w + xx) * 4) as usize;
+                        let a = fs.pixels[di + 3];
+                        if a == 0 {
+                            continue;
+                        }
+                        let (px, py) = (fs.x + xx as i32, fs.y + yy as i32);
+                        if px < 0 || py < 0 || px >= dw || py >= dh {
+                            continue;
+                        }
+                        let (px, py) = (px as u32, py as u32);
+                        let src = Color::rgba(fs.pixels[di], fs.pixels[di + 1], fs.pixels[di + 2], a);
+                        if a == 255 {
+                            layer.set_pixel(px, py, src);
+                        } else if let Some(d) = layer.get_pixel(px, py) {
+                            let sa = a as u32;
+                            let ia = 255 - sa;
+                            let bl = |s: u8, dd: u8| ((s as u32 * sa + dd as u32 * ia) / 255) as u8;
+                            let na = (sa + (d.a as u32) * ia / 255).min(255) as u8;
+                            layer.set_pixel(
+                                px,
+                                py,
+                                Color::rgba(bl(src.r, d.r), bl(src.g, d.g), bl(src.b, d.b), na.max(a)),
+                            );
+                        }
+                    }
+                }
+            }
+            self.float_tex = None;
             self.dirty = true;
         }
     }
@@ -1830,6 +1928,9 @@ impl eframe::App for SketchMotionApp {
                 self.pen_drag_idx = None;
             }
         }
+        if self.tool != Tool::Select && self.float_sel.is_some() {
+            self.commit_float();
+        }
         let mut do_undo = false;
         let mut do_redo = false;
         let mut k_enter = false;
@@ -1976,7 +2077,11 @@ impl eframe::App for SketchMotionApp {
                 self.selected_obj = None;
             }
             if k_del && self.tool == Tool::Select {
-                if let Some(i) = self.selected_obj {
+                if self.float_sel.is_some() {
+                    self.float_sel = None;
+                    self.float_tex = None;
+                    self.dirty = true;
+                } else if let Some(i) = self.selected_obj {
                     if i < self.document.vectors.len() {
                         self.push_undo();
                         self.document.vectors.remove(i);
@@ -2111,81 +2216,107 @@ impl eframe::App for SketchMotionApp {
                         let thr = 6.0 / zoom;
                         if pressed {
                             if let Some(p) = hover {
-                                let mut grabbed = false;
-                                if let Some(si) = self.selected_obj {
-                                    if si < self.document.vectors.len() {
-                                        if let Some((minx, miny, maxx, maxy)) =
-                                            self.document.vectors[si].bounds()
-                                        {
-                                            let r = egui::Rect::from_min_max(
-                                                egui::pos2(
-                                                    rect.min.x + minx * zoom,
-                                                    rect.min.y + miny * zoom,
-                                                ),
-                                                egui::pos2(
-                                                    rect.min.x + maxx * zoom,
-                                                    rect.min.y + maxy * zoom,
-                                                ),
-                                            )
-                                            .expand(3.0);
-                                            let hs = handle_positions(r);
-                                            let (cx, cy) =
-                                                ((minx + maxx) / 2.0, (miny + maxy) / 2.0);
-                                            for (hi, hc) in hs.iter().enumerate() {
-                                                if hc.distance(p) <= 8.0 {
-                                                    self.push_undo();
-                                                    let (grab, fixed, axes) = handle_geometry(
-                                                        hi, minx, miny, maxx, maxy, cx, cy,
-                                                    );
-                                                    self.resize_handle = Some(hi);
-                                                    self.resize_orig =
-                                                        self.document.vectors[si].points.clone();
-                                                    self.resize_grab = grab;
-                                                    self.resize_fixed = fixed;
-                                                    self.resize_axes = axes;
-                                                    self.dragging_obj = false;
-                                                    grabbed = true;
-                                                    break;
+                                let dp = to_doc(p);
+                                let mut consumed = false;
+                                // seleção flutuante (raster): dentro move; fora confirma
+                                if let Some(fs) = &self.float_sel {
+                                    let inside = dp.0 >= fs.x as f32
+                                        && dp.0 <= (fs.x + fs.w as i32) as f32
+                                        && dp.1 >= fs.y as f32
+                                        && dp.1 <= (fs.y + fs.h as i32) as f32;
+                                    if inside {
+                                        self.float_grab = (dp.0 - fs.x as f32, dp.1 - fs.y as f32);
+                                        self.float_dragging = true;
+                                        consumed = true;
+                                    }
+                                }
+                                if !consumed && self.float_sel.is_some() {
+                                    self.commit_float();
+                                }
+                                if !consumed {
+                                    let mut grabbed = false;
+                                    if let Some(si) = self.selected_obj {
+                                        if si < self.document.vectors.len() {
+                                            if let Some((minx, miny, maxx, maxy)) =
+                                                self.document.vectors[si].bounds()
+                                            {
+                                                let r = egui::Rect::from_min_max(
+                                                    egui::pos2(
+                                                        rect.min.x + minx * zoom,
+                                                        rect.min.y + miny * zoom,
+                                                    ),
+                                                    egui::pos2(
+                                                        rect.min.x + maxx * zoom,
+                                                        rect.min.y + maxy * zoom,
+                                                    ),
+                                                )
+                                                .expand(3.0);
+                                                let hs = handle_positions(r);
+                                                let (cx, cy) =
+                                                    ((minx + maxx) / 2.0, (miny + maxy) / 2.0);
+                                                for (hi, hc) in hs.iter().enumerate() {
+                                                    if hc.distance(p) <= 8.0 {
+                                                        self.push_undo();
+                                                        let (grab, fixed, axes) = handle_geometry(
+                                                            hi, minx, miny, maxx, maxy, cx, cy,
+                                                        );
+                                                        self.resize_handle = Some(hi);
+                                                        self.resize_orig =
+                                                            self.document.vectors[si].points.clone();
+                                                        self.resize_grab = grab;
+                                                        self.resize_fixed = fixed;
+                                                        self.resize_axes = axes;
+                                                        self.dragging_obj = false;
+                                                        grabbed = true;
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                                if !grabbed {
-                                    let mut did_rot = false;
-                                    if let Some(si) = self.selected_obj {
-                                        if si < self.document.vectors.len()
-                                            && self.rotate_handle_at(si, p, rect, zoom)
-                                        {
-                                            self.push_undo();
-                                            let c =
-                                                self.document.vectors[si].center().unwrap_or((0.0, 0.0));
-                                            let d = to_doc(p);
-                                            self.rotate_center = c;
-                                            self.rotate_orig = self.document.vectors[si].points.clone();
-                                            self.rotate_start = (d.1 - c.1).atan2(d.0 - c.0);
-                                            self.rotating = true;
-                                            self.dragging_obj = false;
-                                            did_rot = true;
-                                        }
-                                    }
-                                    if !did_rot {
-                                        match self.hit_test(to_doc(p), thr) {
-                                            Some(i) => {
-                                                self.selected_obj = Some(i);
+                                    if !grabbed {
+                                        let mut did_rot = false;
+                                        if let Some(si) = self.selected_obj {
+                                            if si < self.document.vectors.len()
+                                                && self.rotate_handle_at(si, p, rect, zoom)
+                                            {
                                                 self.push_undo();
-                                                self.dragging_obj = true;
-                                            }
-                                            None => {
-                                                self.selected_obj = None;
+                                                let c = self.document.vectors[si]
+                                                    .center()
+                                                    .unwrap_or((0.0, 0.0));
+                                                self.rotate_center = c;
+                                                self.rotate_orig =
+                                                    self.document.vectors[si].points.clone();
+                                                self.rotate_start = (dp.1 - c.1).atan2(dp.0 - c.0);
+                                                self.rotating = true;
                                                 self.dragging_obj = false;
+                                                did_rot = true;
+                                            }
+                                        }
+                                        if !did_rot {
+                                            match self.hit_test(dp, thr) {
+                                                Some(i) => {
+                                                    self.selected_obj = Some(i);
+                                                    self.push_undo();
+                                                    self.dragging_obj = true;
+                                                }
+                                                None => {
+                                                    self.selected_obj = None;
+                                                    self.dragging_obj = false;
+                                                    self.marquee_start = Some((
+                                                        dp.0.floor() as i32,
+                                                        dp.1.floor() as i32,
+                                                    ));
+                                                    self.marquee_cur =
+                                                        (dp.0.floor() as i32, dp.1.floor() as i32);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                        if down && self.resize_handle.is_some() {
+                                                if down && self.resize_handle.is_some() {
                             if let Some(si) = self.selected_obj {
                                 if si < self.document.vectors.len() {
                                     if let Some(pp) = ppos {
@@ -2259,10 +2390,31 @@ impl eframe::App for SketchMotionApp {
                                 }
                             }
                         }
+                        if down && self.float_dragging {
+                            if let Some(pp) = ppos {
+                                let cur = to_doc(pp);
+                                let (gx, gy) = self.float_grab;
+                                if let Some(fs) = &mut self.float_sel {
+                                    fs.x = (cur.0 - gx).round() as i32;
+                                    fs.y = (cur.1 - gy).round() as i32;
+                                }
+                                self.dirty = true;
+                            }
+                        }
+                        if down && self.marquee_start.is_some() {
+                            if let Some(pp) = ppos {
+                                let d = to_doc(pp);
+                                self.marquee_cur = (d.0.floor() as i32, d.1.floor() as i32);
+                            }
+                        }
                         if !down {
                             self.dragging_obj = false;
                             self.resize_handle = None;
                             self.rotating = false;
+                            self.float_dragging = false;
+                            if let Some(start) = self.marquee_start.take() {
+                                self.lift_selection(start, self.marquee_cur);
+                            }
                         }
                         self.last_pos = None;
                     } else if self.tool == Tool::Shapes {
@@ -2416,6 +2568,65 @@ impl eframe::App for SketchMotionApp {
 
                     // Overlay vetorial: objetos, seleção e traço em progresso.
                     self.desenhar_vetores(ui, rect, zoom);
+
+                    // Seleção retangular raster: pixels flutuantes + marca.
+                    if self.float_sel.is_some() && self.float_tex.is_none() {
+                        if let Some(fs) = &self.float_sel {
+                            let img = egui::ColorImage::from_rgba_unmultiplied(
+                                [fs.w as usize, fs.h as usize],
+                                &fs.pixels,
+                            );
+                            self.float_tex = Some(ui.ctx().load_texture(
+                                "float_sel",
+                                img,
+                                egui::TextureOptions::NEAREST,
+                            ));
+                        }
+                    }
+                    if let Some(fs) = &self.float_sel {
+                        let sp0 = egui::pos2(
+                            rect.min.x + fs.x as f32 * zoom,
+                            rect.min.y + fs.y as f32 * zoom,
+                        );
+                        let srect = egui::Rect::from_min_size(
+                            sp0,
+                            egui::vec2(fs.w as f32 * zoom, fs.h as f32 * zoom),
+                        );
+                        let painter = ui.painter_at(rect);
+                        if let Some(tex) = &self.float_tex {
+                            painter.image(
+                                tex.id(),
+                                srect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                        painter.rect_stroke(srect, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
+                        painter.rect_stroke(
+                            srect.expand(1.0),
+                            0.0,
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(160)),
+                        );
+                    }
+                    if let Some((sx, sy)) = self.marquee_start {
+                        let (cx, cy) = self.marquee_cur;
+                        let a = egui::pos2(
+                            rect.min.x + sx.min(cx) as f32 * zoom,
+                            rect.min.y + sy.min(cy) as f32 * zoom,
+                        );
+                        let b = egui::pos2(
+                            rect.min.x + sx.max(cx) as f32 * zoom,
+                            rect.min.y + sy.max(cy) as f32 * zoom,
+                        );
+                        let mr = egui::Rect::from_min_max(a, b);
+                        let painter = ui.painter_at(rect);
+                        painter.rect_stroke(mr, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
+                        painter.rect_stroke(
+                            mr.expand(1.0),
+                            0.0,
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(160)),
+                        );
+                    }
                 });
         });
         let mut do_zoom_in = false;
