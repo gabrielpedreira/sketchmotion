@@ -820,7 +820,7 @@ impl SketchMotionApp {
                     egui::pos2(rect.min.x + maxx * zoom, rect.min.y + maxy * zoom),
                 )
                 .expand(3.0);
-                return rotate_handle_screen(r).distance(hp) <= 10.0;
+                return rotate_handle_screen(r).distance(hp) <= 14.0;
             }
         }
         false
@@ -2376,16 +2376,11 @@ impl eframe::App for SketchMotionApp {
                                             _ => false,
                                         };
                                     if rot_zone {
-                                        if let Some(hp) = hover {
-                                            painter.text(
-                                                hp + egui::vec2(10.0, -10.0),
-                                                egui::Align2::LEFT_BOTTOM,
-                                                egui_phosphor::regular::ARROW_CLOCKWISE,
-                                                egui::FontId::proportional(18.0),
-                                                egui::Color32::from_rgb(0x2F, 0x84, 0xFE),
-                                            );
-                                        }
-                                        ui.ctx().set_cursor_icon(CI::None);
+                                        ui.ctx().set_cursor_icon(if self.rotating {
+                                            CI::Grabbing
+                                        } else {
+                                            CI::Grab
+                                        });
                                     } else if self.dragging_obj || self.resize_handle.is_some() {
                                         ui.ctx().set_cursor_icon(CI::Grabbing);
                                     } else if let (Some(si), Some(hp)) = (self.selected_obj, hover) {
