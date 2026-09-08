@@ -6,11 +6,13 @@
 
 mod color;
 mod document;
+mod frame;
 mod layer;
 mod vector;
 
 pub use color::Color;
 pub use document::Document;
+pub use frame::Frame;
 pub use layer::Layer;
 pub use vector::{Anchor, VectorObject};
 

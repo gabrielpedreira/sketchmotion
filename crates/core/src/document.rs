@@ -4,6 +4,7 @@
 //! alteração no desenho acontece aqui; render e io apenas leem este estado.
 
 use crate::color::Color;
+use crate::frame::Frame;
 use crate::layer::Layer;
 use crate::vector::VectorObject;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,18 @@ pub struct Document {
     /// Objetos vetoriais (ilustração vetorial), desenhados sobre as camadas.
     #[serde(default)]
     pub vectors: Vec<VectorObject>,
+    /// Frames da animação (cada um com suas camadas/vetores). `layers`/`vectors`
+    /// acima são a cópia de trabalho do frame atual.
+    #[serde(default)]
+    pub frames: Vec<Frame>,
+    #[serde(default)]
+    pub current: usize,
+    #[serde(default = "default_fps")]
+    pub fps: u32,
+}
+
+fn default_fps() -> u32 {
+    12
 }
 
 impl Document {
@@ -29,9 +42,109 @@ impl Document {
             background,
             layers: Vec::new(),
             vectors: Vec::new(),
+            frames: Vec::new(),
+            current: 0,
+            fps: 12,
         };
         doc.add_layer("Camada 1");
+        doc.frames = vec![Frame {
+            layers: doc.layers.clone(),
+            vectors: doc.vectors.clone(),
+        }];
         doc
+    }
+
+    /// Ajusta o estado após carregar (migra projetos antigos sem frames e
+    /// carrega a cópia de trabalho a partir do frame atual).
+    pub fn normalize(&mut self) {
+        if self.frames.is_empty() {
+            self.frames = vec![Frame {
+                layers: std::mem::take(&mut self.layers),
+                vectors: std::mem::take(&mut self.vectors),
+            }];
+        }
+        for f in &mut self.frames {
+            if f.layers.is_empty() {
+                f.layers.push(Layer::new("Camada 1", self.width, self.height));
+            }
+        }
+        if self.current >= self.frames.len() {
+            self.current = 0;
+        }
+        if self.fps == 0 {
+            self.fps = 12;
+        }
+        self.layers = self.frames[self.current].layers.clone();
+        self.vectors = self.frames[self.current].vectors.clone();
+    }
+
+    /// Grava a cópia de trabalho no frame atual.
+    pub fn sync_to_frames(&mut self) {
+        let f = Frame {
+            layers: self.layers.clone(),
+            vectors: self.vectors.clone(),
+        };
+        if self.frames.is_empty() {
+            self.frames.push(f);
+            self.current = 0;
+        } else if self.current < self.frames.len() {
+            self.frames[self.current] = f;
+        }
+    }
+
+    /// Troca o frame atual (salvando o anterior antes).
+    pub fn go_to_frame(&mut self, i: usize) {
+        if i >= self.frames.len() || i == self.current {
+            if i < self.frames.len() {
+                self.current = i;
+            }
+            return;
+        }
+        self.sync_to_frames();
+        self.current = i;
+        self.layers = self.frames[i].layers.clone();
+        self.vectors = self.frames[i].vectors.clone();
+    }
+
+    /// Insere um frame em branco após o atual e vai para ele.
+    pub fn add_frame(&mut self) -> usize {
+        self.sync_to_frames();
+        let at = (self.current + 1).min(self.frames.len());
+        self.frames
+            .insert(at, Frame::blank("Camada 1", self.width, self.height));
+        self.current = at;
+        self.layers = self.frames[at].layers.clone();
+        self.vectors = self.frames[at].vectors.clone();
+        at
+    }
+
+    /// Duplica o frame atual e vai para a cópia.
+    pub fn duplicate_frame(&mut self) -> usize {
+        self.sync_to_frames();
+        let copy = self.frames[self.current].clone();
+        let at = self.current + 1;
+        self.frames.insert(at, copy);
+        self.current = at;
+        self.layers = self.frames[at].layers.clone();
+        self.vectors = self.frames[at].vectors.clone();
+        at
+    }
+
+    /// Remove um frame (mantém ao menos um).
+    pub fn remove_frame(&mut self, i: usize) {
+        if self.frames.len() <= 1 || i >= self.frames.len() {
+            return;
+        }
+        self.frames.remove(i);
+        if self.current >= self.frames.len() {
+            self.current = self.frames.len() - 1;
+        }
+        self.layers = self.frames[self.current].layers.clone();
+        self.vectors = self.frames[self.current].vectors.clone();
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.frames.len().max(1)
     }
 
     /// Adiciona uma camada transparente no topo e devolve o índice dela.

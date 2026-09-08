@@ -10,7 +10,7 @@
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{Anchor, Color, Document, VectorObject};
-use sketchmotion_render::{render_document, PixelImage};
+use sketchmotion_render::{render_document, render_layers, render_layers_alpha, PixelImage};
 use sketchmotion_tools::Tool;
 
 const CANVAS_W: u32 = 800;
@@ -59,6 +59,22 @@ fn load_icon() -> egui::IconData {
 
 fn to_color32(c: Color) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+/// Reduz uma imagem RGBA a uma miniatura (amostragem nearest).
+fn thumb_image(full: &PixelImage, tw: usize, th: usize) -> egui::ColorImage {
+    let (fw, fh) = (full.width as usize, full.height as usize);
+    let mut out = vec![0u8; tw * th * 4];
+    for ty in 0..th {
+        for tx in 0..tw {
+            let sx = (tx * fw / tw).min(fw.saturating_sub(1));
+            let sy = (ty * fh / th).min(fh.saturating_sub(1));
+            let si = (sy * fw + sx) * 4;
+            let di = (ty * tw + tx) * 4;
+            out[di..di + 4].copy_from_slice(&full.rgba[si..si + 4]);
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([tw, th], &out)
 }
 
 /// Distância de um ponto (px,py) ao segmento (x1,y1)-(x2,y2).
@@ -490,6 +506,11 @@ struct SketchMotionApp {
     marquee_cur: (i32, i32),
     lasso_points: Vec<(f32, f32)>,
     fill_tolerance: i32,
+    // frames / animação
+    onion: bool,
+    frame_thumbs: Vec<Option<egui::TextureHandle>>,
+    onion_tex: Option<egui::TextureHandle>,
+    onion_for: Option<usize>,
 }
 
 impl SketchMotionApp {
@@ -578,6 +599,10 @@ impl SketchMotionApp {
             marquee_cur: (0, 0),
             lasso_points: Vec::new(),
             fill_tolerance: 24,
+            onion: false,
+            frame_thumbs: Vec::new(),
+            onion_tex: None,
+            onion_for: None,
         }
     }
 
@@ -726,6 +751,9 @@ impl SketchMotionApp {
             1.0
         };
         self.dirty = true;
+        self.frame_thumbs.clear();
+        self.onion_tex = None;
+        self.onion_for = None;
         self.status = if pixel {
             format!("Novo documento pixel art {w}x{h}")
         } else {
@@ -734,6 +762,7 @@ impl SketchMotionApp {
     }
 
     fn salvar(&mut self) {
+        self.document.sync_to_frames();
         if let Some(path) = self.current_path.clone() {
             self.status = match sketchmotion_io::save(&self.document, &path) {
                 Ok(()) => format!("Salvo em {}", path.display()),
@@ -745,6 +774,7 @@ impl SketchMotionApp {
     }
 
     fn salvar_como(&mut self) {
+        self.document.sync_to_frames();
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
             .set_file_name("desenho.sketchmotion")
@@ -791,6 +821,9 @@ impl SketchMotionApp {
                     self.active_layer = 0;
                     self.last_pos = None;
                     self.dirty = true;
+                    self.frame_thumbs.clear();
+                    self.onion_tex = None;
+                    self.onion_for = None;
                     self.current_path = Some(path.clone());
                     self.status = format!("Aberto: {}", path.display());
                     return true;
@@ -1455,6 +1488,154 @@ impl SketchMotionApp {
                     }
                 });
             });
+    }
+
+    /// Timeline de frames (rodapé): miniaturas selecionáveis, navegação, FPS
+    /// e onion skin.
+    fn barra_frames(&mut self, ctx: &egui::Context) {
+        let (dw, dh, bg) = (self.document.width, self.document.height, self.document.background);
+        let th_h = 56usize;
+        let th_w = (((th_h as f32) * dw as f32 / dh as f32).round() as usize).clamp(24, 160);
+        let n = self.document.frame_count();
+        if self.frame_thumbs.len() != n {
+            self.frame_thumbs.resize(n, None);
+        }
+        for i in 0..n {
+            if self.frame_thumbs[i].is_none() {
+                let full = if i == self.document.current {
+                    render_layers(dw, dh, bg, &self.document.layers)
+                } else {
+                    render_layers(dw, dh, bg, &self.document.frames[i].layers)
+                };
+                let img = thumb_image(&full, th_w, th_h);
+                self.frame_thumbs[i] =
+                    Some(ctx.load_texture(format!("thumb{i}"), img, egui::TextureOptions::NEAREST));
+            }
+        }
+        let mut act_add = false;
+        let mut act_dup = false;
+        let mut act_del = false;
+        let mut act_prev = false;
+        let mut act_next = false;
+        let mut goto: Option<usize> = None;
+        egui::TopBottomPanel::bottom("timeline")
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("＋ Frame").on_hover_text("Novo frame após o atual").clicked() {
+                        act_add = true;
+                    }
+                    if ui.button("Duplicar").clicked() {
+                        act_dup = true;
+                    }
+                    if ui.add_enabled(n > 1, egui::Button::new("Excluir")).clicked() {
+                        act_del = true;
+                    }
+                    ui.separator();
+                    if ui.button("◀").clicked() {
+                        act_prev = true;
+                    }
+                    ui.label(format!("Frame {}/{}", self.document.current + 1, n));
+                    if ui.button("▶").clicked() {
+                        act_next = true;
+                    }
+                    ui.separator();
+                    ui.label("FPS:");
+                    let mut fps = self.document.fps as i32;
+                    if ui.add(egui::Slider::new(&mut fps, 1..=60)).changed() {
+                        self.document.fps = fps.clamp(1, 60) as u32;
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.onion, "Onion skin")
+                        .on_hover_text("Mostra o frame anterior a 30%");
+                });
+                ui.add_space(4.0);
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for i in 0..n {
+                            let sel = i == self.document.current;
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(th_w as f32, th_h as f32 + 16.0),
+                                egui::Sense::click(),
+                            );
+                            let img_rect = egui::Rect::from_min_size(
+                                rect.min,
+                                egui::vec2(th_w as f32, th_h as f32),
+                            );
+                            let painter = ui.painter_at(rect);
+                            painter.rect_filled(img_rect, 0.0, egui::Color32::from_gray(30));
+                            if let Some(tex) = &self.frame_thumbs[i] {
+                                painter.image(
+                                    tex.id(),
+                                    img_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            let cor = if sel {
+                                egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                            } else {
+                                egui::Color32::from_gray(90)
+                            };
+                            painter.rect_stroke(
+                                img_rect,
+                                0.0,
+                                egui::Stroke::new(if sel { 2.0 } else { 1.0 }, cor),
+                            );
+                            painter.text(
+                                egui::pos2(rect.center().x, img_rect.bottom() + 8.0),
+                                egui::Align2::CENTER_CENTER,
+                                format!("{}", i + 1),
+                                egui::FontId::proportional(12.0),
+                                cor,
+                            );
+                            if resp.clicked() {
+                                goto = Some(i);
+                            }
+                            ui.add_space(6.0);
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+            });
+        if let Some(i) = goto {
+            self.document.go_to_frame(i);
+            self.dirty = true;
+            self.onion_for = None;
+        }
+        if act_prev && self.document.current > 0 {
+            self.document.go_to_frame(self.document.current - 1);
+            self.dirty = true;
+            self.onion_for = None;
+        }
+        if act_next && self.document.current + 1 < n {
+            self.document.go_to_frame(self.document.current + 1);
+            self.dirty = true;
+            self.onion_for = None;
+        }
+        if act_add {
+            self.document.add_frame();
+            self.frame_thumbs.clear();
+            self.dirty = true;
+            self.onion_for = None;
+        }
+        if act_dup {
+            self.document.duplicate_frame();
+            self.frame_thumbs.clear();
+            self.dirty = true;
+            self.onion_for = None;
+        }
+        if act_del {
+            let c = self.document.current;
+            self.document.remove_frame(c);
+            self.frame_thumbs.clear();
+            self.dirty = true;
+            self.onion_for = None;
+        }
     }
 
     /// Barra de opções (abaixo do menu): cada ferramenta abre aqui o seu
@@ -2389,6 +2570,11 @@ impl eframe::App for SketchMotionApp {
                 }
             }
             self.dirty = false;
+            let cf = self.document.current;
+            if cf < self.frame_thumbs.len() {
+                self.frame_thumbs[cf] = None;
+            }
+            self.onion_for = None;
         }
         let tex_id = self.texture.as_ref().unwrap().id();
 
@@ -2519,6 +2705,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_cor(ctx);
         self.janela_paletas(ctx);
         self.janela_camadas(ctx);
+        self.barra_frames(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let doc_w = self.document.width as f32;
@@ -2556,6 +2743,35 @@ impl eframe::App for SketchMotionApp {
                             painter.line_segment(
                                 [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                                 egui::Stroke::new(1.0_f32, cor),
+                            );
+                        }
+                    }
+
+                    if self.onion && self.document.current > 0 {
+                        let prev = self.document.current - 1;
+                        if self.onion_for != Some(prev) || self.onion_tex.is_none() {
+                            let oi = render_layers_alpha(
+                                self.document.width,
+                                self.document.height,
+                                &self.document.frames[prev].layers,
+                            );
+                            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                [oi.width as usize, oi.height as usize],
+                                &oi.rgba,
+                            );
+                            self.onion_tex = Some(ui.ctx().load_texture(
+                                "onion",
+                                ci,
+                                egui::TextureOptions::NEAREST,
+                            ));
+                            self.onion_for = Some(prev);
+                        }
+                        if let Some(tex) = &self.onion_tex {
+                            ui.painter_at(rect).image(
+                                tex.id(),
+                                rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::from_white_alpha(77),
                             );
                         }
                     }
@@ -3115,7 +3331,7 @@ impl eframe::App for SketchMotionApp {
         let mut do_zoom_in = false;
         let mut do_zoom_out = false;
         egui::Area::new(egui::Id::new("acoes_canvas"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-66.0, -16.0))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-66.0, -104.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {

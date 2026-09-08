@@ -30,7 +30,10 @@ pub fn save(doc: &Document, path: &Path) -> Result<(), String> {
 /// Carrega um documento a partir de um arquivo `.sketchmotion`.
 pub fn load(path: &Path) -> Result<Document, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
-    ciborium::from_reader(BufReader::new(file)).map_err(|e| e.to_string())
+    let mut doc: Document =
+        ciborium::from_reader(BufReader::new(file)).map_err(|e| e.to_string())?;
+    doc.normalize();
+    Ok(doc)
 }
 
 // ---------- Biblioteca global de paletas ----------
