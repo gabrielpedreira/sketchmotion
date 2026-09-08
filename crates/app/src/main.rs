@@ -2203,29 +2203,33 @@ impl SketchMotionApp {
                 ));
             }
         }
-        ui.label("Pincel:");
-        if let Some(tex) = &self.brush_prev[self.brush_kind] {
-            ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
-                tex.id(),
-                egui::vec2(50.0, 18.0),
-            )));
+        if self.pixel_mode {
+            ui.label("Pincel: Duro (no pixel art só o pincel comum)");
+        } else {
+            ui.label("Pincel:");
+            if let Some(tex) = &self.brush_prev[self.brush_kind] {
+                ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                    tex.id(),
+                    egui::vec2(50.0, 18.0),
+                )));
+            }
+            egui::ComboBox::from_id_salt("tipo_pincel")
+                .selected_text(BRUSHES[self.brush_kind])
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for i in 0..BRUSHES.len() {
+                        ui.horizontal(|ui| {
+                            if let Some(tex) = &self.brush_prev[i] {
+                                ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                                    tex.id(),
+                                    egui::vec2(64.0, 20.0),
+                                )));
+                            }
+                            ui.selectable_value(&mut self.brush_kind, i, BRUSHES[i]);
+                        });
+                    }
+                });
         }
-        egui::ComboBox::from_id_salt("tipo_pincel")
-            .selected_text(BRUSHES[self.brush_kind])
-            .width(190.0)
-            .show_ui(ui, |ui| {
-                for i in 0..BRUSHES.len() {
-                    ui.horizontal(|ui| {
-                        if let Some(tex) = &self.brush_prev[i] {
-                            ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
-                                tex.id(),
-                                egui::vec2(64.0, 20.0),
-                            )));
-                        }
-                        ui.selectable_value(&mut self.brush_kind, i, BRUSHES[i]);
-                    });
-                }
-            });
         ui.separator();
         ui.label("Tamanho:");
         ui.add(egui::Slider::new(&mut self.brush_radius, 1..=40));
