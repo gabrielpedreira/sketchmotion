@@ -333,10 +333,13 @@ fn seletor_hue(ui: &mut egui::Ui, hsva: &mut egui::ecolor::Hsva, largura: f32, a
 /// sobre o canvas até ser movida e confirmada (estilo Paint).
 struct FloatSel {
     pixels: Vec<u8>,
-    w: u32,
-    h: u32,
-    x: i32,
-    y: i32,
+    ow: u32,
+    oh: u32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    opacity: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -429,6 +432,11 @@ struct SketchMotionApp {
     float_tex: Option<egui::TextureHandle>,
     float_dragging: bool,
     float_grab: (f32, f32),
+    float_resize: Option<usize>,
+    fr_orig: (f32, f32, f32, f32),
+    fr_fixed: (f32, f32),
+    fr_grab: (f32, f32),
+    fr_axes: (bool, bool),
     marquee_start: Option<(i32, i32)>,
     marquee_cur: (i32, i32),
     fill_tolerance: i32,
@@ -510,6 +518,11 @@ impl SketchMotionApp {
             float_tex: None,
             float_dragging: false,
             float_grab: (0.0, 0.0),
+            float_resize: None,
+            fr_orig: (0.0, 0.0, 0.0, 0.0),
+            fr_fixed: (0.0, 0.0),
+            fr_grab: (0.0, 0.0),
+            fr_axes: (true, true),
             marquee_start: None,
             marquee_cur: (0, 0),
             fill_tolerance: 24,
@@ -873,7 +886,16 @@ impl SketchMotionApp {
                 }
             }
         }
-        self.float_sel = Some(FloatSel { pixels, w, h, x: x0, y: y0 });
+        self.float_sel = Some(FloatSel {
+            pixels,
+            ow: w,
+            oh: h,
+            x: x0 as f32,
+            y: y0 as f32,
+            w: w as f32,
+            h: h as f32,
+            opacity: 1.0,
+        });
         self.float_tex = None;
         self.dirty = true;
         self.status = "Seleção recortada — arraste para mover".into();
@@ -884,31 +906,41 @@ impl SketchMotionApp {
         if let Some(fs) = self.float_sel.take() {
             let li = self.active_layer;
             let (dw, dh) = (self.document.width as i32, self.document.height as i32);
+            let x0 = fs.x.floor() as i32;
+            let y0 = fs.y.floor() as i32;
+            let x1 = (fs.x + fs.w).ceil() as i32;
+            let y1 = (fs.y + fs.h).ceil() as i32;
             if let Some(layer) = self.document.layer_mut(li) {
-                for yy in 0..fs.h {
-                    for xx in 0..fs.w {
-                        let di = ((yy * fs.w + xx) * 4) as usize;
-                        let a = fs.pixels[di + 3];
-                        if a == 0 {
-                            continue;
-                        }
-                        let (px, py) = (fs.x + xx as i32, fs.y + yy as i32);
+                for py in y0..y1 {
+                    for px in x0..x1 {
                         if px < 0 || py < 0 || px >= dw || py >= dh {
                             continue;
                         }
-                        let (px, py) = (px as u32, py as u32);
-                        let src = Color::rgba(fs.pixels[di], fs.pixels[di + 1], fs.pixels[di + 2], a);
-                        if a == 255 {
-                            layer.set_pixel(px, py, src);
-                        } else if let Some(d) = layer.get_pixel(px, py) {
-                            let sa = a as u32;
-                            let ia = 255 - sa;
-                            let bl = |s: u8, dd: u8| ((s as u32 * sa + dd as u32 * ia) / 255) as u8;
-                            let na = (sa + (d.a as u32) * ia / 255).min(255) as u8;
+                        let u = (px as f32 + 0.5 - fs.x) / fs.w;
+                        let v = (py as f32 + 0.5 - fs.y) / fs.h;
+                        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                            continue;
+                        }
+                        let sx = ((u * fs.ow as f32) as u32).min(fs.ow.saturating_sub(1));
+                        let sy = ((v * fs.oh as f32) as u32).min(fs.oh.saturating_sub(1));
+                        let si = ((sy * fs.ow + sx) * 4) as usize;
+                        let a = (fs.pixels[si + 3] as f32 * fs.opacity).round() as u32;
+                        if a == 0 {
+                            continue;
+                        }
+                        let src =
+                            Color::rgba(fs.pixels[si], fs.pixels[si + 1], fs.pixels[si + 2], a as u8);
+                        let (upx, upy) = (px as u32, py as u32);
+                        if a >= 255 {
+                            layer.set_pixel(upx, upy, src);
+                        } else if let Some(d) = layer.get_pixel(upx, upy) {
+                            let ia = 255 - a;
+                            let bl = |sc: u8, dd: u8| ((sc as u32 * a + dd as u32 * ia) / 255) as u8;
+                            let na = (a + (d.a as u32) * ia / 255).min(255) as u8;
                             layer.set_pixel(
-                                px,
-                                py,
-                                Color::rgba(bl(src.r, d.r), bl(src.g, d.g), bl(src.b, d.b), na.max(a)),
+                                upx,
+                                upy,
+                                Color::rgba(bl(src.r, d.r), bl(src.g, d.g), bl(src.b, d.b), na.max(a as u8)),
                             );
                         }
                     }
@@ -1277,6 +1309,31 @@ impl SketchMotionApp {
 
     /// Ferramenta Seleção: opera sobre o objeto vetorial selecionado.
     fn opcoes_selecao(&mut self, ui: &mut egui::Ui) {
+        if self.float_sel.is_some() {
+            ui.label("Seleção de pixels.");
+            ui.separator();
+            ui.label("Opacidade:");
+            let mut pct = self.float_sel.as_ref().map(|f| f.opacity).unwrap_or(1.0) * 100.0;
+            if ui
+                .add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%"))
+                .changed()
+            {
+                if let Some(f) = &mut self.float_sel {
+                    f.opacity = (pct / 100.0).clamp(0.0, 1.0);
+                }
+                self.dirty = true;
+            }
+            ui.separator();
+            if ui.button("Confirmar").clicked() {
+                self.commit_float();
+            }
+            if ui.button("Excluir").clicked() {
+                self.float_sel = None;
+                self.float_tex = None;
+                self.dirty = true;
+            }
+            return;
+        }
         match self.selected_obj {
             Some(idx) if idx < self.document.vectors.len() => {
                 ui.label("Traço selecionado.");
@@ -2352,12 +2409,40 @@ impl eframe::App for SketchMotionApp {
                                 let mut consumed = false;
                                 // seleção flutuante (raster): dentro move; fora confirma
                                 if let Some(fs) = &self.float_sel {
-                                    let inside = dp.0 >= fs.x as f32
-                                        && dp.0 <= (fs.x + fs.w as i32) as f32
-                                        && dp.1 >= fs.y as f32
-                                        && dp.1 <= (fs.y + fs.h as i32) as f32;
-                                    if inside {
-                                        self.float_grab = (dp.0 - fs.x as f32, dp.1 - fs.y as f32);
+                                    let (fx, fy, fw, fh) = (fs.x, fs.y, fs.w, fs.h);
+                                    let sr = egui::Rect::from_min_max(
+                                        egui::pos2(rect.min.x + fx * zoom, rect.min.y + fy * zoom),
+                                        egui::pos2(
+                                            rect.min.x + (fx + fw) * zoom,
+                                            rect.min.y + (fy + fh) * zoom,
+                                        ),
+                                    )
+                                    .expand(3.0);
+                                    let hs = handle_positions(sr);
+                                    let mut on_handle = None;
+                                    for (hi, hc) in hs.iter().enumerate() {
+                                        if hc.distance(p) <= 8.0 {
+                                            on_handle = Some(hi);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(hi) = on_handle {
+                                        let (minx, miny, maxx, maxy) = (fx, fy, fx + fw, fy + fh);
+                                        let (cx, cy) = ((minx + maxx) / 2.0, (miny + maxy) / 2.0);
+                                        let (grab, fixed, axes) =
+                                            handle_geometry(hi, minx, miny, maxx, maxy, cx, cy);
+                                        self.float_resize = Some(hi);
+                                        self.fr_orig = (minx, miny, maxx, maxy);
+                                        self.fr_grab = grab;
+                                        self.fr_fixed = fixed;
+                                        self.fr_axes = axes;
+                                        consumed = true;
+                                    } else if dp.0 >= fx
+                                        && dp.0 <= fx + fw
+                                        && dp.1 >= fy
+                                        && dp.1 <= fy + fh
+                                    {
+                                        self.float_grab = (dp.0 - fx, dp.1 - fy);
                                         self.float_dragging = true;
                                         consumed = true;
                                     }
@@ -2522,13 +2607,34 @@ impl eframe::App for SketchMotionApp {
                                 }
                             }
                         }
-                        if down && self.float_dragging {
+                        if down && self.float_resize.is_some() {
+                            if let Some(pp) = ppos {
+                                let cur = to_doc(pp);
+                                let (ox1, oy1, ox2, oy2) = self.fr_orig;
+                                let (gx, gy) = self.fr_grab;
+                                let (fxp, fyp) = self.fr_fixed;
+                                let (ax, ay) = self.fr_axes;
+                                let sx = if ax { safe_ratio(cur.0 - fxp, gx - fxp) } else { 1.0 };
+                                let sy = if ay { safe_ratio(cur.1 - fyp, gy - fyp) } else { 1.0 };
+                                let nx1 = fxp + (ox1 - fxp) * sx;
+                                let nx2 = fxp + (ox2 - fxp) * sx;
+                                let ny1 = fyp + (oy1 - fyp) * sy;
+                                let ny2 = fyp + (oy2 - fyp) * sy;
+                                if let Some(fs) = &mut self.float_sel {
+                                    fs.x = nx1.min(nx2);
+                                    fs.y = ny1.min(ny2);
+                                    fs.w = (nx2 - nx1).abs().max(1.0);
+                                    fs.h = (ny2 - ny1).abs().max(1.0);
+                                }
+                                self.dirty = true;
+                            }
+                        } else if down && self.float_dragging {
                             if let Some(pp) = ppos {
                                 let cur = to_doc(pp);
                                 let (gx, gy) = self.float_grab;
                                 if let Some(fs) = &mut self.float_sel {
-                                    fs.x = (cur.0 - gx).round() as i32;
-                                    fs.y = (cur.1 - gy).round() as i32;
+                                    fs.x = cur.0 - gx;
+                                    fs.y = cur.1 - gy;
                                 }
                                 self.dirty = true;
                             }
@@ -2544,6 +2650,7 @@ impl eframe::App for SketchMotionApp {
                             self.resize_handle = None;
                             self.rotating = false;
                             self.float_dragging = false;
+                            self.float_resize = None;
                             if let Some(start) = self.marquee_start.take() {
                                 self.lift_selection(start, self.marquee_cur);
                             }
@@ -2713,7 +2820,7 @@ impl eframe::App for SketchMotionApp {
                     if self.float_sel.is_some() && self.float_tex.is_none() {
                         if let Some(fs) = &self.float_sel {
                             let img = egui::ColorImage::from_rgba_unmultiplied(
-                                [fs.w as usize, fs.h as usize],
+                                [fs.ow as usize, fs.oh as usize],
                                 &fs.pixels,
                             );
                             self.float_tex = Some(ui.ctx().load_texture(
@@ -2724,13 +2831,9 @@ impl eframe::App for SketchMotionApp {
                         }
                     }
                     if let Some(fs) = &self.float_sel {
-                        let sp0 = egui::pos2(
-                            rect.min.x + fs.x as f32 * zoom,
-                            rect.min.y + fs.y as f32 * zoom,
-                        );
                         let srect = egui::Rect::from_min_size(
-                            sp0,
-                            egui::vec2(fs.w as f32 * zoom, fs.h as f32 * zoom),
+                            egui::pos2(rect.min.x + fs.x * zoom, rect.min.y + fs.y * zoom),
+                            egui::vec2(fs.w * zoom, fs.h * zoom),
                         );
                         let painter = ui.painter_at(rect);
                         if let Some(tex) = &self.float_tex {
@@ -2738,15 +2841,22 @@ impl eframe::App for SketchMotionApp {
                                 tex.id(),
                                 srect,
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                egui::Color32::WHITE,
+                                egui::Color32::from_white_alpha((fs.opacity * 255.0) as u8),
                             );
                         }
-                        painter.rect_stroke(srect, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
+                        let sr = srect.expand(3.0);
+                        painter.rect_stroke(sr, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
                         painter.rect_stroke(
-                            srect.expand(1.0),
+                            sr.expand(1.0),
                             0.0,
                             egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(160)),
                         );
+                        let azul = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+                        for c in handle_positions(sr) {
+                            let hh = egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0));
+                            painter.rect_filled(hh, 0.0, egui::Color32::WHITE);
+                            painter.rect_stroke(hh, 0.0, egui::Stroke::new(1.0_f32, azul));
+                        }
                     }
                     if let Some((sx, sy)) = self.marquee_start {
                         let (cx, cy) = self.marquee_cur;
