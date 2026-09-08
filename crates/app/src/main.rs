@@ -94,6 +94,32 @@ fn rotate_handle_screen(r: egui::Rect) -> egui::Pos2 {
     egui::pos2(r.center().x, r.top() - 22.0)
 }
 
+/// Sinais locais das 8 alças (cantos e meios), na ordem canônica.
+const HSIGNS: [(f32, f32); 8] = [
+    (-1.0, -1.0),
+    (0.0, -1.0),
+    (1.0, -1.0),
+    (1.0, 0.0),
+    (1.0, 1.0),
+    (0.0, 1.0),
+    (-1.0, 1.0),
+    (-1.0, 0.0),
+];
+
+/// Ponto (mundo) de um canto/lado da seleção flutuante girada.
+fn float_corner(cx: f32, cy: f32, hw: f32, hh: f32, ang: f32, sx: f32, sy: f32) -> (f32, f32) {
+    let (s, c) = ang.sin_cos();
+    let (lx, ly) = (sx * hw, sy * hh);
+    (cx + lx * c - ly * s, cy + lx * s + ly * c)
+}
+
+/// Converte um ponto do mundo para o sistema local (não girado) da seleção.
+fn float_local(cx: f32, cy: f32, ang: f32, wx: f32, wy: f32) -> (f32, f32) {
+    let (s, c) = ang.sin_cos();
+    let (dx, dy) = (wx - cx, wy - cy);
+    (dx * c + dy * s, -dx * s + dy * c)
+}
+
 /// Para a alça `hi`: ponto agarrado, ponto fixo (oposto) e quais eixos escalam.
 fn handle_geometry(
     hi: usize,
@@ -335,10 +361,11 @@ struct FloatSel {
     pixels: Vec<u8>,
     ow: u32,
     oh: u32,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
+    cx: f32,
+    cy: f32,
+    hw: f32,
+    hh: f32,
+    angle: f32,
     opacity: f32,
 }
 
@@ -432,11 +459,12 @@ struct SketchMotionApp {
     float_tex: Option<egui::TextureHandle>,
     float_dragging: bool,
     float_grab: (f32, f32),
-    float_resize: Option<usize>,
-    fr_orig: (f32, f32, f32, f32),
+    float_resize: Option<(f32, f32)>,
     fr_fixed: (f32, f32),
-    fr_grab: (f32, f32),
-    fr_axes: (bool, bool),
+    fr_wh: (f32, f32),
+    fr_angle: f32,
+    float_rotating: bool,
+    float_rot_grab: f32,
     marquee_start: Option<(i32, i32)>,
     marquee_cur: (i32, i32),
     fill_tolerance: i32,
@@ -519,10 +547,11 @@ impl SketchMotionApp {
             float_dragging: false,
             float_grab: (0.0, 0.0),
             float_resize: None,
-            fr_orig: (0.0, 0.0, 0.0, 0.0),
             fr_fixed: (0.0, 0.0),
-            fr_grab: (0.0, 0.0),
-            fr_axes: (true, true),
+            fr_wh: (0.0, 0.0),
+            fr_angle: 0.0,
+            float_rotating: false,
+            float_rot_grab: 0.0,
             marquee_start: None,
             marquee_cur: (0, 0),
             fill_tolerance: 24,
@@ -890,10 +919,11 @@ impl SketchMotionApp {
             pixels,
             ow: w,
             oh: h,
-            x: x0 as f32,
-            y: y0 as f32,
-            w: w as f32,
-            h: h as f32,
+            cx: x0 as f32 + w as f32 / 2.0,
+            cy: y0 as f32 + h as f32 / 2.0,
+            hw: w as f32 / 2.0,
+            hh: h as f32 / 2.0,
+            angle: 0.0,
             opacity: 1.0,
         });
         self.float_tex = None;
@@ -906,18 +936,31 @@ impl SketchMotionApp {
         if let Some(fs) = self.float_sel.take() {
             let li = self.active_layer;
             let (dw, dh) = (self.document.width as i32, self.document.height as i32);
-            let x0 = fs.x.floor() as i32;
-            let y0 = fs.y.floor() as i32;
-            let x1 = (fs.x + fs.w).ceil() as i32;
-            let y1 = (fs.y + fs.h).ceil() as i32;
+            let corners = [
+                float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, -1.0, -1.0),
+                float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, 1.0, -1.0),
+                float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, 1.0, 1.0),
+                float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, -1.0, 1.0),
+            ];
+            let (mut minx, mut miny) = (f32::INFINITY, f32::INFINITY);
+            let (mut maxx, mut maxy) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for (x, y) in corners {
+                minx = minx.min(x);
+                miny = miny.min(y);
+                maxx = maxx.max(x);
+                maxy = maxy.max(y);
+            }
+            let x0 = (minx.floor() as i32).max(0);
+            let y0 = (miny.floor() as i32).max(0);
+            let x1 = (maxx.ceil() as i32).min(dw);
+            let y1 = (maxy.ceil() as i32).min(dh);
             if let Some(layer) = self.document.layer_mut(li) {
                 for py in y0..y1 {
                     for px in x0..x1 {
-                        if px < 0 || py < 0 || px >= dw || py >= dh {
-                            continue;
-                        }
-                        let u = (px as f32 + 0.5 - fs.x) / fs.w;
-                        let v = (py as f32 + 0.5 - fs.y) / fs.h;
+                        let (lx, ly) =
+                            float_local(fs.cx, fs.cy, fs.angle, px as f32 + 0.5, py as f32 + 0.5);
+                        let u = lx / (2.0 * fs.hw) + 0.5;
+                        let v = ly / (2.0 * fs.hh) + 0.5;
                         if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
                             continue;
                         }
@@ -2409,42 +2452,44 @@ impl eframe::App for SketchMotionApp {
                                 let mut consumed = false;
                                 // seleção flutuante (raster): dentro move; fora confirma
                                 if let Some(fs) = &self.float_sel {
-                                    let (fx, fy, fw, fh) = (fs.x, fs.y, fs.w, fs.h);
-                                    let sr = egui::Rect::from_min_max(
-                                        egui::pos2(rect.min.x + fx * zoom, rect.min.y + fy * zoom),
-                                        egui::pos2(
-                                            rect.min.x + (fx + fw) * zoom,
-                                            rect.min.y + (fy + fh) * zoom,
-                                        ),
-                                    )
-                                    .expand(3.0);
-                                    let hs = handle_positions(sr);
-                                    let mut on_handle = None;
-                                    for (hi, hc) in hs.iter().enumerate() {
-                                        if hc.distance(p) <= 8.0 {
-                                            on_handle = Some(hi);
-                                            break;
+                                    let (cx, cy, hw, hh, ang) =
+                                        (fs.cx, fs.cy, fs.hw, fs.hh, fs.angle);
+                                    let scr = |wx: f32, wy: f32| {
+                                        egui::pos2(rect.min.x + wx * zoom, rect.min.y + wy * zoom)
+                                    };
+                                    let (tmx, tmy) = float_corner(cx, cy, hw, hh, ang, 0.0, -1.0);
+                                    let tm = scr(tmx, tmy);
+                                    let cc = scr(cx, cy);
+                                    let dir = (tm - cc).normalized();
+                                    let roth = tm + dir * 22.0;
+                                    if roth.distance(p) <= 12.0 {
+                                        self.float_rotating = true;
+                                        self.float_rot_grab = (dp.1 - cy).atan2(dp.0 - cx) - ang;
+                                        consumed = true;
+                                    } else {
+                                        let mut grabbed_h = None;
+                                        for &(sx, sy) in HSIGNS.iter() {
+                                            let (hx, hy) = float_corner(cx, cy, hw, hh, ang, sx, sy);
+                                            if scr(hx, hy).distance(p) <= 8.0 {
+                                                grabbed_h = Some((sx, sy));
+                                                break;
+                                            }
                                         }
-                                    }
-                                    if let Some(hi) = on_handle {
-                                        let (minx, miny, maxx, maxy) = (fx, fy, fx + fw, fy + fh);
-                                        let (cx, cy) = ((minx + maxx) / 2.0, (miny + maxy) / 2.0);
-                                        let (grab, fixed, axes) =
-                                            handle_geometry(hi, minx, miny, maxx, maxy, cx, cy);
-                                        self.float_resize = Some(hi);
-                                        self.fr_orig = (minx, miny, maxx, maxy);
-                                        self.fr_grab = grab;
-                                        self.fr_fixed = fixed;
-                                        self.fr_axes = axes;
-                                        consumed = true;
-                                    } else if dp.0 >= fx
-                                        && dp.0 <= fx + fw
-                                        && dp.1 >= fy
-                                        && dp.1 <= fy + fh
-                                    {
-                                        self.float_grab = (dp.0 - fx, dp.1 - fy);
-                                        self.float_dragging = true;
-                                        consumed = true;
+                                        if let Some((sx, sy)) = grabbed_h {
+                                            self.fr_fixed =
+                                                float_corner(cx, cy, hw, hh, ang, -sx, -sy);
+                                            self.fr_wh = (2.0 * hw, 2.0 * hh);
+                                            self.fr_angle = ang;
+                                            self.float_resize = Some((sx, sy));
+                                            consumed = true;
+                                        } else {
+                                            let (lx, ly) = float_local(cx, cy, ang, dp.0, dp.1);
+                                            if lx.abs() <= hw && ly.abs() <= hh {
+                                                self.float_grab = (dp.0 - cx, dp.1 - cy);
+                                                self.float_dragging = true;
+                                                consumed = true;
+                                            }
+                                        }
                                     }
                                 }
                                 if !consumed && self.float_sel.is_some() {
@@ -2608,23 +2653,34 @@ impl eframe::App for SketchMotionApp {
                             }
                         }
                         if down && self.float_resize.is_some() {
+                            if let (Some((gx, gy)), Some(pp)) = (self.float_resize, ppos) {
+                                let cur = to_doc(pp);
+                                let ang = self.fr_angle;
+                                let (pfx, pfy) = self.fr_fixed;
+                                let (w0, h0) = self.fr_wh;
+                                let (s, c) = ang.sin_cos();
+                                let (dx, dy) = (cur.0 - pfx, cur.1 - pfy);
+                                let (lx, ly) = (dx * c + dy * s, -dx * s + dy * c);
+                                let nw = if gx != 0.0 { lx.abs().max(1.0) } else { w0 };
+                                let nh = if gy != 0.0 { ly.abs().max(1.0) } else { h0 };
+                                let (hw, hh) = (nw / 2.0, nh / 2.0);
+                                let (flx, fly) = (-gx * hw, -gy * hh);
+                                let cxn = pfx - (flx * c - fly * s);
+                                let cyn = pfy - (flx * s + fly * c);
+                                if let Some(fs) = &mut self.float_sel {
+                                    fs.cx = cxn;
+                                    fs.cy = cyn;
+                                    fs.hw = hw;
+                                    fs.hh = hh;
+                                }
+                                self.dirty = true;
+                            }
+                        } else if down && self.float_rotating {
                             if let Some(pp) = ppos {
                                 let cur = to_doc(pp);
-                                let (ox1, oy1, ox2, oy2) = self.fr_orig;
-                                let (gx, gy) = self.fr_grab;
-                                let (fxp, fyp) = self.fr_fixed;
-                                let (ax, ay) = self.fr_axes;
-                                let sx = if ax { safe_ratio(cur.0 - fxp, gx - fxp) } else { 1.0 };
-                                let sy = if ay { safe_ratio(cur.1 - fyp, gy - fyp) } else { 1.0 };
-                                let nx1 = fxp + (ox1 - fxp) * sx;
-                                let nx2 = fxp + (ox2 - fxp) * sx;
-                                let ny1 = fyp + (oy1 - fyp) * sy;
-                                let ny2 = fyp + (oy2 - fyp) * sy;
+                                let grab = self.float_rot_grab;
                                 if let Some(fs) = &mut self.float_sel {
-                                    fs.x = nx1.min(nx2);
-                                    fs.y = ny1.min(ny2);
-                                    fs.w = (nx2 - nx1).abs().max(1.0);
-                                    fs.h = (ny2 - ny1).abs().max(1.0);
+                                    fs.angle = (cur.1 - fs.cy).atan2(cur.0 - fs.cx) - grab;
                                 }
                                 self.dirty = true;
                             }
@@ -2633,8 +2689,8 @@ impl eframe::App for SketchMotionApp {
                                 let cur = to_doc(pp);
                                 let (gx, gy) = self.float_grab;
                                 if let Some(fs) = &mut self.float_sel {
-                                    fs.x = cur.0 - gx;
-                                    fs.y = cur.1 - gy;
+                                    fs.cx = cur.0 - gx;
+                                    fs.cy = cur.1 - gy;
                                 }
                                 self.dirty = true;
                             }
@@ -2651,6 +2707,7 @@ impl eframe::App for SketchMotionApp {
                             self.rotating = false;
                             self.float_dragging = false;
                             self.float_resize = None;
+                            self.float_rotating = false;
                             if let Some(start) = self.marquee_start.take() {
                                 self.lift_selection(start, self.marquee_cur);
                             }
@@ -2831,32 +2888,64 @@ impl eframe::App for SketchMotionApp {
                         }
                     }
                     if let Some(fs) = &self.float_sel {
-                        let srect = egui::Rect::from_min_size(
-                            egui::pos2(rect.min.x + fs.x * zoom, rect.min.y + fs.y * zoom),
-                            egui::vec2(fs.w * zoom, fs.h * zoom),
-                        );
+                        let scr = |wx: f32, wy: f32| {
+                            egui::pos2(rect.min.x + wx * zoom, rect.min.y + wy * zoom)
+                        };
                         let painter = ui.painter_at(rect);
+                        let cw = [
+                            float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, -1.0, -1.0),
+                            float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, 1.0, -1.0),
+                            float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, 1.0, 1.0),
+                            float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, -1.0, 1.0),
+                        ];
+                        let cs: Vec<egui::Pos2> = cw.iter().map(|(x, y)| scr(*x, *y)).collect();
                         if let Some(tex) = &self.float_tex {
-                            painter.image(
-                                tex.id(),
-                                srect,
-                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                egui::Color32::from_white_alpha((fs.opacity * 255.0) as u8),
+                            let col = egui::Color32::from_white_alpha((fs.opacity * 255.0) as u8);
+                            let uvs = [
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                                egui::pos2(0.0, 1.0),
+                            ];
+                            let mut mesh = egui::Mesh::with_texture(tex.id());
+                            for i in 0..4 {
+                                mesh.vertices.push(egui::epaint::Vertex {
+                                    pos: cs[i],
+                                    uv: uvs[i],
+                                    color: col,
+                                });
+                            }
+                            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                            painter.add(egui::Shape::mesh(mesh));
+                        }
+                        let azul = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+                        for i in 0..4 {
+                            painter.line_segment(
+                                [cs[i], cs[(i + 1) % 4]],
+                                egui::Stroke::new(1.0_f32, azul),
                             );
                         }
-                        let sr = srect.expand(3.0);
-                        painter.rect_stroke(sr, 0.0, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
-                        painter.rect_stroke(
-                            sr.expand(1.0),
-                            0.0,
-                            egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(160)),
-                        );
-                        let azul = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
-                        for c in handle_positions(sr) {
-                            let hh = egui::Rect::from_center_size(c, egui::vec2(8.0, 8.0));
-                            painter.rect_filled(hh, 0.0, egui::Color32::WHITE);
-                            painter.rect_stroke(hh, 0.0, egui::Stroke::new(1.0_f32, azul));
+                        for &(sx, sy) in HSIGNS.iter() {
+                            let (hx, hy) = float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, sx, sy);
+                            let hr = egui::Rect::from_center_size(scr(hx, hy), egui::vec2(8.0, 8.0));
+                            painter.rect_filled(hr, 0.0, egui::Color32::WHITE);
+                            painter.rect_stroke(hr, 0.0, egui::Stroke::new(1.0_f32, azul));
                         }
+                        let (tmx, tmy) = float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, 0.0, -1.0);
+                        let tm = scr(tmx, tmy);
+                        let cc = scr(fs.cx, fs.cy);
+                        let dir = (tm - cc).normalized();
+                        let roth = tm + dir * 22.0;
+                        painter.line_segment([tm, roth], egui::Stroke::new(1.0_f32, azul));
+                        painter.circle_filled(roth, 8.0, egui::Color32::WHITE);
+                        painter.circle_stroke(roth, 8.0, egui::Stroke::new(1.0_f32, azul));
+                        painter.text(
+                            roth,
+                            egui::Align2::CENTER_CENTER,
+                            egui_phosphor::regular::ARROW_CLOCKWISE,
+                            egui::FontId::proportional(12.0),
+                            azul,
+                        );
                     }
                     if let Some((sx, sy)) = self.marquee_start {
                         let (cx, cy) = self.marquee_cur;
