@@ -89,6 +89,11 @@ fn handle_positions(r: egui::Rect) -> [egui::Pos2; 8] {
     ]
 }
 
+/// Posição (tela) do ponto de rotação: acima do centro-topo da caixa.
+fn rotate_handle_screen(r: egui::Rect) -> egui::Pos2 {
+    egui::pos2(r.center().x, r.top() - 22.0)
+}
+
 /// Para a alça `hi`: ponto agarrado, ponto fixo (oposto) e quais eixos escalam.
 fn handle_geometry(
     hi: usize,
@@ -117,6 +122,27 @@ fn safe_ratio(num: f32, den: f32) -> f32 {
     } else {
         num / den
     }
+}
+
+/// Reamostra uma polilinha inserindo pontos ~a cada `spacing` (para apagar
+/// trechos finos de um traço, não só nos vértices).
+fn densify(pts: &[(f32, f32)], spacing: f32) -> Vec<(f32, f32)> {
+    let mut out = Vec::new();
+    if pts.is_empty() {
+        return out;
+    }
+    out.push(pts[0]);
+    for w in pts.windows(2) {
+        let (ax, ay) = w[0];
+        let (bx, by) = w[1];
+        let len = ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt();
+        let n = (len / spacing.max(0.5)).ceil().max(1.0) as usize;
+        for k in 1..=n {
+            let t = k as f32 / n as f32;
+            out.push((ax + (bx - ax) * t, ay + (by - ay) * t));
+        }
+    }
+    out
 }
 
 /// Gera a grade de cores básicas: uma linha de tons de cinza + linhas de
@@ -360,6 +386,12 @@ struct SketchMotionApp {
     shape_fill: bool,
     fill_color: egui::Color32,
     shape_start: Option<(f32, f32)>,
+    eraser_radius: i32,
+    // rotação manual do objeto selecionado
+    rotating: bool,
+    rotate_center: (f32, f32),
+    rotate_start: f32,
+    rotate_orig: Vec<Anchor>,
 }
 
 impl SketchMotionApp {
@@ -429,6 +461,11 @@ impl SketchMotionApp {
             shape_fill: true,
             fill_color: egui::Color32::from_rgb(180, 180, 180),
             shape_start: None,
+            eraser_radius: 8,
+            rotating: false,
+            rotate_center: (0.0, 0.0),
+            rotate_start: 0.0,
+            rotate_orig: Vec::new(),
         }
     }
 
@@ -502,9 +539,18 @@ impl SketchMotionApp {
         Color::rgb(r as u8, g as u8, b as u8)
     }
 
+    /// Raio ativo do desenho: borracha usa o próprio tamanho.
+    fn active_radius(&self) -> i32 {
+        if self.tool == Tool::Eraser {
+            self.eraser_radius
+        } else {
+            self.brush_radius
+        }
+    }
+
     fn paint_dab(&mut self, x: i32, y: i32) {
         let color = self.active_color();
-        let r = self.brush_radius;
+        let r = self.active_radius();
         let li = self.active_layer;
         let pixel = self.pixel_mode;
         let mut pintou = false;
@@ -693,6 +739,64 @@ impl SketchMotionApp {
         best.map(|(i, _)| i)
     }
 
+    /// Apaga apenas a parte dos traços vetoriais que passa pelo círculo da
+    /// borracha (raio em coords do documento), dividindo o traço em pedaços.
+    /// Traços viram polilinhas ao serem apagados (perdem as curvas naquele ponto).
+    fn erase_vetores(&mut self, pos: (f32, f32), radius: f32) {
+        let r2 = radius * radius;
+        let vectors = std::mem::take(&mut self.document.vectors);
+        let mut result: Vec<VectorObject> = Vec::with_capacity(vectors.len());
+        let mut mudou = false;
+        for obj in vectors {
+            // descarte rápido por caixa
+            let dentro = obj.bounds().map_or(false, |(minx, miny, maxx, maxy)| {
+                pos.0 >= minx - radius
+                    && pos.0 <= maxx + radius
+                    && pos.1 >= miny - radius
+                    && pos.1 <= maxy + radius
+            });
+            if !dentro {
+                result.push(obj);
+                continue;
+            }
+            let dense = densify(&obj.flatten(32), (radius * 0.5).max(1.0));
+            let mut runs: Vec<Vec<(f32, f32)>> = Vec::new();
+            let mut cur: Vec<(f32, f32)> = Vec::new();
+            let mut apagou = false;
+            for &(x, y) in &dense {
+                if (x - pos.0).powi(2) + (y - pos.1).powi(2) <= r2 {
+                    apagou = true;
+                    if cur.len() >= 2 {
+                        runs.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.clear();
+                    }
+                } else {
+                    cur.push((x, y));
+                }
+            }
+            if cur.len() >= 2 {
+                runs.push(cur);
+            }
+            if !apagou {
+                result.push(obj);
+            } else {
+                mudou = true;
+                for run in runs {
+                    let mut no = VectorObject::new(obj.stroke, obj.stroke_width);
+                    no.opacity = obj.opacity;
+                    no.points = run.iter().map(|(x, y)| Anchor::new(*x, *y)).collect();
+                    result.push(no);
+                }
+            }
+        }
+        self.document.vectors = result;
+        if mudou {
+            self.selected_obj = None;
+            self.dirty = true;
+        }
+    }
+
     /// Índice da alça da caixa do objeto `si` sob o ponto de tela `hp`.
     fn handle_at(&self, si: usize, hp: egui::Pos2, rect: egui::Rect, zoom: f32) -> Option<usize> {
         let obj = self.document.vectors.get(si)?;
@@ -705,6 +809,21 @@ impl SketchMotionApp {
         handle_positions(r)
             .iter()
             .position(|hc| hc.distance(hp) <= 8.0)
+    }
+
+    /// Verdadeiro se `hp` está sobre o ponto de rotação do objeto `si`.
+    fn rotate_handle_at(&self, si: usize, hp: egui::Pos2, rect: egui::Rect, zoom: f32) -> bool {
+        if let Some(obj) = self.document.vectors.get(si) {
+            if let Some((minx, miny, maxx, maxy)) = obj.bounds() {
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(rect.min.x + minx * zoom, rect.min.y + miny * zoom),
+                    egui::pos2(rect.min.x + maxx * zoom, rect.min.y + maxy * zoom),
+                )
+                .expand(3.0);
+                return rotate_handle_screen(r).distance(hp) <= 10.0;
+            }
+        }
+        false
     }
 
     /// Desenha os objetos vetoriais (curvas), a caixa/alças de seleção e o
@@ -742,6 +861,21 @@ impl SketchMotionApp {
                         painter.rect_filled(h, 0.0, egui::Color32::WHITE);
                         painter.rect_stroke(h, 0.0, egui::Stroke::new(1.0_f32, azul));
                     }
+                    // ponto de rotação dedicado (acima da caixa)
+                    let rh = rotate_handle_screen(r);
+                    painter.line_segment(
+                        [r.center_top(), rh],
+                        egui::Stroke::new(1.0_f32, azul),
+                    );
+                    painter.circle_filled(rh, 8.0, egui::Color32::WHITE);
+                    painter.circle_stroke(rh, 8.0, egui::Stroke::new(1.0_f32, azul));
+                    painter.text(
+                        rh,
+                        egui::Align2::CENTER_CENTER,
+                        egui_phosphor::regular::ARROW_CLOCKWISE,
+                        egui::FontId::proportional(12.0),
+                        azul,
+                    );
                 }
             }
         }
@@ -919,7 +1053,7 @@ impl SketchMotionApp {
 
     fn opcoes_borracha(&mut self, ui: &mut egui::Ui) {
         ui.label("Tamanho:");
-        ui.add(egui::Slider::new(&mut self.brush_radius, 1..=30));
+        ui.add(egui::Slider::new(&mut self.eraser_radius, 1..=60));
         ui.separator();
         self.botao_limpar(ui);
     }
@@ -967,7 +1101,28 @@ impl SketchMotionApp {
                     self.document.vectors[idx].opacity = (pct / 100.0).clamp(0.0, 1.0);
                 }
                 ui.separator();
-                if ui.button("Aplicar cor atual").clicked() {
+                ui.label("Traço:");
+                let mut sc = to_color32(self.document.vectors[idx].stroke);
+                if ui.color_edit_button_srgba(&mut sc).changed() {
+                    self.document.vectors[idx].stroke = Color::rgba(sc.r(), sc.g(), sc.b(), sc.a());
+                }
+                let mut tem_fill = self.document.vectors[idx].fill.is_some();
+                if ui.checkbox(&mut tem_fill, "Preencher").changed() {
+                    self.document.vectors[idx].fill = if tem_fill {
+                        Some(self.document.vectors[idx].stroke)
+                    } else {
+                        None
+                    };
+                }
+                if let Some(fc0) = self.document.vectors[idx].fill {
+                    let mut fc = to_color32(fc0);
+                    if ui.color_edit_button_srgba(&mut fc).changed() {
+                        self.document.vectors[idx].fill =
+                            Some(Color::rgba(fc.r(), fc.g(), fc.b(), fc.a()));
+                    }
+                }
+                ui.separator();
+                if ui.button("Aplicar cor atual (traço)").clicked() {
                     self.document.vectors[idx].stroke = self.brush_core_color();
                 }
                 if ui
@@ -1997,15 +2152,34 @@ impl eframe::App for SketchMotionApp {
                                     }
                                 }
                                 if !grabbed {
-                                    match self.hit_test(to_doc(p), thr) {
-                                        Some(i) => {
-                                            self.selected_obj = Some(i);
+                                    let mut did_rot = false;
+                                    if let Some(si) = self.selected_obj {
+                                        if si < self.document.vectors.len()
+                                            && self.rotate_handle_at(si, p, rect, zoom)
+                                        {
                                             self.push_undo();
-                                            self.dragging_obj = true;
-                                        }
-                                        None => {
-                                            self.selected_obj = None;
+                                            let c =
+                                                self.document.vectors[si].center().unwrap_or((0.0, 0.0));
+                                            let d = to_doc(p);
+                                            self.rotate_center = c;
+                                            self.rotate_orig = self.document.vectors[si].points.clone();
+                                            self.rotate_start = (d.1 - c.1).atan2(d.0 - c.0);
+                                            self.rotating = true;
                                             self.dragging_obj = false;
+                                            did_rot = true;
+                                        }
+                                    }
+                                    if !did_rot {
+                                        match self.hit_test(to_doc(p), thr) {
+                                            Some(i) => {
+                                                self.selected_obj = Some(i);
+                                                self.push_undo();
+                                                self.dragging_obj = true;
+                                            }
+                                            None => {
+                                                self.selected_obj = None;
+                                                self.dragging_obj = false;
+                                            }
                                         }
                                     }
                                 }
@@ -2048,6 +2222,33 @@ impl eframe::App for SketchMotionApp {
                                     }
                                 }
                             }
+                        } else if down && self.rotating {
+                            if let Some(si) = self.selected_obj {
+                                if si < self.document.vectors.len() {
+                                    if let Some(pp) = ppos {
+                                        let cur = to_doc(pp);
+                                        let (cx, cy) = self.rotate_center;
+                                        let ang = (cur.1 - cy).atan2(cur.0 - cx);
+                                        let delta = ang - self.rotate_start;
+                                        let (sn, cs) = delta.sin_cos();
+                                        let orig = self.rotate_orig.clone();
+                                        let obj = &mut self.document.vectors[si];
+                                        if obj.points.len() == orig.len() {
+                                            let rot = |x: f32, y: f32| {
+                                                let (dx, dy) = (x - cx, y - cy);
+                                                (cx + dx * cs - dy * sn, cy + dx * sn + dy * cs)
+                                            };
+                                            for (dst, src) in obj.points.iter_mut().zip(orig.iter()) {
+                                                let (nx, ny) = rot(src.x, src.y);
+                                                dst.x = nx;
+                                                dst.y = ny;
+                                                dst.hin = src.hin.map(|(hx, hy)| rot(hx, hy));
+                                                dst.hout = src.hout.map(|(hx, hy)| rot(hx, hy));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         } else if down && self.dragging_obj {
                             if let Some(i) = self.selected_obj {
                                 if i < self.document.vectors.len()
@@ -2061,6 +2262,7 @@ impl eframe::App for SketchMotionApp {
                         if !down {
                             self.dragging_obj = false;
                             self.resize_handle = None;
+                            self.rotating = false;
                         }
                         self.last_pos = None;
                     } else if self.tool == Tool::Shapes {
@@ -2107,15 +2309,7 @@ impl eframe::App for SketchMotionApp {
                         }
                         if self.tool == Tool::Eraser {
                             if let Some(pp) = ppos {
-                                let tol = (self.brush_radius as f32).max(3.0);
-                                if let Some(i) = self.hit_test(to_doc(pp), tol) {
-                                    self.document.vectors.remove(i);
-                                    match self.selected_obj {
-                                        Some(si) if si == i => self.selected_obj = None,
-                                        Some(si) if si > i => self.selected_obj = Some(si - 1),
-                                        _ => {}
-                                    }
-                                }
+                                self.erase_vetores(to_doc(pp), self.active_radius() as f32);
                             }
                         }
                     } else {
@@ -2145,45 +2339,84 @@ impl eframe::App for SketchMotionApp {
                         }
                     }
 
-                    // Cursor contextual: muda conforme a ferramenta e o que
-                    // está sob o ponteiro (objeto interativo / alça).
+                    // Cursor personalizado por ferramenta + decorações no canvas.
                     if response.hovered() {
                         use egui::CursorIcon as CI;
-                        let ci = if self.eyedropper != Eyedropper::Off {
-                            CI::Crosshair
+                        let painter = ui.painter_at(rect);
+                        if self.eyedropper != Eyedropper::Off {
+                            ui.ctx().set_cursor_icon(CI::Crosshair);
                         } else {
                             match self.tool {
-                                Tool::Pen | Tool::Shapes | Tool::Pencil | Tool::Eraser => CI::Crosshair,
+                                Tool::Pencil | Tool::Eraser => {
+                                    if let Some(hp) = hover {
+                                        let rr = (self.active_radius() as f32 * zoom).max(1.5);
+                                        painter.circle_stroke(
+                                            hp,
+                                            rr,
+                                            egui::Stroke::new(1.5_f32, egui::Color32::from_black_alpha(160)),
+                                        );
+                                        painter.circle_stroke(
+                                            hp,
+                                            rr + 1.0,
+                                            egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(180)),
+                                        );
+                                        painter.circle_filled(hp, 1.0, egui::Color32::from_black_alpha(160));
+                                    }
+                                    ui.ctx().set_cursor_icon(CI::None);
+                                }
+                                Tool::Pen | Tool::Shapes => {
+                                    ui.ctx().set_cursor_icon(CI::Crosshair);
+                                }
                                 Tool::Select => {
-                                    if self.dragging_obj || self.resize_handle.is_some() {
-                                        CI::Grabbing
+                                    let rot_zone = self.rotating
+                                        || match (self.selected_obj, hover) {
+                                            (Some(si), Some(hp)) => {
+                                                self.rotate_handle_at(si, hp, rect, zoom)
+                                            }
+                                            _ => false,
+                                        };
+                                    if rot_zone {
+                                        if let Some(hp) = hover {
+                                            painter.text(
+                                                hp + egui::vec2(10.0, -10.0),
+                                                egui::Align2::LEFT_BOTTOM,
+                                                egui_phosphor::regular::ARROW_CLOCKWISE,
+                                                egui::FontId::proportional(18.0),
+                                                egui::Color32::from_rgb(0x2F, 0x84, 0xFE),
+                                            );
+                                        }
+                                        ui.ctx().set_cursor_icon(CI::None);
+                                    } else if self.dragging_obj || self.resize_handle.is_some() {
+                                        ui.ctx().set_cursor_icon(CI::Grabbing);
                                     } else if let (Some(si), Some(hp)) = (self.selected_obj, hover) {
                                         if let Some(hi) = self.handle_at(si, hp, rect, zoom) {
-                                            match hi {
+                                            let c = match hi {
                                                 0 | 4 => CI::ResizeNwSe,
                                                 2 | 6 => CI::ResizeNeSw,
                                                 1 | 5 => CI::ResizeVertical,
                                                 _ => CI::ResizeHorizontal,
-                                            }
+                                            };
+                                            ui.ctx().set_cursor_icon(c);
                                         } else if self.hit_test(to_doc(hp), 6.0 / zoom).is_some() {
-                                            CI::Grab
+                                            ui.ctx().set_cursor_icon(CI::Grab);
                                         } else {
-                                            CI::Default
+                                            ui.ctx().set_cursor_icon(CI::Default);
                                         }
                                     } else if let Some(hp) = hover {
                                         if self.hit_test(to_doc(hp), 6.0 / zoom).is_some() {
-                                            CI::Grab
+                                            ui.ctx().set_cursor_icon(CI::Grab);
                                         } else {
-                                            CI::Default
+                                            ui.ctx().set_cursor_icon(CI::Default);
                                         }
                                     } else {
-                                        CI::Default
+                                        ui.ctx().set_cursor_icon(CI::Default);
                                     }
                                 }
-                                _ => CI::Default,
+                                _ => {
+                                    ui.ctx().set_cursor_icon(CI::Default);
+                                }
                             }
-                        };
-                        ui.ctx().set_cursor_icon(ci);
+                        }
                     }
 
                     // Overlay vetorial: objetos, seleção e traço em progresso.
