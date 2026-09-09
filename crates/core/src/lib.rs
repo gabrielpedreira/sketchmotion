@@ -8,12 +8,14 @@ mod color;
 mod document;
 mod frame;
 mod layer;
+mod skeleton;
 mod vector;
 
 pub use color::Color;
 pub use document::Document;
 pub use frame::Frame;
 pub use layer::Layer;
+pub use skeleton::{Bone, BonePose, BoneShape, Skeleton, World};
 pub use vector::{Anchor, VectorObject};
 
 #[cfg(test)]

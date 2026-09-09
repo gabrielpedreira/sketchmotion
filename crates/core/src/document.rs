@@ -6,6 +6,7 @@
 use crate::color::Color;
 use crate::frame::Frame;
 use crate::layer::Layer;
+use crate::skeleton::Skeleton;
 use crate::vector::VectorObject;
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,9 @@ pub struct Document {
     pub current: usize,
     #[serde(default = "default_fps")]
     pub fps: u32,
+    /// Esqueletos de rigging 2D presentes na cena (independentes das camadas).
+    #[serde(default)]
+    pub skeletons: Vec<Skeleton>,
 }
 
 fn default_fps() -> u32 {
@@ -45,6 +49,7 @@ impl Document {
             frames: Vec::new(),
             current: 0,
             fps: 12,
+            skeletons: Vec::new(),
         };
         doc.add_layer("Camada 1");
         doc.frames = vec![Frame {

@@ -29,6 +29,8 @@ pub enum Tool {
     Pencil,
     /// Borracha — pinta transparente, revelando o que está por baixo.
     Eraser,
+    /// Rig 2D — criar/posar esqueletos de ossos (painel direito).
+    Rig,
 }
 
 impl Tool {
@@ -57,6 +59,7 @@ impl Tool {
             Tool::Fill => "Balde",
             Tool::Pencil => "Pincel",
             Tool::Eraser => "Borracha",
+            Tool::Rig => "Rig",
         }
     }
 }

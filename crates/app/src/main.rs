@@ -286,6 +286,218 @@ const HSIGNS: [(f32, f32); 8] = [
 ];
 
 /// Ponto (mundo) de um canto/lado da seleção flutuante girada.
+/// Polígono (em coordenadas de TELA) que representa a forma de um osso,
+/// do ponto `o` (origem/articulação) ao ponto `t` (ponta).
+fn rig_shape_points(shape: sketchmotion_core::BoneShape, o: egui::Pos2, t: egui::Pos2) -> Vec<egui::Pos2> {
+    use sketchmotion_core::BoneShape as BS;
+    let dir = t - o;
+    let len = dir.length().max(1.0);
+    let u = dir / len;
+    let n = egui::vec2(-u.y, u.x);
+    let base = |tt: f32| o + dir * tt;
+    match shape {
+        BS::Limb => {
+            let bw = (len * 0.12).clamp(3.0, 12.0);
+            let mid = o + dir * 0.18;
+            vec![o, mid + n * bw, t, mid - n * bw]
+        }
+        BS::Torso => {
+            let h = len * 0.34;
+            vec![
+                o,
+                base(0.62) + n * h,
+                t + n * (h * 0.55),
+                t - n * (h * 0.55),
+                base(0.62) - n * h,
+            ]
+        }
+        BS::Hip => {
+            let h = len * 0.46;
+            vec![
+                o,
+                base(0.5) + n * h,
+                t + n * (h * 0.6),
+                t - n * (h * 0.6),
+                base(0.5) - n * h,
+            ]
+        }
+        BS::Head => {
+            let ra = len * 0.5;
+            let rb = len * 0.38;
+            let c = o + dir * 0.5;
+            (0..24)
+                .map(|k| {
+                    let a = k as f32 / 24.0 * std::f32::consts::TAU;
+                    c + u * (ra * a.cos()) + n * (rb * a.sin())
+                })
+                .collect()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Esqueletos prontos (presets). Coordenadas normalizadas (x p/ direita, y p/
+// baixo) em torno de (0,0); o builder aplica (cx,cy) + escala. Ângulos em
+// radianos: cima = -PI/2, baixo = +PI/2, direita = 0.
+// ---------------------------------------------------------------------------
+use sketchmotion_core::{BoneShape as PBS, Skeleton as PSkel};
+
+fn pw(cx: f32, cy: f32, s: f32, nx: f32, ny: f32) -> (f32, f32) {
+    (cx + nx * s, cy + ny * s)
+}
+
+fn preset_humano(cx: f32, cy: f32, s: f32) -> PSkel {
+    let mut sk = PSkel::new("Humano");
+    let up = -std::f32::consts::FRAC_PI_2;
+    let (hx, hy) = pw(cx, cy, s, 0.0, 0.55);
+    let hip = sk.add_bone_world(None, hx, hy, up, 0.35 * s, PBS::Hip);
+    let (tx, ty) = pw(cx, cy, s, 0.0, 0.2);
+    let torso = sk.add_bone_world(Some(hip), tx, ty, up, 0.85 * s, PBS::Torso);
+    let (hex, hey) = pw(cx, cy, s, 0.0, -0.65);
+    sk.add_bone_world(Some(torso), hex, hey, up, 0.45 * s, PBS::Head);
+    // Braços
+    for side in [1.0_f32, -1.0] {
+        let (sx, sy) = pw(cx, cy, s, 0.28 * side, -0.5);
+        let a1 = (0.5_f32).atan2(0.18 * side);
+        let ua = sk.add_bone_world(Some(torso), sx, sy, a1, 0.5 * s, PBS::Limb);
+        let (ex, ey) = pw(cx, cy, s, 0.28 * side + 0.18 * side, 0.0);
+        let a2 = (0.5_f32).atan2(0.05 * side);
+        let fa = sk.add_bone_world(Some(ua), ex, ey, a2, 0.45 * s, PBS::Limb);
+        let (wx, wy) = pw(cx, cy, s, 0.28 * side + 0.2 * side, 0.45);
+        sk.add_bone_world(Some(fa), wx, wy, a2, 0.14 * s, PBS::Limb);
+    }
+    // Pernas
+    for side in [1.0_f32, -1.0] {
+        let (px, py) = pw(cx, cy, s, 0.16 * side, 0.55);
+        let a1 = (0.5_f32).atan2(0.06 * side);
+        let th = sk.add_bone_world(Some(hip), px, py, a1, 0.7 * s, PBS::Limb);
+        let (kx, ky) = pw(cx, cy, s, 0.16 * side, 1.05);
+        let sh = sk.add_bone_world(Some(th), kx, ky, std::f32::consts::FRAC_PI_2, 0.65 * s, PBS::Limb);
+        let (ax, ay) = pw(cx, cy, s, 0.16 * side, 1.6);
+        sk.add_bone_world(Some(sh), ax, ay, 0.24 * side, 0.22 * s, PBS::Limb);
+    }
+    sk
+}
+
+fn preset_cavalo(cx: f32, cy: f32, s: f32) -> PSkel {
+    let mut sk = PSkel::new("Cavalo");
+    // corpo horizontal, cabeça para a direita (+x)
+    let (rx, ry) = pw(cx, cy, s, -0.9, 0.0);
+    let torso = sk.add_bone_world(None, rx, ry, 0.0, 1.7 * s, PBS::Torso);
+    // pescoço + cabeça (frente, +x, subindo)
+    let (nx, ny) = pw(cx, cy, s, 0.62, -0.1);
+    let neck = sk.add_bone_world(Some(torso), nx, ny, (-0.55_f32).atan2(0.6), 0.6 * s, PBS::Limb);
+    let (hx, hy) = pw(cx, cy, s, 1.05, -0.55);
+    sk.add_bone_world(Some(neck), hx, hy, (-0.15_f32).atan2(0.5), 0.42 * s, PBS::Head);
+    // cauda (atrás, -x, subindo)
+    let (tx, ty) = pw(cx, cy, s, -0.88, -0.08);
+    sk.add_bone_world(Some(torso), tx, ty, (-0.35_f32).atan2(-0.5), 0.55 * s, PBS::Limb);
+    // 4 patas (2 frente, 2 trás), cada uma coxa+canela+casco
+    let front_x = 0.55;
+    let hind_x = -0.6;
+    for (bx, off) in [(front_x, 0.06_f32), (front_x - 0.08, -0.06), (hind_x, 0.06), (hind_x + 0.08, -0.06)] {
+        let (sx, sy) = pw(cx, cy, s, bx + off, 0.15);
+        let th = sk.add_bone_world(Some(torso), sx, sy, std::f32::consts::FRAC_PI_2 + off, 0.55 * s, PBS::Limb);
+        let (kx, ky) = pw(cx, cy, s, bx + off, 0.7);
+        let sh = sk.add_bone_world(Some(th), kx, ky, std::f32::consts::FRAC_PI_2, 0.5 * s, PBS::Limb);
+        let (fx, fy) = pw(cx, cy, s, bx + off, 1.2);
+        sk.add_bone_world(Some(sh), fx, fy, std::f32::consts::FRAC_PI_2, 0.18 * s, PBS::Limb);
+    }
+    sk
+}
+
+fn preset_raptor(cx: f32, cy: f32, s: f32) -> PSkel {
+    let mut sk = PSkel::new("Raptor");
+    let (rx, ry) = pw(cx, cy, s, -0.55, 0.0);
+    let torso = sk.add_bone_world(None, rx, ry, 0.0, 1.05 * s, PBS::Torso);
+    // pescoço + cabeça (frente, +x)
+    let (nx, ny) = pw(cx, cy, s, 0.45, -0.05);
+    let neck = sk.add_bone_world(Some(torso), nx, ny, (-0.4_f32).atan2(0.35), 0.35 * s, PBS::Limb);
+    let (hx, hy) = pw(cx, cy, s, 0.85, -0.35);
+    sk.add_bone_world(Some(neck), hx, hy, (0.0_f32).atan2(0.35), 0.38 * s, PBS::Head);
+    // cauda longa (3 segmentos, atrás -x subindo)
+    let (t0x, t0y) = pw(cx, cy, s, -0.55, -0.05);
+    let ta = (-0.18_f32).atan2(-0.6);
+    let t1 = sk.add_bone_world(Some(torso), t0x, t0y, ta, 0.5 * s, PBS::Limb);
+    let (t1x, t1y) = pw(cx, cy, s, -1.05, -0.2);
+    let t2 = sk.add_bone_world(Some(t1), t1x, t1y, (-0.1_f32).atan2(-0.6), 0.45 * s, PBS::Limb);
+    let (t2x, t2y) = pw(cx, cy, s, -1.6, -0.28);
+    sk.add_bone_world(Some(t2), t2x, t2y, (-0.05_f32).atan2(-0.5), 0.4 * s, PBS::Limb);
+    // bracinhos (2)
+    for off in [0.05_f32, -0.05] {
+        let (ax, ay) = pw(cx, cy, s, 0.3 + off, 0.05);
+        let ua = sk.add_bone_world(Some(torso), ax, ay, (0.35_f32).atan2(0.25), 0.28 * s, PBS::Limb);
+        let (fx, fy) = pw(cx, cy, s, 0.5 + off, 0.32);
+        sk.add_bone_world(Some(ua), fx, fy, (0.3_f32).atan2(0.05), 0.22 * s, PBS::Limb);
+    }
+    // pernas (2)
+    for off in [0.06_f32, -0.06] {
+        let (px, py) = pw(cx, cy, s, -0.05 + off, 0.12);
+        let th = sk.add_bone_world(Some(torso), px, py, (0.55_f32).atan2(0.2), 0.5 * s, PBS::Limb);
+        let (kx, ky) = pw(cx, cy, s, 0.05 + off, 0.6);
+        let sh = sk.add_bone_world(Some(th), kx, ky, (0.6_f32).atan2(-0.15), 0.42 * s, PBS::Limb);
+        let (fx, fy) = pw(cx, cy, s, -0.1 + off, 1.0);
+        sk.add_bone_world(Some(sh), fx, fy, (0.15_f32).atan2(0.5), 0.28 * s, PBS::Limb);
+    }
+    sk
+}
+
+fn preset_skeleton(key: &str, cx: f32, cy: f32, s: f32) -> PSkel {
+    match key {
+        "cavalo" => preset_cavalo(cx, cy, s),
+        "raptor" => preset_raptor(cx, cy, s),
+        _ => preset_humano(cx, cy, s),
+    }
+}
+
+/// Extensão (bbox) de um esqueleto em coordenadas de mundo.
+fn skeleton_extent(sk: &PSkel) -> (f32, f32, f32, f32) {
+    let (mut mnx, mut mny, mut mxx, mut mxy) =
+        (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for b in &sk.bones {
+        for (x, y) in [sk.origin(b.id), sk.tip(b.id)] {
+            mnx = mnx.min(x);
+            mny = mny.min(y);
+            mxx = mxx.max(x);
+            mxy = mxy.max(y);
+        }
+    }
+    if !mnx.is_finite() {
+        return (0.0, 0.0, 1.0, 1.0);
+    }
+    (mnx, mny, mxx, mxy)
+}
+
+/// Desenha um esqueleto ajustado dentro de `rect` (miniatura de prévia).
+fn desenhar_preview_esqueleto(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    sk: &PSkel,
+    col: egui::Color32,
+) {
+    let (mnx, mny, mxx, mxy) = skeleton_extent(sk);
+    let (w, h) = ((mxx - mnx).max(1e-3), (mxy - mny).max(1e-3));
+    let scale = (rect.width() / w).min(rect.height() / h) * 0.9;
+    let cxw = (mnx + mxx) * 0.5;
+    let cyw = (mny + mxy) * 0.5;
+    let map = |x: f32, y: f32| {
+        egui::pos2(
+            rect.center().x + (x - cxw) * scale,
+            rect.center().y + (y - cyw) * scale,
+        )
+    };
+    let fill = egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 70);
+    for b in &sk.bones {
+        let (ox, oy) = sk.origin(b.id);
+        let (tx, ty) = sk.tip(b.id);
+        painter.add(egui::Shape::convex_polygon(
+            rig_shape_points(b.shape, map(ox, oy), map(tx, ty)),
+            fill,
+            egui::Stroke::new(1.2_f32, col),
+        ));
+    }
+}
+
 fn resize_cursor(sx: f32, sy: f32) -> egui::CursorIcon {
     use egui::CursorIcon as CI;
     match (sx as i32, sy as i32) {
@@ -592,6 +804,21 @@ enum Eyedropper {
     ToArea(usize),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum RigMode {
+    /// Criar ossos arrastando (encadeia a partir da ponta de um osso existente).
+    Create,
+    /// Posar: mover/rotacionar um osso; filhos acompanham (FK).
+    Pose,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RigDrag {
+    None,
+    Move,
+    Rotate,
+}
+
 struct SketchMotionApp {
     document: Document,
     texture: Option<egui::TextureHandle>,
@@ -622,6 +849,19 @@ struct SketchMotionApp {
     win_layers: bool,
     reopen_layers: bool,
     icon_r_layers: Option<egui::Rect>,
+    // Rig 2D (painel direito)
+    win_rig: bool,
+    reopen_rig: bool,
+    icon_r_rig: Option<egui::Rect>,
+    show_bones: bool,
+    rig_skel: usize,
+    rig_mode: RigMode,
+    rig_sel_bone: Option<u32>,
+    rig_dragging: RigDrag,
+    rig_grab: (f32, f32),
+    rig_start: Option<(f32, f32)>,
+    rig_preview: Option<(f32, f32)>,
+    rig_shape: sketchmotion_core::BoneShape,
     current_path: Option<std::path::PathBuf>,
     pixel_mode: bool,
     screen: Screen,
@@ -733,6 +973,18 @@ impl SketchMotionApp {
             win_layers: false,
             reopen_layers: false,
             icon_r_layers: None,
+            win_rig: false,
+            reopen_rig: false,
+            icon_r_rig: None,
+            show_bones: true,
+            rig_skel: 0,
+            rig_mode: RigMode::Create,
+            rig_sel_bone: None,
+            rig_dragging: RigDrag::None,
+            rig_grab: (0.0, 0.0),
+            rig_start: None,
+            rig_preview: None,
+            rig_shape: sketchmotion_core::BoneShape::Limb,
             current_path: None,
             pixel_mode: false,
             screen: Screen::Home,
@@ -1754,7 +2006,7 @@ impl SketchMotionApp {
     /// Ferramentas que não trabalham em pixels ficam bloqueadas no pixel art.
     fn bloqueada_pixel(&self, t: Tool) -> bool {
         self.pixel_mode
-            && matches!(t, Tool::Pen | Tool::Shapes | Tool::Text | Tool::DirectSelect)
+            && matches!(t, Tool::Pen | Tool::Shapes | Tool::Text | Tool::DirectSelect | Tool::Rig)
     }
 
     /// Desenha os traços vetoriais no buffer RGBA (borda para o flood fill).
@@ -2311,6 +2563,7 @@ impl SketchMotionApp {
                         Tool::DirectSelect => self.opcoes_selecao_direta(ui),
                         Tool::Shapes => self.opcoes_formas(ui),
                         Tool::Fill => self.opcoes_balde(ui),
+                        Tool::Rig => self.opcoes_rig(ui),
                     }
                 }
             });
@@ -2705,6 +2958,17 @@ impl SketchMotionApp {
                         self.win_layers = !self.win_layers;
                         if self.win_layers {
                             self.reopen_layers = true;
+                        }
+                    }
+                    ui.add_space(6.0);
+
+                    let resp_r = icon_button(ui, self.win_rig, icon::PERSON_SIMPLE)
+                        .on_hover_text("Rig (esqueletos)");
+                    self.icon_r_rig = Some(resp_r.rect);
+                    if resp_r.clicked() {
+                        self.win_rig = !self.win_rig;
+                        if self.win_rig {
+                            self.reopen_rig = true;
                         }
                     }
                 });
@@ -3139,6 +3403,473 @@ impl SketchMotionApp {
         self.win_layers = open;
     }
 
+    /// Índice do esqueleto ativo (clampado), ou None se não há esqueletos.
+    fn rig_active_index(&self) -> Option<usize> {
+        let n = self.document.skeletons.len();
+        if n == 0 {
+            None
+        } else {
+            Some(self.rig_skel.min(n - 1))
+        }
+    }
+
+    /// Cria um osso arrastando de `start` a `end`. Se `start` estiver perto da
+    /// ponta de um osso existente, o novo osso vira filho dele (encadeia).
+    fn rig_create_bone(&mut self, si: usize, start: (f32, f32), end: (f32, f32)) {
+        let (dx, dy) = (end.0 - start.0, end.1 - start.1);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 3.0 {
+            return;
+        }
+        let thr = 12.0_f32;
+        let mut parent: Option<u32> = None;
+        {
+            let sk = &self.document.skeletons[si];
+            let mut best = thr;
+            for b in &sk.bones {
+                let (tx, ty) = sk.tip(b.id);
+                let d = ((tx - start.0).powi(2) + (ty - start.1).powi(2)).sqrt();
+                if d < best {
+                    best = d;
+                    parent = Some(b.id);
+                }
+            }
+        }
+        self.push_undo();
+        let sk = &mut self.document.skeletons[si];
+        let new_id = if let Some(pid) = parent {
+            let plen = sk.bone(pid).map(|b| b.length).unwrap_or(0.0);
+            let pw = sk.world(pid);
+            let (ptx, pty) = (
+                pw.x + plen * pw.scale * pw.angle.cos(),
+                pw.y + plen * pw.scale * pw.angle.sin(),
+            );
+            let ang_world = (end.1 - pty).atan2(end.0 - ptx);
+            let seg = ((end.0 - ptx).powi(2) + (end.1 - pty).powi(2)).sqrt();
+            sk.add_bone(Some(pid), plen, 0.0, ang_world - pw.angle, seg, self.rig_shape)
+        } else {
+            sk.add_bone(None, start.0, start.1, dy.atan2(dx), len, self.rig_shape)
+        };
+        self.rig_sel_bone = Some(new_id);
+        self.dirty = true;
+    }
+
+    /// Seleciona o osso sob o ponto (prioriza a articulação para mover).
+    fn rig_pick(&mut self, si: usize, p: (f32, f32)) {
+        let thr = 10.0_f32;
+        let mut found: Option<u32> = None;
+        let mut mode = RigDrag::Rotate;
+        {
+            let sk = &self.document.skeletons[si];
+            let mut best = 8.0_f32;
+            for b in &sk.bones {
+                let (ox, oy) = sk.origin(b.id);
+                let d = ((ox - p.0).powi(2) + (oy - p.1).powi(2)).sqrt();
+                if d < best {
+                    best = d;
+                    found = Some(b.id);
+                    mode = RigDrag::Move;
+                }
+            }
+            if found.is_none() {
+                let mut best = thr;
+                for b in &sk.bones {
+                    let (ox, oy) = sk.origin(b.id);
+                    let (tx, ty) = sk.tip(b.id);
+                    let d = dist_point_seg(p.0, p.1, ox, oy, tx, ty);
+                    if d < best {
+                        best = d;
+                        found = Some(b.id);
+                        mode = RigDrag::Rotate;
+                    }
+                }
+            }
+        }
+        self.rig_sel_bone = found;
+        if let Some(bid) = found {
+            self.push_undo();
+            self.rig_dragging = mode;
+            let grab = {
+                let sk = &self.document.skeletons[si];
+                let (ox, oy) = sk.origin(bid);
+                match mode {
+                    RigDrag::Move => (ox - p.0, oy - p.1),
+                    RigDrag::Rotate => {
+                        let cur = sk.world(bid).angle;
+                        let aim = (p.1 - oy).atan2(p.0 - ox);
+                        (cur - aim, 0.0)
+                    }
+                    RigDrag::None => (0.0, 0.0),
+                }
+            };
+            self.rig_grab = grab;
+        } else {
+            self.rig_dragging = RigDrag::None;
+        }
+    }
+
+    /// Aplica a manipulação em andamento (girar em torno da articulação ou
+    /// mover a articulação). Filhos acompanham porque o mundo é recalculado.
+    fn rig_drag_to(&mut self, si: usize, p: (f32, f32)) {
+        let bid = match self.rig_sel_bone {
+            Some(b) => b,
+            None => return,
+        };
+        match self.rig_dragging {
+            RigDrag::Rotate => {
+                let (ox, oy, parent_ang) = {
+                    let sk = &self.document.skeletons[si];
+                    let (ox, oy) = sk.origin(bid);
+                    let pa = sk
+                        .bone(bid)
+                        .and_then(|b| b.parent)
+                        .map(|pp| sk.world(pp).angle)
+                        .unwrap_or(0.0);
+                    (ox, oy, pa)
+                };
+                let aim = (p.1 - oy).atan2(p.0 - ox) + self.rig_grab.0;
+                if let Some(b) = self.document.skeletons[si].bone_mut(bid) {
+                    b.angle = aim - parent_ang;
+                }
+                self.dirty = true;
+            }
+            RigDrag::Move => {
+                let desired = (p.0 + self.rig_grab.0, p.1 + self.rig_grab.1);
+                let (nx, ny) = {
+                    let sk = &self.document.skeletons[si];
+                    match sk.bone(bid).and_then(|b| b.parent) {
+                        None => desired,
+                        Some(pp) => {
+                            let pw = sk.world(pp);
+                            let (dx, dy) = (desired.0 - pw.x, desired.1 - pw.y);
+                            let (s, c) = (-pw.angle).sin_cos();
+                            let sc = pw.scale.max(1e-4);
+                            ((dx * c - dy * s) / sc, (dx * s + dy * c) / sc)
+                        }
+                    }
+                };
+                if let Some(b) = self.document.skeletons[si].bone_mut(bid) {
+                    b.x = nx;
+                    b.y = ny;
+                }
+                self.dirty = true;
+            }
+            RigDrag::None => {}
+        }
+    }
+
+    /// Opções da ferramenta Rig na barra superior.
+    fn opcoes_rig(&mut self, ui: &mut egui::Ui) {
+        use sketchmotion_core::BoneShape as BS;
+        ui.label("Rig:");
+        ui.selectable_value(&mut self.rig_mode, RigMode::Create, "Criar ossos");
+        ui.selectable_value(&mut self.rig_mode, RigMode::Pose, "Posar");
+        if self.rig_mode == RigMode::Create {
+            ui.separator();
+            ui.label("Peça:");
+            ui.selectable_value(&mut self.rig_shape, BS::Limb, "Membro");
+            ui.selectable_value(&mut self.rig_shape, BS::Torso, "Tronco");
+            ui.selectable_value(&mut self.rig_shape, BS::Hip, "Quadril");
+            ui.selectable_value(&mut self.rig_shape, BS::Head, "Cabeça");
+        }
+        ui.separator();
+        ui.weak("Painel Rig (à direita) gerencia os esqueletos.");
+    }
+
+    /// Overlay dos esqueletos (ossos + articulações) sobre o canvas.
+    fn desenhar_rig(&self, ui: &egui::Ui, rect: egui::Rect, zoom: f32) {
+        if !self.show_bones {
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        let sp = |x: f32, y: f32| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom);
+        let active = self.rig_active_index();
+        for (si, sk) in self.document.skeletons.iter().enumerate() {
+            if !sk.visible {
+                continue;
+            }
+            let is_active = active == Some(si);
+            let base = if is_active {
+                egui::Color32::from_rgb(0xFF, 0x9F, 0x1C)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(0xFF, 0x9F, 0x1C, 120)
+            };
+            for b in &sk.bones {
+                let (ox, oy) = sk.origin(b.id);
+                let (tx, ty) = sk.tip(b.id);
+                let o = sp(ox, oy);
+                let t = sp(tx, ty);
+                let sel = is_active && self.rig_sel_bone == Some(b.id);
+                let col = if sel {
+                    egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                } else {
+                    base
+                };
+                let w = if sel { 3.0 } else { 2.0 };
+                let fill = egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 70);
+                painter.add(egui::Shape::convex_polygon(
+                    rig_shape_points(b.shape, o, t),
+                    fill,
+                    egui::Stroke::new(w, col),
+                ));
+                let jr = if sel { 4.5 } else { 3.5 };
+                painter.circle_filled(o, jr, col);
+                painter.circle_stroke(o, jr, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
+            }
+        }
+        // Preview do osso sendo criado (arrastar em modo Criar).
+        if self.tool == Tool::Rig && self.rig_mode == RigMode::Create {
+            if let (Some(a), Some(b)) = (self.rig_start, self.rig_preview) {
+                let o = sp(a.0, a.1);
+                let t = sp(b.0, b.1);
+                let ghost = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+                painter.add(egui::Shape::convex_polygon(
+                    rig_shape_points(self.rig_shape, o, t),
+                    egui::Color32::from_rgba_unmultiplied(0x2F, 0x84, 0xFE, 50),
+                    egui::Stroke::new(1.5_f32, ghost),
+                ));
+                painter.circle_filled(o, 3.5, ghost);
+            }
+        }
+    }
+
+    /// Janela: Rig — lista de esqueletos e modos de edição (painel direito).
+    fn janela_rig(&mut self, ctx: &egui::Context) {
+        use egui_phosphor::regular as icon;
+        let mut open = self.win_rig;
+
+        let mut add_skel = false;
+        let mut del_skel: Option<usize> = None;
+        let mut set_active: Option<usize> = None;
+        let mut toggle_vis: Option<usize> = None;
+        let mut set_mode: Option<RigMode> = None;
+        let mut do_reset = false;
+        let mut do_setrest = false;
+        let mut del_bone = false;
+        let mut insert_preset: Option<&'static str> = None;
+
+        let mut win = egui::Window::new("Rig — esqueletos")
+            .open(&mut open)
+            .default_width(300.0);
+        if let Some(r) = self.icon_r_rig {
+            let pos = egui::pos2(r.left() - 8.0, r.top());
+            win = win.pivot(egui::Align2::RIGHT_TOP);
+            win = if self.reopen_rig { win.current_pos(pos) } else { win.default_pos(pos) };
+        }
+        win.show(ctx, |ui| {
+            ui.checkbox(&mut self.show_bones, "Mostrar esqueletos");
+            ui.add_space(2.0);
+
+            egui::CollapsingHeader::new("Esqueletos prontos")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (lbl, key) in
+                            [("Humano", "humano"), ("Cavalo", "cavalo"), ("Raptor", "raptor")]
+                        {
+                            let (rct, resp) = ui
+                                .allocate_exact_size(egui::vec2(82.0, 92.0), egui::Sense::click());
+                            let pt = ui.painter_at(rct);
+                            let bg = if resp.hovered() {
+                                egui::Color32::from_gray(52)
+                            } else {
+                                egui::Color32::from_gray(34)
+                            };
+                            pt.rect_filled(rct, 6.0, bg);
+                            let prev = preset_skeleton(key, 0.0, 0.0, 1.0);
+                            desenhar_preview_esqueleto(
+                                &pt,
+                                egui::Rect::from_min_size(
+                                    rct.min,
+                                    egui::vec2(rct.width(), rct.height() - 16.0),
+                                )
+                                .shrink(6.0),
+                                &prev,
+                                egui::Color32::from_rgb(0x8F, 0xB7, 0xFF),
+                            );
+                            pt.text(
+                                egui::pos2(rct.center().x, rct.bottom() - 8.0),
+                                egui::Align2::CENTER_CENTER,
+                                lbl,
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::WHITE,
+                            );
+                            if resp.on_hover_text(format!("Inserir esqueleto {lbl}")).clicked() {
+                                insert_preset = Some(key);
+                            }
+                        }
+                    });
+                });
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Meus esqueletos").strong());
+
+            let n = self.document.skeletons.len();
+            if n == 0 {
+                ui.weak("Nenhum ainda — insira um pronto ou crie vazio.");
+            }
+            let active = self.rig_active_index();
+            for i in 0..n {
+                let vis = self.document.skeletons[i].visible;
+                let is_active = active == Some(i);
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(is_active, icon::CIRCLE)
+                        .on_hover_text("Esqueleto ativo")
+                        .clicked()
+                    {
+                        set_active = Some(i);
+                    }
+                    if ui
+                        .selectable_label(false, if vis { icon::EYE } else { icon::EYE_SLASH })
+                        .on_hover_text("Ver/ocultar")
+                        .clicked()
+                    {
+                        toggle_vis = Some(i);
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.document.skeletons[i].name)
+                            .desired_width(120.0),
+                    );
+                    let nb = self.document.skeletons[i].bones.len();
+                    ui.weak(format!("{nb} osso(s)"));
+                    if ui.small_button(icon::TRASH).on_hover_text("Excluir esqueleto").clicked() {
+                        del_skel = Some(i);
+                    }
+                });
+            }
+            ui.separator();
+            if ui.button(format!("{}  Novo (vazio)", icon::PLUS)).clicked() {
+                add_skel = true;
+            }
+
+            ui.separator();
+            if self.pixel_mode {
+                ui.weak("Rig indisponível no modo pixel art.");
+            } else if self.document.skeletons.is_empty() {
+                ui.weak("Crie um esqueleto para editar.");
+            } else {
+                let editing = self.tool == Tool::Rig;
+                ui.label("Edição:");
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(editing && self.rig_mode == RigMode::Create, "Criar ossos")
+                        .clicked()
+                    {
+                        set_mode = Some(RigMode::Create);
+                    }
+                    if ui
+                        .selectable_label(editing && self.rig_mode == RigMode::Pose, "Posar")
+                        .clicked()
+                    {
+                        set_mode = Some(RigMode::Pose);
+                    }
+                });
+                if editing && self.rig_mode == RigMode::Create {
+                    ui.horizontal_wrapped(|ui| {
+                        use sketchmotion_core::BoneShape as BS;
+                        ui.label("Peça:");
+                        ui.selectable_value(&mut self.rig_shape, BS::Limb, "Membro");
+                        ui.selectable_value(&mut self.rig_shape, BS::Torso, "Tronco");
+                        ui.selectable_value(&mut self.rig_shape, BS::Hip, "Quadril");
+                        ui.selectable_value(&mut self.rig_shape, BS::Head, "Cabeça");
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Resetar pose").clicked() {
+                        do_reset = true;
+                    }
+                    if ui.button("Definir descanso").clicked() {
+                        do_setrest = true;
+                    }
+                });
+                if self.rig_sel_bone.is_some()
+                    && ui
+                        .button(format!("{}  Excluir osso selecionado", icon::TRASH))
+                        .clicked()
+                {
+                    del_bone = true;
+                }
+                ui.weak(
+                    "Criar: arraste para desenhar um osso; comece perto da ponta de outro para encadear. Posar: arraste o corpo para girar, ou a bolinha da articulação para mover.",
+                );
+            }
+        });
+
+        if add_skel {
+            let name = format!("Esqueleto {}", self.document.skeletons.len() + 1);
+            self.push_undo();
+            self.document
+                .skeletons
+                .push(sketchmotion_core::Skeleton::new(name));
+            self.rig_skel = self.document.skeletons.len() - 1;
+            self.rig_sel_bone = None;
+            self.show_bones = true;
+            self.dirty = true;
+        }
+        if let Some(key) = insert_preset {
+            self.push_undo();
+            let cx = self.document.width as f32 / 2.0;
+            let cy = self.document.height as f32 / 2.0;
+            let base = self.document.width.min(self.document.height) as f32;
+            let sk = preset_skeleton(key, cx, cy, base * 0.26);
+            self.document.skeletons.push(sk);
+            self.rig_skel = self.document.skeletons.len() - 1;
+            self.rig_sel_bone = None;
+            self.show_bones = true;
+            self.dirty = true;
+        }
+        if let Some(i) = del_skel {
+            self.push_undo();
+            if i < self.document.skeletons.len() {
+                self.document.skeletons.remove(i);
+            }
+            if self.rig_skel >= self.document.skeletons.len() {
+                self.rig_skel = self.document.skeletons.len().saturating_sub(1);
+            }
+            self.rig_sel_bone = None;
+            self.dirty = true;
+        }
+        if let Some(i) = set_active {
+            self.rig_skel = i;
+            self.rig_sel_bone = None;
+        }
+        if let Some(i) = toggle_vis {
+            if let Some(sk) = self.document.skeletons.get_mut(i) {
+                sk.visible = !sk.visible;
+            }
+            self.dirty = true;
+        }
+        if let Some(m) = set_mode {
+            self.tool = Tool::Rig;
+            self.rig_mode = m;
+            self.show_bones = true;
+            self.eyedropper = Eyedropper::Off;
+        }
+        if do_reset {
+            if let Some(si) = self.rig_active_index() {
+                self.push_undo();
+                self.document.skeletons[si].reset_pose();
+                self.dirty = true;
+            }
+        }
+        if do_setrest {
+            if let Some(si) = self.rig_active_index() {
+                self.document.skeletons[si].set_rest();
+            }
+        }
+        if del_bone {
+            if let (Some(si), Some(bid)) = (self.rig_active_index(), self.rig_sel_bone) {
+                self.push_undo();
+                self.document.skeletons[si].remove_bone(bid);
+                self.rig_sel_bone = None;
+                self.dirty = true;
+            }
+        }
+
+        self.reopen_rig = false;
+        self.win_rig = open;
+    }
+
     /// Tela inicial: escolher o tamanho do documento (presets ou personalizado),
     /// marcar se é pixel art, e então entrar no editor.
     fn tela_inicial(&mut self, ctx: &egui::Context) {
@@ -3399,6 +4130,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_cor(ctx);
         self.janela_paletas(ctx);
         self.janela_camadas(ctx);
+        self.janela_rig(ctx);
         self.barra_frames(ctx);
         self.janela_reproducao(ctx);
 
@@ -3776,6 +4508,47 @@ impl eframe::App for SketchMotionApp {
                             self.float_release();
                         }
                         self.last_pos = None;
+                    } else if self.tool == Tool::Rig {
+                        if let Some(si) = self.rig_active_index() {
+                            match self.rig_mode {
+                                RigMode::Create => {
+                                    if pressed {
+                                        if let Some(pp) = hover {
+                                            self.rig_start = Some(to_doc(pp));
+                                        }
+                                    }
+                                    if down {
+                                        if let Some(pp) = ppos {
+                                            self.rig_preview = Some(to_doc(pp));
+                                        }
+                                    }
+                                    if !down {
+                                        if let Some(start) = self.rig_start.take() {
+                                            if let Some(pp) = ppos {
+                                                self.rig_create_bone(si, start, to_doc(pp));
+                                            }
+                                        }
+                                        self.rig_preview = None;
+                                    }
+                                }
+                                RigMode::Pose => {
+                                    if pressed {
+                                        if let Some(pp) = hover {
+                                            self.rig_pick(si, to_doc(pp));
+                                        }
+                                    }
+                                    if down {
+                                        if let Some(pp) = ppos {
+                                            self.rig_drag_to(si, to_doc(pp));
+                                        }
+                                    }
+                                    if !down {
+                                        self.rig_dragging = RigDrag::None;
+                                    }
+                                }
+                            }
+                        }
+                        self.last_pos = None;
                     } else if self.tool == Tool::Shapes {
                         if pressed {
                             if let Some(p) = hover {
@@ -3900,6 +4673,14 @@ impl eframe::App for SketchMotionApp {
                                 Tool::Pen | Tool::Shapes | Tool::Fill => {
                                     ui.ctx().set_cursor_icon(CI::Crosshair);
                                 }
+                                Tool::Rig => {
+                                    let c = if self.rig_mode == RigMode::Create {
+                                        CI::Crosshair
+                                    } else {
+                                        CI::Grab
+                                    };
+                                    ui.ctx().set_cursor_icon(c);
+                                }
                                 Tool::Lasso | Tool::MagicWand => {
                                     let c = hover
                                         .and_then(|hp| self.float_cursor(hp, rect, zoom))
@@ -3961,6 +4742,7 @@ impl eframe::App for SketchMotionApp {
 
                     // Overlay vetorial: objetos, seleção e traço em progresso.
                     self.desenhar_vetores(ui, rect, zoom);
+                    self.desenhar_rig(ui, rect, zoom);
 
                     // Seleção retangular raster: pixels flutuantes + marca.
                     if self.float_sel.is_some() && self.float_tex.is_none() {
