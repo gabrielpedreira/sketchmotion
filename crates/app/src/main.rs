@@ -332,6 +332,14 @@ fn rig_shape_points(shape: sketchmotion_core::BoneShape, o: egui::Pos2, t: egui:
                 })
                 .collect()
         }
+        BS::Mao => {
+            let h = len * 0.28;
+            vec![o + n * (h * 0.5), o - n * (h * 0.5), t - n * h, t + n * h]
+        }
+        BS::Pe => {
+            let h = len * 0.5;
+            vec![o, t + n * h, t - n * (h * 0.2)]
+        }
     }
 }
 
@@ -496,6 +504,85 @@ fn desenhar_preview_esqueleto(
             egui::Stroke::new(1.2_f32, col),
         ));
     }
+}
+
+/// Geometria de uma peça-imagem do rig, em unidades da imagem (x/W, y/W).
+struct PieceDef {
+    aspect: f32,
+    origin: (f32, f32),
+    tip: (f32, f32),
+    conns: &'static [(f32, f32)],
+    tex: usize,
+}
+
+fn piece_def(shape: sketchmotion_core::BoneShape) -> PieceDef {
+    use sketchmotion_core::BoneShape as BS;
+    match shape {
+        BS::Limb => PieceDef {
+            aspect: 8.6106,
+            origin: (0.498, 0.3789),
+            tip: (0.498, 8.2317),
+            conns: &[(0.498, 0.3789), (0.498, 8.2317)],
+            tex: 0,
+        },
+        BS::Torso => PieceDef {
+            aspect: 1.5409,
+            origin: (0.500, 1.4823),
+            tip: (0.500, 0.0570),
+            conns: &[(0.500, 1.4823), (0.500, 0.0570), (0.074, 0.4268), (0.925, 0.4268)],
+            tex: 1,
+        },
+        BS::Hip => PieceDef {
+            aspect: 0.7157,
+            origin: (0.500, 0.1546),
+            tip: (0.498, 0.5114),
+            conns: &[(0.500, 0.1546), (0.095, 0.5053), (0.901, 0.5175)],
+            tex: 2,
+        },
+        BS::Head => PieceDef {
+            aspect: 1.7784,
+            origin: (0.519, 1.6397),
+            tip: (0.5, 0.02),
+            conns: &[(0.519, 1.6397)],
+            tex: 3,
+        },
+        BS::Mao => PieceDef {
+            aspect: 1.0541,
+            origin: (0.500, 0.2024),
+            tip: (0.5, 1.03),
+            conns: &[(0.500, 0.2024)],
+            tex: 4,
+        },
+        BS::Pe => PieceDef {
+            aspect: 0.4400,
+            origin: (0.906, 0.0933),
+            tip: (0.03, 0.40),
+            conns: &[(0.906, 0.0933)],
+            tex: 5,
+        },
+    }
+}
+
+/// Similaridade por 2 pontos: mapeia (px,py) do espaço da imagem da peça para o
+/// mundo, dado que p_orig->w_orig e p_tip->w_tip.
+fn map_piece(
+    p_orig: (f32, f32),
+    p_tip: (f32, f32),
+    w_orig: (f32, f32),
+    w_tip: (f32, f32),
+    px: f32,
+    py: f32,
+) -> (f32, f32) {
+    let aimg = (p_tip.0 - p_orig.0, p_tip.1 - p_orig.1);
+    let aw = (w_tip.0 - w_orig.0, w_tip.1 - w_orig.1);
+    let limg = (aimg.0 * aimg.0 + aimg.1 * aimg.1).sqrt().max(1e-4);
+    let lw = (aw.0 * aw.0 + aw.1 * aw.1).sqrt().max(1e-4);
+    let ang = aw.1.atan2(aw.0) - aimg.1.atan2(aimg.0);
+    let sc = lw / limg;
+    let (s, c) = ang.sin_cos();
+    let (cc, ss) = (sc * c, sc * s);
+    let (dx, dy) = (px - p_orig.0, py - p_orig.1);
+    (w_orig.0 + dx * cc - dy * ss, w_orig.1 + dx * ss + dy * cc)
 }
 
 fn resize_cursor(sx: f32, sy: f32) -> egui::CursorIcon {
@@ -817,6 +904,7 @@ enum RigDrag {
     None,
     Move,
     Rotate,
+    Resize,
 }
 
 struct SketchMotionApp {
@@ -863,6 +951,8 @@ struct SketchMotionApp {
     rig_preview: Option<(f32, f32)>,
     rig_shape: sketchmotion_core::BoneShape,
     cursor_tex: [Option<egui::TextureHandle>; 5],
+    piece_tex: [Option<egui::TextureHandle>; 6],
+    rig_snap_hint: Option<(u32, f32, f32)>,
     current_path: Option<std::path::PathBuf>,
     pixel_mode: bool,
     screen: Screen,
@@ -987,6 +1077,8 @@ impl SketchMotionApp {
             rig_preview: None,
             rig_shape: sketchmotion_core::BoneShape::Limb,
             cursor_tex: [None, None, None, None, None],
+            piece_tex: [None, None, None, None, None, None],
+            rig_snap_hint: None,
             current_path: None,
             pixel_mode: false,
             screen: Screen::Home,
@@ -3420,67 +3512,69 @@ impl SketchMotionApp {
     fn rig_create_bone(&mut self, si: usize, start: (f32, f32), end: (f32, f32)) {
         let (dx, dy) = (end.0 - start.0, end.1 - start.1);
         let len = (dx * dx + dy * dy).sqrt();
-        if len < 3.0 {
+        if len < 4.0 {
             return;
         }
-        let thr = 12.0_f32;
+        // Encaixa o começo no ponto de ligação mais próximo (encadeia).
         let mut parent: Option<u32> = None;
+        let mut snap = start;
         {
             let sk = &self.document.skeletons[si];
-            let mut best = thr;
+            let mut best = 16.0_f32;
             for b in &sk.bones {
-                let (tx, ty) = sk.tip(b.id);
-                let d = ((tx - start.0).powi(2) + (ty - start.1).powi(2)).sqrt();
-                if d < best {
-                    best = d;
-                    parent = Some(b.id);
+                for cp in self.bone_conns(sk, b.id) {
+                    let d = ((cp.0 - start.0).powi(2) + (cp.1 - start.1).powi(2)).sqrt();
+                    if d < best {
+                        best = d;
+                        parent = Some(b.id);
+                        snap = cp;
+                    }
                 }
             }
         }
         self.push_undo();
+        let ang = (end.1 - snap.1).atan2(end.0 - snap.0);
+        let seg = ((end.0 - snap.0).powi(2) + (end.1 - snap.1).powi(2)).sqrt().max(1.0);
         let sk = &mut self.document.skeletons[si];
-        let new_id = if let Some(pid) = parent {
-            let plen = sk.bone(pid).map(|b| b.length).unwrap_or(0.0);
-            let pw = sk.world(pid);
-            let (ptx, pty) = (
-                pw.x + plen * pw.scale * pw.angle.cos(),
-                pw.y + plen * pw.scale * pw.angle.sin(),
-            );
-            let ang_world = (end.1 - pty).atan2(end.0 - ptx);
-            let seg = ((end.0 - ptx).powi(2) + (end.1 - pty).powi(2)).sqrt();
-            sk.add_bone(Some(pid), plen, 0.0, ang_world - pw.angle, seg, self.rig_shape)
-        } else {
-            sk.add_bone(None, start.0, start.1, dy.atan2(dx), len, self.rig_shape)
-        };
-        self.rig_sel_bone = Some(new_id);
+        let id = sk.add_bone_world(parent, snap.0, snap.1, ang, seg, self.rig_shape);
+        self.rig_sel_bone = Some(id);
         self.dirty = true;
     }
 
     /// Seleciona o osso sob o ponto (prioriza a articulação para mover).
     fn rig_pick(&mut self, si: usize, p: (f32, f32)) {
-        let thr = 10.0_f32;
         let mut found: Option<u32> = None;
         let mut mode = RigDrag::Rotate;
         {
             let sk = &self.document.skeletons[si];
-            let mut best = 8.0_f32;
+            // 1) ponta (bola) -> redimensionar
+            let mut best = 12.0_f32;
             for b in &sk.bones {
-                let (ox, oy) = sk.origin(b.id);
-                let d = ((ox - p.0).powi(2) + (oy - p.1).powi(2)).sqrt();
+                let (tx, ty) = sk.tip(b.id);
+                let d = ((tx - p.0).powi(2) + (ty - p.1).powi(2)).sqrt();
                 if d < best {
                     best = d;
                     found = Some(b.id);
-                    mode = RigDrag::Move;
+                    mode = RigDrag::Resize;
                 }
             }
+            // 2) origem (bola) -> mover
             if found.is_none() {
-                let mut best = thr;
+                let mut best = 12.0_f32;
                 for b in &sk.bones {
                     let (ox, oy) = sk.origin(b.id);
-                    let (tx, ty) = sk.tip(b.id);
-                    let d = dist_point_seg(p.0, p.1, ox, oy, tx, ty);
+                    let d = ((ox - p.0).powi(2) + (oy - p.1).powi(2)).sqrt();
                     if d < best {
                         best = d;
+                        found = Some(b.id);
+                        mode = RigDrag::Move;
+                    }
+                }
+            }
+            // 3) corpo da peça -> girar (o de cima vence)
+            if found.is_none() {
+                for b in &sk.bones {
+                    if self.piece_hit(sk, b.id, p) {
                         found = Some(b.id);
                         mode = RigDrag::Rotate;
                     }
@@ -3501,7 +3595,7 @@ impl SketchMotionApp {
                         let aim = (p.1 - oy).atan2(p.0 - ox);
                         (cur - aim, 0.0)
                     }
-                    RigDrag::None => (0.0, 0.0),
+                    RigDrag::Resize | RigDrag::None => (0.0, 0.0),
                 }
             };
             self.rig_grab = grab;
@@ -3533,6 +3627,28 @@ impl SketchMotionApp {
                 if let Some(b) = self.document.skeletons[si].bone_mut(bid) {
                     b.angle = aim - parent_ang;
                 }
+                self.rig_snap_hint = None;
+                self.dirty = true;
+            }
+            RigDrag::Resize => {
+                let (ox, oy, parent_ang) = {
+                    let sk = &self.document.skeletons[si];
+                    let (ox, oy) = sk.origin(bid);
+                    let pa = sk
+                        .bone(bid)
+                        .and_then(|b| b.parent)
+                        .map(|pp| sk.world(pp).angle)
+                        .unwrap_or(0.0);
+                    (ox, oy, pa)
+                };
+                let (dx, dy) = (p.0 - ox, p.1 - oy);
+                let nlen = (dx * dx + dy * dy).sqrt().max(2.0);
+                let aim = dy.atan2(dx);
+                if let Some(b) = self.document.skeletons[si].bone_mut(bid) {
+                    b.length = nlen;
+                    b.angle = aim - parent_ang;
+                }
+                self.rig_snap_hint = None;
                 self.dirty = true;
             }
             RigDrag::Move => {
@@ -3554,6 +3670,8 @@ impl SketchMotionApp {
                     b.x = nx;
                     b.y = ny;
                 }
+                let origin_now = self.document.skeletons[si].origin(bid);
+                self.rig_snap_hint = self.nearest_snap_target(si, bid, origin_now);
                 self.dirty = true;
             }
             RigDrag::None => {}
@@ -3564,6 +3682,174 @@ impl SketchMotionApp {
     /// Garante que as texturas de cursor personalizadas estejam carregadas
     /// (decodifica + reduz os PNGs uma vez). Índices: 0 caneta, 1 balde,
     /// 2 conta-gotas, 3 laço, 4 varinha.
+    /// Carrega (uma vez) as texturas das peças do rig a partir de ossos/*.png.
+    /// Ordem: 0 membro, 1 tronco, 2 quadril, 3 cabeca, 4 mao, 5 pe.
+    fn ensure_piece_textures(&mut self, ctx: &egui::Context) {
+        if self.piece_tex.iter().all(|t| t.is_some()) {
+            return;
+        }
+        const DATA: [&[u8]; 6] = [
+            include_bytes!("../../../ossos/membro.png"),
+            include_bytes!("../../../ossos/tronco.png"),
+            include_bytes!("../../../ossos/quadril.png"),
+            include_bytes!("../../../ossos/cabeca.png"),
+            include_bytes!("../../../ossos/mao.png"),
+            include_bytes!("../../../ossos/pe.png"),
+        ];
+        const NAMES: [&str; 6] =
+            ["p_membro", "p_tronco", "p_quadril", "p_cabeca", "p_mao", "p_pe"];
+        for i in 0..6 {
+            if self.piece_tex[i].is_some() {
+                continue;
+            }
+            if let Ok(img) = image::load_from_memory(DATA[i]) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
+                self.piece_tex[i] =
+                    Some(ctx.load_texture(NAMES[i], color, egui::TextureOptions::LINEAR));
+            }
+        }
+    }
+
+    /// Pontos de ligação de um osso em coordenadas de mundo (o primeiro é a
+    /// origem/pino que se conecta ao pai).
+    fn bone_conns(&self, sk: &sketchmotion_core::Skeleton, id: u32) -> Vec<(f32, f32)> {
+        let shape = match sk.bone(id) {
+            Some(b) => b.shape,
+            None => return Vec::new(),
+        };
+        let pd = piece_def(shape);
+        let wo = sk.origin(id);
+        let wt = sk.tip(id);
+        pd.conns
+            .iter()
+            .map(|&(cx, cy)| map_piece(pd.origin, pd.tip, wo, wt, cx, cy))
+            .collect()
+    }
+
+    /// Testa se o ponto de mundo `p` está dentro do retângulo da peça (ignora
+    /// transparência — suficiente para seleção).
+    fn piece_hit(&self, sk: &sketchmotion_core::Skeleton, id: u32, p: (f32, f32)) -> bool {
+        let shape = match sk.bone(id) {
+            Some(b) => b.shape,
+            None => return false,
+        };
+        let pd = piece_def(shape);
+        let wo = sk.origin(id);
+        let wt = sk.tip(id);
+        let aimg = (pd.tip.0 - pd.origin.0, pd.tip.1 - pd.origin.1);
+        let aw = (wt.0 - wo.0, wt.1 - wo.1);
+        let limg = (aimg.0 * aimg.0 + aimg.1 * aimg.1).sqrt().max(1e-4);
+        let lw = (aw.0 * aw.0 + aw.1 * aw.1).sqrt().max(1e-4);
+        let ang = aw.1.atan2(aw.0) - aimg.1.atan2(aimg.0);
+        let sc = lw / limg;
+        let (s, c) = (-ang).sin_cos();
+        let (dx, dy) = (p.0 - wo.0, p.1 - wo.1);
+        let ix = (dx * c - dy * s) / sc + pd.origin.0;
+        let iy = (dx * s + dy * c) / sc + pd.origin.1;
+        ix >= 0.0 && ix <= 1.0 && iy >= 0.0 && iy <= pd.aspect
+    }
+
+    /// True se `node` é descendente de `ancestor` (para evitar ciclos).
+    fn is_descendant(&self, sk: &sketchmotion_core::Skeleton, mut node: u32, ancestor: u32) -> bool {
+        while let Some(b) = sk.bone(node) {
+            match b.parent {
+                Some(pp) => {
+                    if pp == ancestor {
+                        return true;
+                    }
+                    node = pp;
+                }
+                None => break,
+            }
+        }
+        false
+    }
+
+    /// Ponto de ligação mais próximo de `p` pertencente a outro osso (não a
+    /// `bid` nem a um descendente dele). Devolve (id_alvo, x, y).
+    fn nearest_snap_target(
+        &self,
+        si: usize,
+        bid: u32,
+        p: (f32, f32),
+    ) -> Option<(u32, f32, f32)> {
+        let sk = &self.document.skeletons[si];
+        let mut best = 18.0_f32;
+        let mut res = None;
+        for b in &sk.bones {
+            if b.id == bid || self.is_descendant(sk, b.id, bid) {
+                continue;
+            }
+            for cp in self.bone_conns(sk, b.id) {
+                let d = ((cp.0 - p.0).powi(2) + (cp.1 - p.1).powi(2)).sqrt();
+                if d < best {
+                    best = d;
+                    res = Some((b.id, cp.0, cp.1));
+                }
+            }
+        }
+        res
+    }
+
+    /// Conecta `bid` ao osso `target`, encaixando a origem de `bid` no ponto.
+    fn rig_connect(&mut self, si: usize, bid: u32, target: u32, point: (f32, f32)) {
+        {
+            let sk = &self.document.skeletons[si];
+            if target == bid || self.is_descendant(sk, target, bid) {
+                return;
+            }
+        }
+        let world_ang = self.document.skeletons[si].world(bid).angle;
+        self.push_undo();
+        let sk = &mut self.document.skeletons[si];
+        if let Some(b) = sk.bone_mut(bid) {
+            b.parent = Some(target);
+        }
+        let pw = sk.world(target);
+        let (dx, dy) = (point.0 - pw.x, point.1 - pw.y);
+        let (s, c) = (-pw.angle).sin_cos();
+        let scl = pw.scale.max(1e-4);
+        let lx = (dx * c - dy * s) / scl;
+        let ly = (dx * s + dy * c) / scl;
+        let la = world_ang - pw.angle;
+        if let Some(b) = sk.bone_mut(bid) {
+            b.x = lx;
+            b.y = ly;
+            b.angle = la;
+        }
+        self.dirty = true;
+    }
+
+    /// Separa o osso selecionado da sua conexão (vira raiz, mantendo a posição).
+    fn rig_separar(&mut self, si: usize, bid: u32) {
+        let w = self.document.skeletons[si].world(bid);
+        self.push_undo();
+        let sk = &mut self.document.skeletons[si];
+        if let Some(b) = sk.bone_mut(bid) {
+            b.parent = None;
+            b.x = w.x;
+            b.y = w.y;
+            b.angle = w.angle;
+        }
+        self.dirty = true;
+    }
+
+    /// Fim do gesto de posar: se estava movendo e há alvo de encaixe, conecta.
+    fn rig_release_pose(&mut self, si: usize) {
+        if self.rig_dragging == RigDrag::Move {
+            if let (Some(bid), Some((tid, tx, ty))) = (self.rig_sel_bone, self.rig_snap_hint) {
+                self.rig_connect(si, bid, tid, (tx, ty));
+            }
+        }
+        self.rig_snap_hint = None;
+        self.rig_dragging = RigDrag::None;
+    }
+
     fn ensure_cursor_textures(&mut self, ctx: &egui::Context) {
         if self.cursor_tex.iter().all(|t| t.is_some()) {
             return;
@@ -3638,6 +3924,8 @@ impl SketchMotionApp {
             ui.selectable_value(&mut self.rig_shape, BS::Torso, "Tronco");
             ui.selectable_value(&mut self.rig_shape, BS::Hip, "Quadril");
             ui.selectable_value(&mut self.rig_shape, BS::Head, "Cabeça");
+            ui.selectable_value(&mut self.rig_shape, BS::Mao, "Mão");
+            ui.selectable_value(&mut self.rig_shape, BS::Pe, "Pé");
         }
         ui.separator();
         ui.weak("Painel Rig (à direita) gerencia os esqueletos.");
@@ -3650,52 +3938,82 @@ impl SketchMotionApp {
         }
         let painter = ui.painter_at(rect);
         let sp = |x: f32, y: f32| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom);
+        // Mapeia as 4 quinas da imagem da peça para a tela.
+        let corners = |pd: &PieceDef, wo: (f32, f32), wt: (f32, f32)| -> [egui::Pos2; 4] {
+            let c = [(0.0, 0.0), (1.0, 0.0), (1.0, pd.aspect), (0.0, pd.aspect)];
+            let mut out = [egui::pos2(0.0, 0.0); 4];
+            for (k, &(cx, cy)) in c.iter().enumerate() {
+                let (wx, wy) = map_piece(pd.origin, pd.tip, wo, wt, cx, cy);
+                out[k] = sp(wx, wy);
+            }
+            out
+        };
         let active = self.rig_active_index();
         for (si, sk) in self.document.skeletons.iter().enumerate() {
             if !sk.visible {
                 continue;
             }
             let is_active = active == Some(si);
-            let base = if is_active {
-                egui::Color32::from_rgb(0xFF, 0x9F, 0x1C)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(0xFF, 0x9F, 0x1C, 120)
-            };
             for b in &sk.bones {
-                let (ox, oy) = sk.origin(b.id);
-                let (tx, ty) = sk.tip(b.id);
-                let o = sp(ox, oy);
-                let t = sp(tx, ty);
-                let sel = is_active && self.rig_sel_bone == Some(b.id);
-                let col = if sel {
-                    egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                let pd = piece_def(b.shape);
+                let wo = sk.origin(b.id);
+                let wt = sk.tip(b.id);
+                let v = corners(&pd, wo, wt);
+                if let Some(tex) = &self.piece_tex[pd.tex] {
+                    let uv = [
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                        egui::pos2(0.0, 1.0),
+                    ];
+                    let mut mesh = egui::Mesh::with_texture(tex.id());
+                    for k in 0..4 {
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: v[k],
+                            uv: uv[k],
+                            color: egui::Color32::WHITE,
+                        });
+                    }
+                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    painter.add(egui::Shape::mesh(mesh));
                 } else {
-                    base
-                };
-                let w = if sel { 3.0 } else { 2.0 };
-                let fill = egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 70);
-                painter.add(egui::Shape::convex_polygon(
-                    rig_shape_points(b.shape, o, t),
-                    fill,
-                    egui::Stroke::new(w, col),
-                ));
-                let jr = if sel { 4.5 } else { 3.5 };
-                painter.circle_filled(o, jr, col);
-                painter.circle_stroke(o, jr, egui::Stroke::new(1.0_f32, egui::Color32::WHITE));
+                    let o = sp(wo.0, wo.1);
+                    let t = sp(wt.0, wt.1);
+                    painter.add(egui::Shape::convex_polygon(
+                        rig_shape_points(b.shape, o, t),
+                        egui::Color32::from_rgba_unmultiplied(0xFF, 0x9F, 0x1C, 70),
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0xFF, 0x9F, 0x1C)),
+                    ));
+                }
+                if is_active && self.rig_sel_bone == Some(b.id) {
+                    let azul = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+                    painter.add(egui::Shape::closed_line(
+                        v.to_vec(),
+                        egui::Stroke::new(2.0, azul),
+                    ));
+                    // alça de redimensionar (bola da ponta)
+                    let tb = sp(wt.0, wt.1);
+                    painter.circle_stroke(tb, 7.0, egui::Stroke::new(2.0, azul));
+                }
             }
         }
-        // Preview do osso sendo criado (arrastar em modo Criar).
+        // Realce do encaixe (durante o arrasto para conectar).
+        if let Some((_, hx, hy)) = self.rig_snap_hint {
+            painter.circle_stroke(
+                sp(hx, hy),
+                12.0,
+                egui::Stroke::new(2.5, egui::Color32::from_rgb(0x3A, 0xC0, 0x50)),
+            );
+        }
+        // Preview da peça sendo criada (arrastar em modo Criar).
         if self.tool == Tool::Rig && self.rig_mode == RigMode::Create {
             if let (Some(a), Some(b)) = (self.rig_start, self.rig_preview) {
-                let o = sp(a.0, a.1);
-                let t = sp(b.0, b.1);
-                let ghost = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
-                painter.add(egui::Shape::convex_polygon(
-                    rig_shape_points(self.rig_shape, o, t),
-                    egui::Color32::from_rgba_unmultiplied(0x2F, 0x84, 0xFE, 50),
-                    egui::Stroke::new(1.5_f32, ghost),
+                let pd = piece_def(self.rig_shape);
+                let v = corners(&pd, a, b);
+                painter.add(egui::Shape::closed_line(
+                    v.to_vec(),
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(0x2F, 0x84, 0xFE)),
                 ));
-                painter.circle_filled(o, 3.5, ghost);
             }
         }
     }
@@ -3713,6 +4031,7 @@ impl SketchMotionApp {
         let mut do_reset = false;
         let mut do_setrest = false;
         let mut del_bone = false;
+        let mut separar_bone = false;
         let mut insert_preset: Option<&'static str> = None;
 
         let mut win = egui::Window::new("Rig — esqueletos")
@@ -3839,6 +4158,8 @@ impl SketchMotionApp {
                         ui.selectable_value(&mut self.rig_shape, BS::Torso, "Tronco");
                         ui.selectable_value(&mut self.rig_shape, BS::Hip, "Quadril");
                         ui.selectable_value(&mut self.rig_shape, BS::Head, "Cabeça");
+                        ui.selectable_value(&mut self.rig_shape, BS::Mao, "Mão");
+                        ui.selectable_value(&mut self.rig_shape, BS::Pe, "Pé");
                     });
                 }
                 ui.horizontal(|ui| {
@@ -3849,15 +4170,21 @@ impl SketchMotionApp {
                         do_setrest = true;
                     }
                 });
-                if self.rig_sel_bone.is_some()
-                    && ui
-                        .button(format!("{}  Excluir osso selecionado", icon::TRASH))
-                        .clicked()
-                {
-                    del_bone = true;
+                if self.rig_sel_bone.is_some() {
+                    ui.horizontal(|ui| {
+                        if ui.button("Separar selecionado").clicked() {
+                            separar_bone = true;
+                        }
+                        if ui
+                            .button(format!("{}  Excluir", icon::TRASH))
+                            .clicked()
+                        {
+                            del_bone = true;
+                        }
+                    });
                 }
                 ui.weak(
-                    "Criar: arraste para desenhar um osso; comece perto da ponta de outro para encadear. Posar: arraste o corpo para girar, ou a bolinha da articulação para mover.",
+                    "Criar: arraste uma peça; comece sobre um ponto de ligação para encaixar. Posar: arraste o corpo para girar, a bola da origem para mover (encaixa ao soltar perto de outro ponto) e a bola da ponta para redimensionar.",
                 );
             }
         });
@@ -3930,6 +4257,11 @@ impl SketchMotionApp {
                 self.document.skeletons[si].remove_bone(bid);
                 self.rig_sel_bone = None;
                 self.dirty = true;
+            }
+        }
+        if separar_bone {
+            if let (Some(si), Some(bid)) = (self.rig_active_index(), self.rig_sel_bone) {
+                self.rig_separar(si, bid);
             }
         }
 
@@ -4198,6 +4530,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_paletas(ctx);
         self.janela_camadas(ctx);
         self.janela_rig(ctx);
+        self.ensure_piece_textures(ctx);
         self.barra_frames(ctx);
         self.janela_reproducao(ctx);
 
@@ -4610,7 +4943,7 @@ impl eframe::App for SketchMotionApp {
                                         }
                                     }
                                     if !down {
-                                        self.rig_dragging = RigDrag::None;
+                                        self.rig_release_pose(si);
                                     }
                                 }
                             }

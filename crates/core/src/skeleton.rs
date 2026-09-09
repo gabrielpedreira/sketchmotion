@@ -26,6 +26,10 @@ pub enum BoneShape {
     Hip,
     /// Cabeca — elipse.
     Head,
+    /// Mao.
+    Mao,
+    /// Pe.
+    Pe,
 }
 
 /// Um osso: transform LOCAL relativo ao pai + comprimento visual.
