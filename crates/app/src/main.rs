@@ -10,7 +10,7 @@
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{Anchor, Color, Document, VectorObject};
-use sketchmotion_render::{render_document, render_frame, render_frame_alpha, PixelImage};
+use sketchmotion_render::{render_frame_alpha, render_layers_alpha, PixelImage};
 use sketchmotion_tools::Tool;
 
 const CANVAS_W: u32 = 800;
@@ -622,6 +622,26 @@ fn map_piece(
     (w_orig.0 + dx * cc - dy * ss, w_orig.1 + dx * ss + dy * cc)
 }
 
+fn upscale_nn(w: u32, h: u32, rgba: &[u8], scale: u32) -> (u32, u32, Vec<u8>) {
+    if scale <= 1 {
+        return (w, h, rgba.to_vec());
+    }
+    let (w2, h2) = (w * scale, h * scale);
+    let mut out = vec![0u8; (w2 * h2 * 4) as usize];
+    for y in 0..h2 {
+        let sy = y / scale;
+        for x in 0..w2 {
+            let sx = x / scale;
+            let sidx = ((sy * w + sx) * 4) as usize;
+            let didx = ((y * w2 + x) * 4) as usize;
+            if sidx + 4 <= rgba.len() {
+                out[didx..didx + 4].copy_from_slice(&rgba[sidx..sidx + 4]);
+            }
+        }
+    }
+    (w2, h2, out)
+}
+
 fn refl_x(axis: Option<f32>, x: f32) -> f32 {
     match axis {
         Some(a) => 2.0 * a - x,
@@ -1003,6 +1023,7 @@ struct SketchMotionApp {
     rig_sep_guard: Option<(u32, f32, f32)>,
     sel_rig: Option<usize>,
     current_path: Option<std::path::PathBuf>,
+    export_scale: u32,
     pixel_mode: bool,
     screen: Screen,
     home_w: u32,
@@ -1134,6 +1155,7 @@ impl SketchMotionApp {
             rig_sep_guard: None,
             sel_rig: None,
             current_path: None,
+            export_scale: 1,
             pixel_mode: false,
             screen: Screen::Home,
             home_w: 800,
@@ -1576,20 +1598,20 @@ impl SketchMotionApp {
             .set_file_name("desenho.png")
             .save_file()
         {
-            let img = render_frame(
+            let img = render_frame_alpha(
                 self.document.width,
                 self.document.height,
-                self.document.background,
                 &self.document.layers,
                 &self.document.vectors,
             );
-            self.status = match sketchmotion_io::export_png(
-                img.width as u32,
-                img.height as u32,
+            let (ew, eh, ergba) = upscale_nn(
+                self.document.width,
+                self.document.height,
                 &img.rgba,
-                &path,
-            ) {
-                Ok(()) => format!("Exportado: {}", path.display()),
+                self.export_scale,
+            );
+            self.status = match sketchmotion_io::export_png(ew, eh, &ergba, &path) {
+                Ok(()) => format!("Exportado ({ew}x{eh}): {}", path.display()),
                 Err(e) => format!("Erro ao exportar: {e}"),
             };
         }
@@ -1725,20 +1747,24 @@ impl SketchMotionApp {
             .set_file_name("animacao.gif")
             .save_file()
         {
-            let (w, h, bg, fps) = (
+            let (w, h, fps, sc) = (
                 self.document.width,
                 self.document.height,
-                self.document.background,
                 self.document.fps,
+                self.export_scale.max(1),
             );
+            let (ew, eh) = (w * sc, h * sc);
             let mut frames: Vec<Vec<u8>> = Vec::with_capacity(self.document.frames.len());
             for f in &self.document.frames {
-                let img = render_frame(w, h, bg, &f.layers, &f.vectors);
-                frames.push(img.rgba);
+                let img = render_frame_alpha(w, h, &f.layers, &f.vectors);
+                let (_, _, up) = upscale_nn(w, h, &img.rgba, sc);
+                frames.push(up);
             }
             let n = frames.len();
-            self.status = match sketchmotion_io::export_gif(w, h, &frames, fps, &path) {
-                Ok(()) => format!("GIF exportado ({n} frames, {fps} fps): {}", path.display()),
+            self.status = match sketchmotion_io::export_gif(ew, eh, &frames, fps, &path) {
+                Ok(()) => {
+                    format!("GIF exportado ({n} frames, {fps} fps, {ew}x{eh}): {}", path.display())
+                }
                 Err(e) => format!("Erro no GIF: {e}"),
             };
         }
@@ -1752,17 +1778,14 @@ impl SketchMotionApp {
             return;
         }
         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            let (w, h, bg) = (
-                self.document.width,
-                self.document.height,
-                self.document.background,
-            );
+            let (w, h, sc) = (self.document.width, self.document.height, self.export_scale.max(1));
             let mut ok = 0usize;
             let mut erro: Option<String> = None;
             for (i, f) in self.document.frames.iter().enumerate() {
-                let img = render_frame(w, h, bg, &f.layers, &f.vectors);
+                let img = render_frame_alpha(w, h, &f.layers, &f.vectors);
+                let (ew, eh, up) = upscale_nn(w, h, &img.rgba, sc);
                 let fp = dir.join(format!("frame_{:04}.png", i + 1));
-                match sketchmotion_io::export_png(w, h, &img.rgba, &fp) {
+                match sketchmotion_io::export_png(ew, eh, &up, &fp) {
                     Ok(()) => ok += 1,
                     Err(e) => {
                         erro = Some(e);
@@ -2331,7 +2354,8 @@ impl SketchMotionApp {
             self.status = "Camada bloqueada".into();
             return;
         }
-        let PixelImage { width, height, mut rgba } = render_document(&self.document);
+        let PixelImage { width, height, mut rgba } =
+            render_layers_alpha(self.document.width, self.document.height, &self.document.layers);
         self.rasterizar_vetores(&mut rgba, width as u32, height as u32);
         let idx = |x: i32, y: i32| ((y * w + x) * 4) as usize;
         let ti = idx(x0, y0);
@@ -2604,10 +2628,9 @@ impl SketchMotionApp {
         }
         ctx.request_repaint();
         let pf = self.play_frame.min(n.saturating_sub(1));
-        let img = render_frame(
+        let img = render_frame_alpha(
             self.document.width,
             self.document.height,
-            self.document.background,
             &self.document.frames[pf].layers,
             &self.document.frames[pf].vectors,
         );
@@ -2663,7 +2686,7 @@ impl SketchMotionApp {
     /// Timeline de frames (rodapé): miniaturas selecionáveis, navegação, FPS
     /// e onion skin.
     fn barra_frames(&mut self, ctx: &egui::Context) {
-        let (dw, dh, bg) = (self.document.width, self.document.height, self.document.background);
+        let (dw, dh) = (self.document.width, self.document.height);
         let th_h = 56usize;
         let th_w = (((th_h as f32) * dw as f32 / dh as f32).round() as usize).clamp(24, 160);
         let n = self.document.frame_count();
@@ -2673,12 +2696,11 @@ impl SketchMotionApp {
         for i in 0..n {
             if self.frame_thumbs[i].is_none() {
                 let full = if i == self.document.current {
-                    render_frame(dw, dh, bg, &self.document.layers, &self.document.vectors)
+                    render_frame_alpha(dw, dh, &self.document.layers, &self.document.vectors)
                 } else {
-                    render_frame(
+                    render_frame_alpha(
                         dw,
                         dh,
-                        bg,
                         &self.document.frames[i].layers,
                         &self.document.frames[i].vectors,
                     )
@@ -4846,7 +4868,12 @@ impl eframe::App for SketchMotionApp {
         });
         let editando = ctx.wants_keyboard_input();
         if self.dirty || self.texture.is_none() {
-            let PixelImage { width, height, rgba } = render_document(&self.document);
+            let PixelImage { width, height, rgba } = render_frame_alpha(
+                self.document.width,
+                self.document.height,
+                &self.document.layers,
+                &self.document.vectors,
+            );
             let image =
                 egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
             match &mut self.texture {
@@ -4939,6 +4966,14 @@ impl eframe::App for SketchMotionApp {
                         ui.close_menu();
                     }
                 });
+                ui.separator();
+                ui.label("Escala export:")
+                    .on_hover_text("Multiplica o tamanho na exportação (pixel art nítido)");
+                ui.add(
+                    egui::DragValue::new(&mut self.export_scale)
+                        .range(1..=16)
+                        .suffix("x"),
+                );
                 if !self.status.is_empty() {
                     ui.separator();
                     ui.label(&self.status);
@@ -5036,12 +5071,37 @@ impl eframe::App for SketchMotionApp {
                 .drag_to_scroll(false)
                 .show(ui, |ui| {
                     let size = egui::vec2(doc_w * zoom, doc_h * zoom);
-                    let image =
-                        egui::Image::from_texture(egui::load::SizedTexture::new(tex_id, size))
-                            .fit_to_exact_size(size)
-                            .sense(egui::Sense::click_and_drag());
-                    let response = ui.add(image);
-                    let rect = response.rect;
+                    let (rect, response) =
+                        ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                    // Fundo xadrez indica transparência; a imagem (com alfa) vai por cima.
+                    {
+                        let p = ui.painter_at(rect);
+                        let cell = 8.0_f32.max(zoom);
+                        p.rect_filled(rect, 0.0, egui::Color32::from_gray(210));
+                        let nx = (rect.width() / cell).ceil() as i32;
+                        let ny = (rect.height() / cell).ceil() as i32;
+                        for j in 0..ny {
+                            for i in 0..nx {
+                                if (i + j) % 2 == 0 {
+                                    continue;
+                                }
+                                let x = rect.left() + i as f32 * cell;
+                                let y = rect.top() + j as f32 * cell;
+                                let cr = egui::Rect::from_min_size(
+                                    egui::pos2(x, y),
+                                    egui::vec2(cell, cell),
+                                )
+                                .intersect(rect);
+                                p.rect_filled(cr, 0.0, egui::Color32::from_gray(165));
+                            }
+                        }
+                        p.image(
+                            tex_id,
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
 
                     if self.pixel_mode && zoom >= 6.0 {
                         let painter = ui.painter_at(rect);
