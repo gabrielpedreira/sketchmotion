@@ -1103,9 +1103,17 @@ struct SketchMotionApp {
     fill_tolerance: i32,
     // frames / animação
     onion: bool,
-    frame_thumbs: Vec<Option<egui::TextureHandle>>,
     onion_tex: Option<egui::TextureHandle>,
     onion_for: Option<usize>,
+    // timelines (faixas)
+    view_both: bool,
+    play_both: bool,
+    /// Cache de miniaturas por faixa/frame (evita re-renderizar tudo a cada quadro).
+    track_thumbs: Vec<Vec<Option<egui::TextureHandle>>>,
+    /// Cache das texturas de sobreposição entre timelines (onion/ver ambas).
+    between_cache: Vec<Option<egui::TextureHandle>>,
+    /// Chave do cache acima: (faixa ativa, página atual, nº de faixas, onion_between, view_both).
+    between_key: Option<(usize, usize, usize, bool, bool)>,
     // pincéis
     brush_kind: usize,
     rng: u32,
@@ -1230,9 +1238,13 @@ impl SketchMotionApp {
             lasso_points: Vec::new(),
             fill_tolerance: 24,
             onion: true,
-            frame_thumbs: Vec::new(),
             onion_tex: None,
             onion_for: None,
+            view_both: false,
+            play_both: false,
+            track_thumbs: Vec::new(),
+            between_cache: Vec::new(),
+            between_key: None,
             brush_kind: 0,
             rng: 0x2545_F491,
             smudge: None,
@@ -1595,7 +1607,9 @@ impl SketchMotionApp {
             1.0
         };
         self.dirty = true;
-        self.frame_thumbs.clear();
+        self.track_thumbs.clear();
+        self.between_cache.clear();
+        self.between_key = None;
         self.onion_tex = None;
         self.onion_for = None;
         self.status = if pixel {
@@ -1671,7 +1685,9 @@ impl SketchMotionApp {
                     self.active_layer = 0;
                     self.last_pos = None;
                     self.dirty = true;
-                    self.frame_thumbs.clear();
+                    self.track_thumbs.clear();
+                    self.between_cache.clear();
+                    self.between_key = None;
                     self.onion_tex = None;
                     self.onion_for = None;
                     self.pixel_mode = self.document.pixel_art;
@@ -2702,7 +2718,18 @@ impl SketchMotionApp {
         if !self.playing {
             return;
         }
-        let n = self.document.frame_count();
+        let both = self.play_both && self.document.tracks.len() > 1;
+        let n = if both {
+            self.document
+                .tracks
+                .iter()
+                .map(|t| t.frames.len())
+                .max()
+                .unwrap_or(1)
+                .max(1)
+        } else {
+            self.document.frame_count()
+        };
         let fps = self.document.fps.max(1) as f32;
         let step = 1.0 / fps;
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
@@ -2724,16 +2751,24 @@ impl SketchMotionApp {
         }
         ctx.request_repaint();
         let pf = self.play_frame.min(n.saturating_sub(1));
-        let img = render_frame_alpha(
-            self.document.width,
-            self.document.height,
-            &self.document.frames[pf].layers,
-            &self.document.frames[pf].vectors,
-        );
-        let ci = egui::ColorImage::from_rgba_unmultiplied(
-            [img.width as usize, img.height as usize],
-            &img.rgba,
-        );
+        let ci = if both {
+            let rgba = self.compose_tracks_at(pf);
+            egui::ColorImage::from_rgba_unmultiplied(
+                [self.document.width as usize, self.document.height as usize],
+                &rgba,
+            )
+        } else {
+            let img = render_frame_alpha(
+                self.document.width,
+                self.document.height,
+                &self.document.frames[pf].layers,
+                &self.document.frames[pf].vectors,
+            );
+            egui::ColorImage::from_rgba_unmultiplied(
+                [img.width as usize, img.height as usize],
+                &img.rgba,
+            )
+        };
         match &mut self.play_tex {
             Some(t) => t.set(ci, egui::TextureOptions::NEAREST),
             None => {
@@ -2779,138 +2814,414 @@ impl SketchMotionApp {
         }
     }
 
-    /// Timeline de frames (rodapé): miniaturas selecionáveis, navegação, FPS
-    /// e onion skin.
-    fn barra_frames(&mut self, ctx: &egui::Context) {
+    /// Garante o cache de miniaturas (`track_thumbs[faixa][frame]`), refazendo
+    /// apenas o que mudou. Sem edição em andamento nada é re-renderizado.
+    fn ensure_track_thumbs(&mut self, ctx: &egui::Context, th_w: usize, th_h: usize) {
         let (dw, dh) = (self.document.width, self.document.height);
-        let th_h = 56usize;
-        let th_w = (((th_h as f32) * dw as f32 / dh as f32).round() as usize).clamp(24, 160);
-        let n = self.document.frame_count();
-        if self.frame_thumbs.len() != n {
-            self.frame_thumbs.resize(n, None);
+        let ntr = self.document.tracks.len();
+        let active = self.document.active_track;
+        if self.track_thumbs.len() != ntr {
+            self.track_thumbs = vec![Vec::new(); ntr];
         }
-        for i in 0..n {
-            if self.frame_thumbs[i].is_none() {
-                let full = if i == self.document.current {
-                    render_frame_alpha(dw, dh, &self.document.layers, &self.document.vectors)
+        for ti in 0..ntr {
+            let total = if ti == active {
+                self.document.frames.len()
+            } else {
+                self.document.tracks[ti].frames.len()
+            };
+            if self.track_thumbs[ti].len() != total {
+                self.track_thumbs[ti] = vec![None; total];
+            }
+            for fi in 0..total {
+                // O frame atual da faixa ativa é refeito só quando há edição.
+                if ti == active && fi == self.document.current && self.dirty {
+                    self.track_thumbs[ti][fi] = None;
+                }
+                if self.track_thumbs[ti][fi].is_some() {
+                    continue;
+                }
+                let full = if ti == active {
+                    if fi == self.document.current {
+                        render_frame_alpha(dw, dh, &self.document.layers, &self.document.vectors)
+                    } else {
+                        render_frame_alpha(
+                            dw,
+                            dh,
+                            &self.document.frames[fi].layers,
+                            &self.document.frames[fi].vectors,
+                        )
+                    }
                 } else {
                     render_frame_alpha(
                         dw,
                         dh,
-                        &self.document.frames[i].layers,
-                        &self.document.frames[i].vectors,
+                        &self.document.tracks[ti].frames[fi].layers,
+                        &self.document.tracks[ti].frames[fi].vectors,
                     )
                 };
                 let img = thumb_image(&full, th_w, th_h);
-                self.frame_thumbs[i] =
-                    Some(ctx.load_texture(format!("thumb{i}"), img, egui::TextureOptions::NEAREST));
+                self.track_thumbs[ti][fi] = Some(ctx.load_texture(
+                    format!("thumb_{ti}_{fi}"),
+                    img,
+                    egui::TextureOptions::NEAREST,
+                ));
             }
         }
-        let mut act_add = false;
-        let mut act_dup = false;
-        let mut act_del = false;
-        let mut act_prev = false;
-        let mut act_next = false;
-        let mut act_play = false;
-        let mut goto: Option<usize> = None;
+    }
+
+    /// Timeline (rodapé): cada faixa de animação é uma "lane" completa, com
+    /// seu botão de selecionar, excluir, controles de frame e tira de frames.
+    fn barra_frames(&mut self, ctx: &egui::Context) {
+        let (dw, dh) = (self.document.width, self.document.height);
+        let th_h = 44usize;
+        let th_w = (((th_h as f32) * dw as f32 / dh as f32).round() as usize).clamp(20, 140);
+
+        // Ações diferidas (aplicadas depois de fechar os painéis).
+        let mut track_add = false;
+        let mut sel_track: Option<usize> = None;
+        let mut del_track: Option<usize> = None;
+        let mut do_play: Option<usize> = None;
+        let mut do_add: Option<usize> = None;
+        let mut do_dup: Option<usize> = None;
+        let mut do_delframe: Option<usize> = None;
+        let mut do_prev: Option<usize> = None;
+        let mut do_next: Option<usize> = None;
+        let mut goto: Option<(usize, usize)> = None;
+
+        let ntr = self.document.tracks.len();
+        let active = self.document.active_track;
+
+        // Prepara o cache de miniaturas ANTES do painel: durante o desenho
+        // (self.dirty) só a miniatura do frame atual da faixa ativa é refeita.
+        self.ensure_track_thumbs(ctx, th_w, th_h);
+
         egui::TopBottomPanel::bottom("timeline")
             .resizable(false)
             .show(ctx, |ui| {
                 ui.add_space(4.0);
+                // Barra superior: adicionar timeline + opções globais.
                 ui.horizontal(|ui| {
-                    let play_lbl = if self.playing { "⏸ Parar" } else { "▶ Play" };
                     if ui
-                        .button(play_lbl)
-                        .on_hover_text("Rodar a animação no FPS definido")
+                        .button("＋ Timeline")
+                        .on_hover_text("Adicionar nova timeline (uma camada de animação)")
                         .clicked()
                     {
-                        act_play = true;
+                        track_add = true;
                     }
                     ui.separator();
-                    if ui.button("＋ Frame").on_hover_text("Novo frame após o atual").clicked() {
-                        act_add = true;
-                    }
-                    if ui.button("Duplicar").clicked() {
-                        act_dup = true;
-                    }
-                    if ui.add_enabled(n > 1, egui::Button::new("Excluir")).clicked() {
-                        act_del = true;
-                    }
-                    ui.separator();
-                    if ui.button("◀").clicked() {
-                        act_prev = true;
-                    }
-                    ui.label(format!("Frame {}/{}", self.document.current + 1, n));
-                    if ui.button("▶").clicked() {
-                        act_next = true;
+                    if ui
+                        .checkbox(&mut self.document.onion_between, "Onion skin entre timelines")
+                        .on_hover_text(
+                            "Vê a mesma página das outras timelines translúcida \
+                             (desliga o onion entre páginas)",
+                        )
+                        .changed()
+                    {
+                        if self.document.onion_between {
+                            self.onion = false;
+                        }
+                        self.dirty = true;
                     }
                     ui.separator();
-                    ui.label("FPS:");
-                    let mut fps = self.document.fps as i32;
-                    if ui.add(egui::Slider::new(&mut fps, 1..=60)).changed() {
-                        self.document.fps = fps.clamp(1, 60) as u32;
-                    }
-                    nudge_u32(ui, &mut self.document.fps, 1, 60);
-                    ui.separator();
-                    ui.checkbox(&mut self.onion, "Onion skin")
-                        .on_hover_text("Mostra o frame anterior a 30%");
+                    ui.checkbox(&mut self.view_both, "Ver ambas")
+                        .on_hover_text("Compõe todas as timelines visíveis no canvas");
+                    ui.checkbox(&mut self.play_both, "Play ambas")
+                        .on_hover_text("Reproduz todas as timelines juntas");
                 });
-                ui.add_space(4.0);
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        for i in 0..n {
-                            let sel = i == self.document.current;
-                            let (rect, resp) = ui.allocate_exact_size(
-                                egui::vec2(th_w as f32, th_h as f32 + 16.0),
-                                egui::Sense::click(),
-                            );
-                            let img_rect = egui::Rect::from_min_size(
-                                rect.min,
-                                egui::vec2(th_w as f32, th_h as f32),
-                            );
-                            let painter = ui.painter_at(rect);
-                            painter.rect_filled(img_rect, 0.0, egui::Color32::from_gray(30));
-                            if let Some(tex) = &self.frame_thumbs[i] {
-                                painter.image(
-                                    tex.id(),
-                                    img_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-                            let cor = if sel {
-                                egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
-                            } else {
-                                egui::Color32::from_gray(90)
-                            };
-                            painter.rect_stroke(
-                                img_rect,
-                                0.0,
-                                egui::Stroke::new(if sel { 2.0 } else { 1.0 }, cor),
-                            );
-                            painter.text(
-                                egui::pos2(rect.center().x, img_rect.bottom() + 8.0),
-                                egui::Align2::CENTER_CENTER,
-                                format!("{}", i + 1),
-                                egui::FontId::proportional(12.0),
-                                cor,
-                            );
-                            if resp.clicked() {
-                                goto = Some(i);
-                            }
-                            ui.add_space(6.0);
+                ui.separator();
+
+                // Uma lane por timeline.
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for ti in 0..ntr {
+                            let is_active = ti == active;
+                            ui.horizontal(|ui| {
+                                // Coluna esquerda: selecionar (●) + excluir (✕).
+                                ui.vertical(|ui| {
+                                    let mark = if is_active { "●" } else { "○" };
+                                    let sel_btn = egui::Button::new(mark)
+                                        .min_size(egui::vec2(36.0, 30.0))
+                                        .fill(if is_active {
+                                            egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                                        } else {
+                                            egui::Color32::from_gray(60)
+                                        });
+                                    if ui
+                                        .add(sel_btn)
+                                        .on_hover_text("Selecionar (só a selecionada é editável)")
+                                        .clicked()
+                                    {
+                                        sel_track = Some(ti);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            ntr > 1,
+                                            egui::Button::new(egui_phosphor::regular::TRASH)
+                                                .min_size(egui::vec2(36.0, 24.0)),
+                                        )
+                                        .on_hover_text("Excluir esta timeline")
+                                        .clicked()
+                                    {
+                                        del_track = Some(ti);
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                // Coluna direita: controles + tira de frames.
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        let (cur, total) = if is_active {
+                                            (
+                                                self.document.current,
+                                                self.document.frames.len().max(1),
+                                            )
+                                        } else {
+                                            let t = &self.document.tracks[ti];
+                                            let tot = t.frames.len().max(1);
+                                            (t.current.min(tot - 1), tot)
+                                        };
+                                        let play_lbl = if self.playing && is_active {
+                                            "⏸ Parar"
+                                        } else {
+                                            "▶ Play"
+                                        };
+                                        if ui
+                                            .button(play_lbl)
+                                            .on_hover_text("Rodar esta timeline no FPS definido")
+                                            .clicked()
+                                        {
+                                            do_play = Some(ti);
+                                        }
+                                        ui.separator();
+                                        if ui
+                                            .button("＋ Frame")
+                                            .on_hover_text("Novo frame após o atual")
+                                            .clicked()
+                                        {
+                                            do_add = Some(ti);
+                                        }
+                                        if ui.button("Duplicar").clicked() {
+                                            do_dup = Some(ti);
+                                        }
+                                        if ui
+                                            .add_enabled(total > 1, egui::Button::new("Excluir"))
+                                            .clicked()
+                                        {
+                                            do_delframe = Some(ti);
+                                        }
+                                        ui.separator();
+                                        if ui.button("◀").clicked() {
+                                            do_prev = Some(ti);
+                                        }
+                                        ui.label(format!("Frame {}/{}", cur + 1, total));
+                                        if ui.button("▶").clicked() {
+                                            do_next = Some(ti);
+                                        }
+                                        ui.separator();
+                                        ui.label("FPS:");
+                                        if is_active {
+                                            let mut fps = self.document.fps as i32;
+                                            if ui.add(egui::Slider::new(&mut fps, 1..=60)).changed() {
+                                                self.document.fps = fps.clamp(1, 60) as u32;
+                                                self.dirty = true;
+                                            }
+                                            nudge_u32(ui, &mut self.document.fps, 1, 60);
+                                        } else {
+                                            let mut fps = self.document.tracks[ti].fps as i32;
+                                            if ui.add(egui::Slider::new(&mut fps, 1..=60)).changed() {
+                                                self.document.tracks[ti].fps =
+                                                    fps.clamp(1, 60) as u32;
+                                                self.dirty = true;
+                                            }
+                                            nudge_u32(ui, &mut self.document.tracks[ti].fps, 1, 60);
+                                        }
+                                        ui.separator();
+                                        if ui
+                                            .checkbox(&mut self.onion, "Onion skin")
+                                            .on_hover_text("Mostra o frame anterior a 30%")
+                                            .changed()
+                                        {
+                                            if self.onion {
+                                                self.document.onion_between = false;
+                                            }
+                                        }
+                                    });
+                                    // Tira de frames desta timeline.
+                                    ui.push_id(ti, |ui| {
+                                        egui::ScrollArea::horizontal().show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                let total = if is_active {
+                                                    self.document.frames.len()
+                                                } else {
+                                                    self.document.tracks[ti].frames.len()
+                                                };
+                                                let cur = if is_active {
+                                                    self.document.current
+                                                } else {
+                                                    self.document.tracks[ti].current
+                                                };
+                                                for fi in 0..total {
+                                                    let sel = fi == cur;
+                                                    // Miniatura vem do cache (preparado antes do painel).
+                                                    let tex = match self
+                                                        .track_thumbs
+                                                        .get(ti)
+                                                        .and_then(|v| v.get(fi))
+                                                        .and_then(|o| o.as_ref())
+                                                    {
+                                                        Some(t) => t.clone(),
+                                                        None => continue,
+                                                    };
+                                                    let (rect, resp) = ui.allocate_exact_size(
+                                                        egui::vec2(
+                                                            th_w as f32,
+                                                            th_h as f32 + 14.0,
+                                                        ),
+                                                        egui::Sense::click(),
+                                                    );
+                                                    let img_rect = egui::Rect::from_min_size(
+                                                        rect.min,
+                                                        egui::vec2(th_w as f32, th_h as f32),
+                                                    );
+                                                    let painter = ui.painter_at(rect);
+                                                    painter.rect_filled(
+                                                        img_rect,
+                                                        0.0,
+                                                        egui::Color32::from_gray(30),
+                                                    );
+                                                    painter.image(
+                                                        tex.id(),
+                                                        img_rect,
+                                                        egui::Rect::from_min_max(
+                                                            egui::pos2(0.0, 0.0),
+                                                            egui::pos2(1.0, 1.0),
+                                                        ),
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                    let cor = if sel && is_active {
+                                                        egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                                                    } else if sel {
+                                                        egui::Color32::from_gray(150)
+                                                    } else {
+                                                        egui::Color32::from_gray(90)
+                                                    };
+                                                    painter.rect_stroke(
+                                                        img_rect,
+                                                        0.0,
+                                                        egui::Stroke::new(
+                                                            if sel { 2.0 } else { 1.0 },
+                                                            cor,
+                                                        ),
+                                                    );
+                                                    painter.text(
+                                                        egui::pos2(
+                                                            rect.center().x,
+                                                            img_rect.bottom() + 7.0,
+                                                        ),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        format!("{}", fi + 1),
+                                                        egui::FontId::proportional(11.0),
+                                                        cor,
+                                                    );
+                                                    if resp.clicked() {
+                                                        goto = Some((ti, fi));
+                                                    }
+                                                    ui.add_space(5.0);
+                                                }
+                                            });
+                                        });
+                                    });
+                                });
+                            });
+                            ui.separator();
                         }
                     });
-                });
-                ui.add_space(4.0);
+                ui.add_space(2.0);
             });
-        if goto.is_some() || act_add || act_dup || act_del || act_prev || act_next {
+
+        // ---- Aplicar ações ----
+        if track_add {
+            self.document.add_track();
+            self.onion_for = None;
+            self.dirty = true;
             self.playing = false;
         }
-        if act_play {
+        if let Some(ti) = sel_track {
+            self.document.go_to_track(ti);
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some(ti) = del_track {
+            self.document.remove_track(ti);
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some((ti, fi)) = goto {
+            if ti != self.document.active_track {
+                self.document.go_to_track(ti);
+            }
+            self.document.go_to_frame(fi);
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some(ti) = do_prev {
+            if ti != self.document.active_track {
+                self.document.go_to_track(ti);
+            }
+            if self.document.current > 0 {
+                self.document.go_to_frame(self.document.current - 1);
+            }
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some(ti) = do_next {
+            if ti != self.document.active_track {
+                self.document.go_to_track(ti);
+            }
+            if self.document.current + 1 < self.document.frames.len() {
+                self.document.go_to_frame(self.document.current + 1);
+            }
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some(ti) = do_add {
+            if ti != self.document.active_track {
+                self.document.go_to_track(ti);
+            }
+            self.document.add_frame();
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some(ti) = do_dup {
+            if ti != self.document.active_track {
+                self.document.go_to_track(ti);
+            }
+            self.document.duplicate_frame();
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some(ti) = do_delframe {
+            if ti != self.document.active_track {
+                self.document.go_to_track(ti);
+            }
+            let c = self.document.current;
+            self.document.remove_frame(c);
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some(ti) = do_play {
+            if ti != self.document.active_track {
+                self.document.go_to_track(ti);
+            }
             if self.playing {
                 self.playing = false;
             } else {
@@ -2921,40 +3232,42 @@ impl SketchMotionApp {
                 self.playing = true;
             }
         }
-        if let Some(i) = goto {
-            self.document.go_to_frame(i);
-            self.dirty = true;
-            self.onion_for = None;
+    }
+
+    /// Compõe todas as timelines visíveis no playhead dado (para "Play ambas").
+    /// Faz over-blend de baixo (índice 0) para cima; devolve RGBA não-premult.
+    fn compose_tracks_at(&self, playhead: usize) -> Vec<u8> {
+        let w = self.document.width as usize;
+        let h = self.document.height as usize;
+        let mut base = vec![0u8; w * h * 4];
+        for t in &self.document.tracks {
+            if !t.visible || t.frames.is_empty() {
+                continue;
+            }
+            let idx = playhead % t.frames.len();
+            let top = render_frame_alpha(
+                self.document.width,
+                self.document.height,
+                &t.frames[idx].layers,
+                &t.frames[idx].vectors,
+            );
+            for p in 0..(w * h) {
+                let sa = top.rgba[p * 4 + 3] as f32 / 255.0;
+                if sa <= 0.0 {
+                    continue;
+                }
+                let da = base[p * 4 + 3] as f32 / 255.0;
+                let outa = sa + da * (1.0 - sa);
+                for c in 0..3 {
+                    let sc = top.rgba[p * 4 + c] as f32;
+                    let dc = base[p * 4 + c] as f32;
+                    let outc = (sc * sa + dc * da * (1.0 - sa)) / outa.max(1e-6);
+                    base[p * 4 + c] = outc.round().clamp(0.0, 255.0) as u8;
+                }
+                base[p * 4 + 3] = (outa * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
         }
-        if act_prev && self.document.current > 0 {
-            self.document.go_to_frame(self.document.current - 1);
-            self.dirty = true;
-            self.onion_for = None;
-        }
-        if act_next && self.document.current + 1 < n {
-            self.document.go_to_frame(self.document.current + 1);
-            self.dirty = true;
-            self.onion_for = None;
-        }
-        if act_add {
-            self.document.add_frame();
-            self.frame_thumbs.clear();
-            self.dirty = true;
-            self.onion_for = None;
-        }
-        if act_dup {
-            self.document.duplicate_frame();
-            self.frame_thumbs.clear();
-            self.dirty = true;
-            self.onion_for = None;
-        }
-        if act_del {
-            let c = self.document.current;
-            self.document.remove_frame(c);
-            self.frame_thumbs.clear();
-            self.dirty = true;
-            self.onion_for = None;
-        }
+        base
     }
 
     /// Barra de opções (abaixo do menu): cada ferramenta abre aqui o seu
@@ -4983,9 +5296,13 @@ impl eframe::App for SketchMotionApp {
                 }
             }
             self.dirty = false;
+            // Invalida só a miniatura do frame atual da faixa ativa (barato).
+            let at = self.document.active_track;
             let cf = self.document.current;
-            if cf < self.frame_thumbs.len() {
-                self.frame_thumbs[cf] = None;
+            if let Some(tv) = self.track_thumbs.get_mut(at) {
+                if cf < tv.len() {
+                    tv[cf] = None;
+                }
             }
             self.onion_for = None;
         }
@@ -5251,7 +5568,7 @@ impl eframe::App for SketchMotionApp {
                         }
                     }
 
-                    if self.onion && self.document.current > 0 {
+                    if self.onion && !self.document.onion_between && self.document.current > 0 {
                         let prev = self.document.current - 1;
                         if self.onion_for != Some(prev) || self.onion_tex.is_none() {
                             let oi = render_frame_alpha(
@@ -5278,6 +5595,67 @@ impl eframe::App for SketchMotionApp {
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                                 egui::Color32::from_white_alpha(77),
                             );
+                        }
+                    }
+
+                    // Onion entre timelines / ver ambas: desenha as outras faixas.
+                    // As texturas ficam em cache; só refazemos quando muda a
+                    // página, a faixa ativa, o nº de faixas ou o modo de exibição.
+                    if (self.document.onion_between || self.view_both)
+                        && self.document.tracks.len() > 1
+                    {
+                        let cur = self.document.current;
+                        let act = self.document.active_track;
+                        let ntr = self.document.tracks.len();
+                        let alpha: u8 = if self.document.onion_between { 90 } else { 200 };
+                        let key = (act, cur, ntr, self.document.onion_between, self.view_both);
+                        if self.between_key != Some(key) {
+                            let mut cache: Vec<Option<egui::TextureHandle>> = vec![None; ntr];
+                            for ti in 0..ntr {
+                                if ti == act {
+                                    continue;
+                                }
+                                let visible = self.document.tracks[ti].visible;
+                                let flen = self.document.tracks[ti].frames.len();
+                                if !visible || flen == 0 {
+                                    continue;
+                                }
+                                let page = if self.document.onion_between {
+                                    cur.min(flen - 1)
+                                } else {
+                                    self.document.tracks[ti].current.min(flen - 1)
+                                };
+                                let oi = render_frame_alpha(
+                                    self.document.width,
+                                    self.document.height,
+                                    &self.document.tracks[ti].frames[page].layers,
+                                    &self.document.tracks[ti].frames[page].vectors,
+                                );
+                                let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                    [oi.width as usize, oi.height as usize],
+                                    &oi.rgba,
+                                );
+                                cache[ti] = Some(ui.ctx().load_texture(
+                                    format!("track_overlay_{ti}"),
+                                    ci,
+                                    egui::TextureOptions::NEAREST,
+                                ));
+                            }
+                            self.between_cache = cache;
+                            self.between_key = Some(key);
+                        }
+                        for ti in 0..ntr {
+                            if let Some(Some(tex)) = self.between_cache.get(ti) {
+                                ui.painter_at(rect).image(
+                                    tex.id(),
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::from_white_alpha(alpha),
+                                );
+                            }
                         }
                     }
 
