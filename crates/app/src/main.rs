@@ -416,37 +416,42 @@ fn preset_cavalo(cx: f32, cy: f32, s: f32) -> PSkel {
 
 fn preset_raptor(cx: f32, cy: f32, s: f32) -> PSkel {
     let mut sk = PSkel::new("Raptor");
-    let (rx, ry) = pw(cx, cy, s, -0.55, 0.0);
-    let torso = sk.add_bone_world(None, rx, ry, 0.0, 1.05 * s, PBS::Torso);
-    // pescoço + cabeça (frente, +x)
-    let (nx, ny) = pw(cx, cy, s, 0.45, -0.05);
-    let neck = sk.add_bone_world(Some(torso), nx, ny, (-0.4_f32).atan2(0.35), 0.35 * s, PBS::Limb);
-    let (hx, hy) = pw(cx, cy, s, 0.85, -0.35);
-    sk.add_bone_world(Some(neck), hx, hy, (0.0_f32).atan2(0.35), 0.38 * s, PBS::Head);
-    // cauda longa (3 segmentos, atrás -x subindo)
-    let (t0x, t0y) = pw(cx, cy, s, -0.55, -0.05);
-    let ta = (-0.18_f32).atan2(-0.6);
-    let t1 = sk.add_bone_world(Some(torso), t0x, t0y, ta, 0.5 * s, PBS::Limb);
-    let (t1x, t1y) = pw(cx, cy, s, -1.05, -0.2);
-    let t2 = sk.add_bone_world(Some(t1), t1x, t1y, (-0.1_f32).atan2(-0.6), 0.45 * s, PBS::Limb);
-    let (t2x, t2y) = pw(cx, cy, s, -1.6, -0.28);
-    sk.add_bone_world(Some(t2), t2x, t2y, (-0.05_f32).atan2(-0.5), 0.4 * s, PBS::Limb);
-    // bracinhos (2)
-    for off in [0.05_f32, -0.05] {
-        let (ax, ay) = pw(cx, cy, s, 0.3 + off, 0.05);
-        let ua = sk.add_bone_world(Some(torso), ax, ay, (0.35_f32).atan2(0.25), 0.28 * s, PBS::Limb);
-        let (fx, fy) = pw(cx, cy, s, 0.5 + off, 0.32);
-        sk.add_bone_world(Some(ua), fx, fy, (0.3_f32).atan2(0.05), 0.22 * s, PBS::Limb);
-    }
-    // pernas (2)
-    for off in [0.06_f32, -0.06] {
-        let (px, py) = pw(cx, cy, s, -0.05 + off, 0.12);
-        let th = sk.add_bone_world(Some(torso), px, py, (0.55_f32).atan2(0.2), 0.5 * s, PBS::Limb);
-        let (kx, ky) = pw(cx, cy, s, 0.05 + off, 0.6);
-        let sh = sk.add_bone_world(Some(th), kx, ky, (0.6_f32).atan2(-0.15), 0.42 * s, PBS::Limb);
-        let (fx, fy) = pw(cx, cy, s, -0.1 + off, 1.0);
-        sk.add_bone_world(Some(sh), fx, fy, (0.15_f32).atan2(0.5), 0.28 * s, PBS::Limb);
-    }
+    let ss = s * 3.6;
+    let sp = |nx: f32, ny: f32| (cx + (nx - 0.5) * ss, cy + (ny - 0.5) * ss * 0.6551);
+    let place = |sk: &mut PSkel, parent: Option<u32>, o: (f32, f32), t: (f32, f32), idx: u16| -> u32 {
+        let ow = sp(o.0, o.1);
+        let tw = sp(t.0, t.1);
+        let (dx, dy) = (tw.0 - ow.0, tw.1 - ow.1);
+        let ang = dy.atan2(dx);
+        let len = (dx * dx + dy * dy).sqrt().max(2.0);
+        let id = sk.add_bone_world(parent, ow.0, ow.1, ang, len, PBS::Limb);
+        if let Some(b) = sk.bone_mut(id) {
+            b.img = Some(idx);
+        }
+        id
+    };
+    let tronco = place(&mut sk, None, (0.308, 0.365), (0.532, 0.393), 4);
+    let toraxica = place(&mut sk, Some(tronco), (0.308, 0.365), (0.262, 0.3), 3);
+    let cervical = place(&mut sk, Some(toraxica), (0.262, 0.3), (0.196, 0.15), 2);
+    let maxilar = place(&mut sk, Some(cervical), (0.196, 0.15), (0.075, 0.115), 1);
+    let mandibula = place(&mut sk, Some(maxilar), (0.196, 0.15), (0.075, 0.085), 0);
+    let c1 = place(&mut sk, Some(tronco), (0.532, 0.393), (0.609, 0.352), 5);
+    let c2 = place(&mut sk, Some(c1), (0.609, 0.352), (0.726, 0.279), 6);
+    let c3 = place(&mut sk, Some(c2), (0.726, 0.279), (0.834, 0.245), 7);
+    let c4 = place(&mut sk, Some(c3), (0.834, 0.245), (0.955, 0.215), 8);
+    let umerod = place(&mut sk, Some(tronco), (0.32, 0.457), (0.353, 0.564), 9);
+    let radiod = place(&mut sk, Some(umerod), (0.353, 0.564), (0.293, 0.662), 11);
+    let maod = place(&mut sk, Some(radiod), (0.293, 0.662), (0.235, 0.72), 13);
+    let umeroe = place(&mut sk, Some(tronco), (0.288, 0.433), (0.278, 0.539), 10);
+    let radioe = place(&mut sk, Some(umeroe), (0.278, 0.539), (0.192, 0.58), 12);
+    let maoe = place(&mut sk, Some(radioe), (0.192, 0.58), (0.15, 0.628), 14);
+    let femurd = place(&mut sk, Some(tronco), (0.462, 0.404), (0.468, 0.577), 15);
+    let tibiad = place(&mut sk, Some(femurd), (0.468, 0.577), (0.553, 0.724), 17);
+    let ped = place(&mut sk, Some(tibiad), (0.553, 0.724), (0.575, 0.86), 19);
+    let femure = place(&mut sk, Some(tronco), (0.488, 0.408), (0.414, 0.583), 16);
+    let tibiae = place(&mut sk, Some(femure), (0.414, 0.583), (0.4875, 0.7315), 18);
+    let pee = place(&mut sk, Some(tibiae), (0.4875, 0.7315), (0.47, 0.87), 20);
+    let _ = (mandibula, c4, maod, maoe, ped, pee, cervical, radiod, radioe, tibiad, tibiae);
     sk
 }
 
@@ -505,6 +510,38 @@ fn desenhar_preview_esqueleto(
         ));
     }
 }
+
+struct PartDef {
+    name: &'static str,
+    aspect: f32,
+    origin: (f32, f32),
+    tip: (f32, f32),
+    conns: &'static [(f32, f32)],
+}
+
+const RAPTOR_PARTS: [PartDef; 21] = [
+    PartDef { name: "mandibula_superior", aspect: 0.4573, origin: (0.907, 0.3192), tip: (0.001, 0.3663), conns: &[(0.907, 0.3192)] },
+    PartDef { name: "maxilar_inferior", aspect: 0.9244, origin: (0.88, 0.1192), tip: (0.002, 0.8911), conns: &[(0.88, 0.1192)] },
+    PartDef { name: "pescoco_cervical", aspect: 1.3077, origin: (0.811, 1.1194), tip: (0.187, 0.1857), conns: &[(0.187, 0.1857), (0.811, 1.1194)] },
+    PartDef { name: "pescoco_toraxica", aspect: 1.0769, origin: (0.831, 0.9078), tip: (0.168, 0.168), conns: &[(0.168, 0.168), (0.831, 0.9078)] },
+    PartDef { name: "tronco", aspect: 0.5016, origin: (0.128, 0.1219), tip: (0.955, 0.1776), conns: &[(0.128, 0.1219), (0.726, 0.1771), (0.955, 0.1776), (0.624, 0.1821), (0.045, 0.2598), (0.143, 0.2809)] },
+    PartDef { name: "cauda_1", aspect: 0.6735, origin: (0.139, 0.3839), tip: (0.822, 0.1522), conns: &[(0.822, 0.1522), (0.139, 0.3839)] },
+    PartDef { name: "cauda_2", aspect: 0.5384, origin: (0.099, 0.4388), tip: (0.9, 0.098), conns: &[(0.9, 0.098), (0.099, 0.4388)] },
+    PartDef { name: "cauda_3", aspect: 0.3919, origin: (0.109, 0.2806), tip: (0.888, 0.1086), conns: &[(0.888, 0.1086), (0.109, 0.2806)] },
+    PartDef { name: "cauda_4", aspect: 0.3527, origin: (0.119, 0.1192), tip: (0.998, 0.3421), conns: &[(0.119, 0.1192)] },
+    PartDef { name: "umero_direito", aspect: 1.0576, origin: (0.17, 0.1703), tip: (0.828, 0.8852), conns: &[(0.17, 0.1703), (0.828, 0.8852)] },
+    PartDef { name: "umero_esquerdo", aspect: 2.2402, origin: (0.298, 0.2935), tip: (0.699, 1.9378), conns: &[(0.298, 0.2935), (0.699, 1.9378)] },
+    PartDef { name: "radio_direito", aspect: 1.0278, origin: (0.826, 0.1706), tip: (0.172, 0.8551), conns: &[(0.826, 0.1706), (0.172, 0.8551)] },
+    PartDef { name: "radio_esquerdo", aspect: 0.503, origin: (0.861, 0.1368), tip: (0.138, 0.3647), conns: &[(0.861, 0.1368), (0.138, 0.3647)] },
+    PartDef { name: "mao_direita", aspect: 1.7315, origin: (0.546, 0.2268), tip: (0.728, 1.7246), conns: &[(0.546, 0.2268)] },
+    PartDef { name: "mao_esquerda", aspect: 1.396, origin: (0.805, 0.1926), tip: (0.316, 1.3792), conns: &[(0.805, 0.1926)] },
+    PartDef { name: "femur_direito", aspect: 2.6515, origin: (0.74, 0.2572), tip: (0.429, 2.3917), conns: &[(0.74, 0.2572), (0.429, 2.3917)] },
+    PartDef { name: "femur_esquerdo", aspect: 2.6515, origin: (0.74, 0.2572), tip: (0.428, 2.3917), conns: &[(0.74, 0.2572), (0.428, 2.3917)] },
+    PartDef { name: "tibia_direita", aspect: 0.977, origin: (0.112, 0.1104), tip: (0.887, 0.8637), conns: &[(0.112, 0.1104), (0.887, 0.8637)] },
+    PartDef { name: "tibia_esquerda", aspect: 0.9916, origin: (0.114, 0.114), tip: (0.885, 0.8756), conns: &[(0.114, 0.114), (0.885, 0.8756)] },
+    PartDef { name: "pe_direito", aspect: 1.6545, origin: (0.821, 0.177), tip: (0.0, 1.5503), conns: &[(0.821, 0.177)] },
+    PartDef { name: "pe_esquerdo", aspect: 1.6545, origin: (0.821, 0.177), tip: (0.0, 1.5503), conns: &[(0.821, 0.177)] },
+];
 
 /// Geometria de uma peça-imagem do rig, em unidades da imagem (x/W, y/W).
 struct PieceDef {
@@ -952,6 +989,8 @@ struct SketchMotionApp {
     rig_shape: sketchmotion_core::BoneShape,
     cursor_tex: [Option<egui::TextureHandle>; 5],
     piece_tex: [Option<egui::TextureHandle>; 6],
+    part_tex: [Option<egui::TextureHandle>; 21],
+    raptor_mini_tex: Option<egui::TextureHandle>,
     rig_snap_hint: Option<(u32, f32, f32)>,
     rig_resize_enabled: bool,
     rig_sep_guard: Option<(u32, f32, f32)>,
@@ -1080,6 +1119,8 @@ impl SketchMotionApp {
             rig_shape: sketchmotion_core::BoneShape::Limb,
             cursor_tex: [None, None, None, None, None],
             piece_tex: [None, None, None, None, None, None],
+            part_tex: std::array::from_fn(|_| None),
+            raptor_mini_tex: None,
             rig_snap_hint: None,
             rig_resize_enabled: false,
             rig_sep_guard: None,
@@ -3728,33 +3769,128 @@ impl SketchMotionApp {
         }
     }
 
+    /// Geometria (aspecto, origem, ponta, pontos de ligacao) de um osso, seja
+    /// peca generica (shape) ou peca-imagem propria (img).
+    fn bone_geom(
+        &self,
+        shape: sketchmotion_core::BoneShape,
+        img: Option<u16>,
+    ) -> (f32, (f32, f32), (f32, f32), &'static [(f32, f32)]) {
+        if let Some(i) = img {
+            let i = i as usize;
+            if i < RAPTOR_PARTS.len() {
+                let pd = &RAPTOR_PARTS[i];
+                return (pd.aspect, pd.origin, pd.tip, pd.conns);
+            }
+        }
+        let pd = piece_def(shape);
+        (pd.aspect, pd.origin, pd.tip, pd.conns)
+    }
+
+    fn bone_tex(
+        &self,
+        shape: sketchmotion_core::BoneShape,
+        img: Option<u16>,
+    ) -> Option<&egui::TextureHandle> {
+        if let Some(i) = img {
+            let i = i as usize;
+            if i < self.part_tex.len() {
+                return self.part_tex[i].as_ref();
+            }
+        }
+        self.piece_tex[piece_def(shape).tex].as_ref()
+    }
+
+    /// Carrega (uma vez) as texturas das pecas do raptor (ossos/raptor) e a
+    /// miniatura do botao.
+    fn ensure_part_textures(&mut self, ctx: &egui::Context) {
+        if self.raptor_mini_tex.is_some() && self.part_tex.iter().all(|t| t.is_some()) {
+            return;
+        }
+        const DATA: [&[u8]; 21] = [
+            include_bytes!("../../../ossos/raptor/mandibula_superior.png"),
+            include_bytes!("../../../ossos/raptor/maxilar_inferior.png"),
+            include_bytes!("../../../ossos/raptor/pescoco_cervical.png"),
+            include_bytes!("../../../ossos/raptor/pescoco_toraxica.png"),
+            include_bytes!("../../../ossos/raptor/tronco.png"),
+            include_bytes!("../../../ossos/raptor/cauda_1.png"),
+            include_bytes!("../../../ossos/raptor/cauda_2.png"),
+            include_bytes!("../../../ossos/raptor/cauda_3.png"),
+            include_bytes!("../../../ossos/raptor/cauda_4.png"),
+            include_bytes!("../../../ossos/raptor/umero_direito.png"),
+            include_bytes!("../../../ossos/raptor/umero_esquerdo.png"),
+            include_bytes!("../../../ossos/raptor/radio_direito.png"),
+            include_bytes!("../../../ossos/raptor/radio_esquerdo.png"),
+            include_bytes!("../../../ossos/raptor/mao_direita.png"),
+            include_bytes!("../../../ossos/raptor/mao_esquerda.png"),
+            include_bytes!("../../../ossos/raptor/femur_direito.png"),
+            include_bytes!("../../../ossos/raptor/femur_esquerdo.png"),
+            include_bytes!("../../../ossos/raptor/tibia_direita.png"),
+            include_bytes!("../../../ossos/raptor/tibia_esquerda.png"),
+            include_bytes!("../../../ossos/raptor/pe_direito.png"),
+            include_bytes!("../../../ossos/raptor/pe_esquerdo.png"),
+        ];
+        for i in 0..21 {
+            if self.part_tex[i].is_some() {
+                continue;
+            }
+            if let Ok(img) = image::load_from_memory(DATA[i]) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
+                self.part_tex[i] = Some(ctx.load_texture(
+                    RAPTOR_PARTS[i].name,
+                    color,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        if self.raptor_mini_tex.is_none() {
+            if let Ok(img) = image::load_from_memory(include_bytes!(
+                "../../../ossos/raptor/miniatura_raptor.png"
+            )) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
+                self.raptor_mini_tex =
+                    Some(ctx.load_texture("raptor_mini", color, egui::TextureOptions::LINEAR));
+            }
+        }
+    }
+
     /// Pontos de ligação de um osso em coordenadas de mundo (o primeiro é a
     /// origem/pino que se conecta ao pai).
     fn bone_conns(&self, sk: &sketchmotion_core::Skeleton, id: u32) -> Vec<(f32, f32)> {
-        let shape = match sk.bone(id) {
-            Some(b) => b.shape,
+        let (shape, img) = match sk.bone(id) {
+            Some(b) => (b.shape, b.img),
             None => return Vec::new(),
         };
-        let pd = piece_def(shape);
+        let (_aspect, oi, ti, conns) = self.bone_geom(shape, img);
         let wo = sk.origin(id);
         let wt = sk.tip(id);
-        pd.conns
+        conns
             .iter()
-            .map(|&(cx, cy)| map_piece(pd.origin, pd.tip, wo, wt, cx, cy))
+            .map(|&(cx, cy)| map_piece(oi, ti, wo, wt, cx, cy))
             .collect()
     }
 
     /// Testa se o ponto de mundo `p` está dentro do retângulo da peça (ignora
     /// transparência — suficiente para seleção).
     fn piece_hit(&self, sk: &sketchmotion_core::Skeleton, id: u32, p: (f32, f32)) -> bool {
-        let shape = match sk.bone(id) {
-            Some(b) => b.shape,
+        let (shape, img) = match sk.bone(id) {
+            Some(b) => (b.shape, b.img),
             None => return false,
         };
-        let pd = piece_def(shape);
+        let (aspect, oi, ti, _c) = self.bone_geom(shape, img);
         let wo = sk.origin(id);
         let wt = sk.tip(id);
-        let aimg = (pd.tip.0 - pd.origin.0, pd.tip.1 - pd.origin.1);
+        let aimg = (ti.0 - oi.0, ti.1 - oi.1);
         let aw = (wt.0 - wo.0, wt.1 - wo.1);
         let limg = (aimg.0 * aimg.0 + aimg.1 * aimg.1).sqrt().max(1e-4);
         let lw = (aw.0 * aw.0 + aw.1 * aw.1).sqrt().max(1e-4);
@@ -3762,9 +3898,9 @@ impl SketchMotionApp {
         let sc = lw / limg;
         let (s, c) = (-ang).sin_cos();
         let (dx, dy) = (p.0 - wo.0, p.1 - wo.1);
-        let ix = (dx * c - dy * s) / sc + pd.origin.0;
-        let iy = (dx * s + dy * c) / sc + pd.origin.1;
-        ix >= 0.0 && ix <= 1.0 && iy >= 0.0 && iy <= pd.aspect
+        let ix = (dx * c - dy * s) / sc + oi.0;
+        let iy = (dx * s + dy * c) / sc + oi.1;
+        ix >= 0.0 && ix <= 1.0 && iy >= 0.0 && iy <= aspect
     }
 
     /// True se `node` é descendente de `ancestor` (para evitar ciclos).
@@ -3966,11 +4102,11 @@ impl SketchMotionApp {
         let painter = ui.painter_at(rect);
         let sp = |x: f32, y: f32| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom);
         // Mapeia as 4 quinas da imagem da peça para a tela.
-        let corners = |pd: &PieceDef, wo: (f32, f32), wt: (f32, f32)| -> [egui::Pos2; 4] {
-            let c = [(0.0, 0.0), (1.0, 0.0), (1.0, pd.aspect), (0.0, pd.aspect)];
+        let corners = |aspect: f32, oi: (f32, f32), ti: (f32, f32), wo: (f32, f32), wt: (f32, f32)| -> [egui::Pos2; 4] {
+            let c = [(0.0, 0.0), (1.0, 0.0), (1.0, aspect), (0.0, aspect)];
             let mut out = [egui::pos2(0.0, 0.0); 4];
             for (k, &(cx, cy)) in c.iter().enumerate() {
-                let (wx, wy) = map_piece(pd.origin, pd.tip, wo, wt, cx, cy);
+                let (wx, wy) = map_piece(oi, ti, wo, wt, cx, cy);
                 out[k] = sp(wx, wy);
             }
             out
@@ -3982,11 +4118,11 @@ impl SketchMotionApp {
             }
             let is_active = active == Some(si);
             for b in &sk.bones {
-                let pd = piece_def(b.shape);
+                let (aspect, oi, ti, _conns) = self.bone_geom(b.shape, b.img);
                 let wo = sk.origin(b.id);
                 let wt = sk.tip(b.id);
-                let v = corners(&pd, wo, wt);
-                if let Some(tex) = &self.piece_tex[pd.tex] {
+                let v = corners(aspect, oi, ti, wo, wt);
+                if let Some(tex) = self.bone_tex(b.shape, b.img) {
                     let uv = [
                         egui::pos2(0.0, 0.0),
                         egui::pos2(1.0, 0.0),
@@ -4037,8 +4173,8 @@ impl SketchMotionApp {
         // Preview da peça sendo criada (arrastar em modo Criar).
         if self.tool == Tool::Rig && self.rig_mode == RigMode::Create {
             if let (Some(a), Some(b)) = (self.rig_start, self.rig_preview) {
-                let pd = piece_def(self.rig_shape);
-                let v = corners(&pd, a, b);
+                let (aspect, oi, ti, _) = self.bone_geom(self.rig_shape, None);
+                let v = corners(aspect, oi, ti, a, b);
                 painter.add(egui::Shape::closed_line(
                     v.to_vec(),
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(0x2F, 0x84, 0xFE)),
@@ -4050,6 +4186,7 @@ impl SketchMotionApp {
     /// Janela: Rig — lista de esqueletos e modos de edição (painel direito).
     fn janela_rig(&mut self, ctx: &egui::Context) {
         use egui_phosphor::regular as icon;
+        self.ensure_part_textures(ctx);
         let mut open = self.win_rig;
 
         let mut add_skel = false;
@@ -4091,17 +4228,38 @@ impl SketchMotionApp {
                                 egui::Color32::from_gray(34)
                             };
                             pt.rect_filled(rct, 6.0, bg);
-                            let prev = preset_skeleton(key, 0.0, 0.0, 1.0);
-                            desenhar_preview_esqueleto(
-                                &pt,
-                                egui::Rect::from_min_size(
-                                    rct.min,
-                                    egui::vec2(rct.width(), rct.height() - 16.0),
-                                )
-                                .shrink(6.0),
-                                &prev,
-                                egui::Color32::from_rgb(0x8F, 0xB7, 0xFF),
-                            );
+                            let ir = egui::Rect::from_min_size(
+                                rct.min,
+                                egui::vec2(rct.width(), rct.height() - 16.0),
+                            )
+                            .shrink(6.0);
+                            if key == "raptor" {
+                                if let Some(tex) = &self.raptor_mini_tex {
+                                    let sz = tex.size_vec2();
+                                    let scl = (ir.width() / sz.x).min(ir.height() / sz.y);
+                                    let r = egui::Rect::from_center_size(
+                                        ir.center(),
+                                        egui::vec2(sz.x * scl, sz.y * scl),
+                                    );
+                                    pt.image(
+                                        tex.id(),
+                                        r,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            } else {
+                                let prev = preset_skeleton(key, 0.0, 0.0, 1.0);
+                                desenhar_preview_esqueleto(
+                                    &pt,
+                                    ir,
+                                    &prev,
+                                    egui::Color32::from_rgb(0x8F, 0xB7, 0xFF),
+                                );
+                            }
                             pt.text(
                                 egui::pos2(rct.center().x, rct.bottom() - 8.0),
                                 egui::Align2::CENTER_CENTER,
@@ -4564,6 +4722,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_camadas(ctx);
         self.janela_rig(ctx);
         self.ensure_piece_textures(ctx);
+        self.ensure_part_textures(ctx);
         self.barra_frames(ctx);
         self.janela_reproducao(ctx);
 

@@ -49,6 +49,9 @@ pub struct Bone {
     /// Forma visual do osso.
     #[serde(default)]
     pub shape: BoneShape,
+    /// Imagem propria da peca (indice numa tabela do app); None = usa `shape`.
+    #[serde(default)]
+    pub img: Option<u16>,
     /// Pose de descanso, para "resetar pose" e futuros keyframes.
     pub rest: BonePose,
 }
@@ -120,6 +123,7 @@ impl Skeleton {
             scale: 1.0,
             length,
             shape,
+            img: None,
             rest: BonePose {
                 x,
                 y,

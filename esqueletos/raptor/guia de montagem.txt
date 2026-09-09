@@ -1,0 +1,18 @@
+guia de montagem
+cada parentese() mostra uma cor de conexão
+os nomes referem-se aos nomes dos arquivos png
+use a imagem manual_visual.png para ajudar na referencia
+
+mandibula_superior  => maxilar_inferior  => pescoco_cervical (amarelo)
+pescoco_cervical => pescoco_toraxica (azul claro)
+pescoco_toraxica => tronco (verde)  
+tronco => cauda_1 (vermelho) => 
+cauda_1 => cauda_2 (rosa)
+cauda_2 = > cauda_3 (amarelo)
+cauda_3 => cauda_4 (azul escuro)
+umero_direito => tronco (azulescuro)
+umero_esquerdo => tronco (amarelo)
+radio_direito=> umero_direito (rosa)
+radio_esquerdo => umero_esquerdo (verde)
+mao_direita => radio_direito (vermelho)
+mao_esquerda => radio_esquerdo (roxo)
