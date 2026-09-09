@@ -862,6 +862,7 @@ struct SketchMotionApp {
     rig_start: Option<(f32, f32)>,
     rig_preview: Option<(f32, f32)>,
     rig_shape: sketchmotion_core::BoneShape,
+    cursor_tex: [Option<egui::TextureHandle>; 5],
     current_path: Option<std::path::PathBuf>,
     pixel_mode: bool,
     screen: Screen,
@@ -985,6 +986,7 @@ impl SketchMotionApp {
             rig_start: None,
             rig_preview: None,
             rig_shape: sketchmotion_core::BoneShape::Limb,
+            cursor_tex: [None, None, None, None, None],
             current_path: None,
             pixel_mode: false,
             screen: Screen::Home,
@@ -3559,6 +3561,71 @@ impl SketchMotionApp {
     }
 
     /// Opções da ferramenta Rig na barra superior.
+    /// Garante que as texturas de cursor personalizadas estejam carregadas
+    /// (decodifica + reduz os PNGs uma vez). Índices: 0 caneta, 1 balde,
+    /// 2 conta-gotas, 3 laço, 4 varinha.
+    fn ensure_cursor_textures(&mut self, ctx: &egui::Context) {
+        if self.cursor_tex.iter().all(|t| t.is_some()) {
+            return;
+        }
+        const DATA: [&[u8]; 5] = [
+            include_bytes!("../../../cursores/caneta.png"),
+            include_bytes!("../../../cursores/balde.png"),
+            include_bytes!("../../../cursores/contagotas.png"),
+            include_bytes!("../../../cursores/laco.png"),
+            include_bytes!("../../../cursores/varinha_magica.png"),
+        ];
+        const NAMES: [&str; 5] = ["cur_caneta", "cur_balde", "cur_conta", "cur_laco", "cur_varinha"];
+        for i in 0..5 {
+            if self.cursor_tex[i].is_some() {
+                continue;
+            }
+            if let Ok(img) = image::load_from_memory(DATA[i]) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let scale = (44.0_f32 / w.max(h) as f32).min(1.0);
+                let nw = ((w as f32 * scale) as u32).max(1);
+                let nh = ((h as f32 * scale) as u32).max(1);
+                let small =
+                    image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [nw as usize, nh as usize],
+                    small.as_raw(),
+                );
+                self.cursor_tex[i] =
+                    Some(ctx.load_texture(NAMES[i], color, egui::TextureOptions::LINEAR));
+            }
+        }
+    }
+
+    /// Desenha o cursor personalizado (índice) ancorado por `hotspot` (fração
+    /// da imagem que coincide com o ponteiro real). Devolve false se a textura
+    /// não estiver disponível.
+    fn desenhar_cursor_img(
+        &self,
+        painter: &egui::Painter,
+        ctx: &egui::Context,
+        hp: egui::Pos2,
+        idx: usize,
+        hotspot: (f32, f32),
+    ) -> bool {
+        if let Some(tex) = &self.cursor_tex[idx] {
+            let size = tex.size_vec2();
+            let tl = hp - egui::vec2(size.x * hotspot.0, size.y * hotspot.1);
+            let rect = egui::Rect::from_min_size(tl, size);
+            painter.image(
+                tex.id(),
+                rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+            true
+        } else {
+            false
+        }
+    }
+
     fn opcoes_rig(&mut self, ui: &mut egui::Ui) {
         use sketchmotion_core::BoneShape as BS;
         ui.label("Rig:");
@@ -4648,9 +4715,20 @@ impl eframe::App for SketchMotionApp {
                     // Cursor personalizado por ferramenta + decorações no canvas.
                     if response.hovered() {
                         use egui::CursorIcon as CI;
+                        self.ensure_cursor_textures(ui.ctx());
                         let painter = ui.painter_at(rect);
                         if self.eyedropper != Eyedropper::Off {
-                            ui.ctx().set_cursor_icon(CI::Crosshair);
+                            match hover {
+                                Some(hp)
+                                    if self.desenhar_cursor_img(
+                                        &painter,
+                                        ui.ctx(),
+                                        hp,
+                                        2,
+                                        (0.14, 0.9),
+                                    ) => {}
+                                _ => ui.ctx().set_cursor_icon(CI::Crosshair),
+                            }
                         } else {
                             match self.tool {
                                 Tool::Pencil | Tool::Eraser => {
@@ -4670,8 +4748,34 @@ impl eframe::App for SketchMotionApp {
                                     }
                                     ui.ctx().set_cursor_icon(CI::None);
                                 }
-                                Tool::Pen | Tool::Shapes | Tool::Fill => {
+                                Tool::Shapes => {
                                     ui.ctx().set_cursor_icon(CI::Crosshair);
+                                }
+                                Tool::Pen => {
+                                    match hover {
+                                        Some(hp)
+                                            if self.desenhar_cursor_img(
+                                                &painter,
+                                                ui.ctx(),
+                                                hp,
+                                                0,
+                                                (0.12, 0.92),
+                                            ) => {}
+                                        _ => ui.ctx().set_cursor_icon(CI::Crosshair),
+                                    }
+                                }
+                                Tool::Fill => {
+                                    match hover {
+                                        Some(hp)
+                                            if self.desenhar_cursor_img(
+                                                &painter,
+                                                ui.ctx(),
+                                                hp,
+                                                1,
+                                                (0.22, 0.85),
+                                            ) => {}
+                                        _ => ui.ctx().set_cursor_icon(CI::Crosshair),
+                                    }
                                 }
                                 Tool::Rig => {
                                     let c = if self.rig_mode == RigMode::Create {
@@ -4682,10 +4786,23 @@ impl eframe::App for SketchMotionApp {
                                     ui.ctx().set_cursor_icon(c);
                                 }
                                 Tool::Lasso | Tool::MagicWand => {
-                                    let c = hover
-                                        .and_then(|hp| self.float_cursor(hp, rect, zoom))
-                                        .unwrap_or(CI::Crosshair);
-                                    ui.ctx().set_cursor_icon(c);
+                                    if let Some(c) =
+                                        hover.and_then(|hp| self.float_cursor(hp, rect, zoom))
+                                    {
+                                        ui.ctx().set_cursor_icon(c);
+                                    } else if let Some(hp) = hover {
+                                        let (idx, hs) = if self.tool == Tool::Lasso {
+                                            (3usize, (0.5_f32, 0.5_f32))
+                                        } else {
+                                            (4usize, (0.82_f32, 0.14_f32))
+                                        };
+                                        if !self.desenhar_cursor_img(&painter, ui.ctx(), hp, idx, hs)
+                                        {
+                                            ui.ctx().set_cursor_icon(CI::Crosshair);
+                                        }
+                                    } else {
+                                        ui.ctx().set_cursor_icon(CI::Crosshair);
+                                    }
                                 }
                                 Tool::Select => 'sel: {
                                     if let Some(c) =
