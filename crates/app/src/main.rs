@@ -953,6 +953,8 @@ struct SketchMotionApp {
     cursor_tex: [Option<egui::TextureHandle>; 5],
     piece_tex: [Option<egui::TextureHandle>; 6],
     rig_snap_hint: Option<(u32, f32, f32)>,
+    rig_resize_enabled: bool,
+    rig_sep_guard: Option<(u32, f32, f32)>,
     current_path: Option<std::path::PathBuf>,
     pixel_mode: bool,
     screen: Screen,
@@ -1079,6 +1081,8 @@ impl SketchMotionApp {
             cursor_tex: [None, None, None, None, None],
             piece_tex: [None, None, None, None, None, None],
             rig_snap_hint: None,
+            rig_resize_enabled: false,
+            rig_sep_guard: None,
             current_path: None,
             pixel_mode: false,
             screen: Screen::Home,
@@ -3547,15 +3551,17 @@ impl SketchMotionApp {
         let mut mode = RigDrag::Rotate;
         {
             let sk = &self.document.skeletons[si];
-            // 1) ponta (bola) -> redimensionar
-            let mut best = 12.0_f32;
-            for b in &sk.bones {
-                let (tx, ty) = sk.tip(b.id);
-                let d = ((tx - p.0).powi(2) + (ty - p.1).powi(2)).sqrt();
-                if d < best {
-                    best = d;
-                    found = Some(b.id);
-                    mode = RigDrag::Resize;
+            // 1) ponta (bola) -> redimensionar (só quando habilitado)
+            if self.rig_resize_enabled {
+                let mut best = 12.0_f32;
+                for b in &sk.bones {
+                    let (tx, ty) = sk.tip(b.id);
+                    let d = ((tx - p.0).powi(2) + (ty - p.1).powi(2)).sqrt();
+                    if d < best {
+                        best = d;
+                        found = Some(b.id);
+                        mode = RigDrag::Resize;
+                    }
                 }
             }
             // 2) origem (bola) -> mover
@@ -3671,6 +3677,13 @@ impl SketchMotionApp {
                     b.y = ny;
                 }
                 let origin_now = self.document.skeletons[si].origin(bid);
+                if let Some((gid, gx, gy)) = self.rig_sep_guard {
+                    if gid == bid
+                        && ((origin_now.0 - gx).powi(2) + (origin_now.1 - gy).powi(2)).sqrt() > 34.0
+                    {
+                        self.rig_sep_guard = None;
+                    }
+                }
                 self.rig_snap_hint = self.nearest_snap_target(si, bid, origin_now);
                 self.dirty = true;
             }
@@ -3781,11 +3794,22 @@ impl SketchMotionApp {
         let sk = &self.document.skeletons[si];
         let mut best = 18.0_f32;
         let mut res = None;
+        // Ponto de encaixe suprimido logo após "Separar" (evita reconectar sem
+        // querer). Só volta a valer depois que a peça se afasta bem dele.
+        let guard = match self.rig_sep_guard {
+            Some((gid, gx, gy)) if gid == bid => Some((gx, gy)),
+            _ => None,
+        };
         for b in &sk.bones {
             if b.id == bid || self.is_descendant(sk, b.id, bid) {
                 continue;
             }
             for cp in self.bone_conns(sk, b.id) {
+                if let Some((gx, gy)) = guard {
+                    if ((cp.0 - gx).powi(2) + (cp.1 - gy).powi(2)).sqrt() < 22.0 {
+                        continue;
+                    }
+                }
                 let d = ((cp.0 - p.0).powi(2) + (cp.1 - p.1).powi(2)).sqrt();
                 if d < best {
                     best = d;
@@ -3836,6 +3860,9 @@ impl SketchMotionApp {
             b.y = w.y;
             b.angle = w.angle;
         }
+        // Guarda o ponto onde estava conectada: não reconecta aqui até a peça
+        // se afastar e voltar.
+        self.rig_sep_guard = Some((bid, w.x, w.y));
         self.dirty = true;
     }
 
@@ -3991,9 +4018,11 @@ impl SketchMotionApp {
                         v.to_vec(),
                         egui::Stroke::new(2.0, azul),
                     ));
-                    // alça de redimensionar (bola da ponta)
-                    let tb = sp(wt.0, wt.1);
-                    painter.circle_stroke(tb, 7.0, egui::Stroke::new(2.0, azul));
+                    if self.rig_resize_enabled {
+                        // alça de redimensionar (bola da ponta)
+                        let tb = sp(wt.0, wt.1);
+                        painter.circle_stroke(tb, 7.0, egui::Stroke::new(2.0, azul));
+                    }
                 }
             }
         }
@@ -4162,6 +4191,10 @@ impl SketchMotionApp {
                         ui.selectable_value(&mut self.rig_shape, BS::Pe, "Pé");
                     });
                 }
+                ui.checkbox(
+                    &mut self.rig_resize_enabled,
+                    "Redimensionar (arrastar a ponta)",
+                );
                 ui.horizontal(|ui| {
                     if ui.button("Resetar pose").clicked() {
                         do_reset = true;
