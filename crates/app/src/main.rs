@@ -622,6 +622,13 @@ fn map_piece(
     (w_orig.0 + dx * cc - dy * ss, w_orig.1 + dx * ss + dy * cc)
 }
 
+fn refl_x(axis: Option<f32>, x: f32) -> f32 {
+    match axis {
+        Some(a) => 2.0 * a - x,
+        None => x,
+    }
+}
+
 fn resize_cursor(sx: f32, sy: f32) -> egui::CursorIcon {
     use egui::CursorIcon as CI;
     match (sx as i32, sy as i32) {
@@ -994,6 +1001,7 @@ struct SketchMotionApp {
     rig_snap_hint: Option<(u32, f32, f32)>,
     rig_resize_enabled: bool,
     rig_sep_guard: Option<(u32, f32, f32)>,
+    sel_rig: Option<usize>,
     current_path: Option<std::path::PathBuf>,
     pixel_mode: bool,
     screen: Screen,
@@ -1124,6 +1132,7 @@ impl SketchMotionApp {
             rig_snap_hint: None,
             rig_resize_enabled: false,
             rig_sep_guard: None,
+            sel_rig: None,
             current_path: None,
             pixel_mode: false,
             screen: Screen::Home,
@@ -1615,6 +1624,156 @@ impl SketchMotionApp {
             if let Err(e) = sketchmotion_io::save_library(&self.library, &path) {
                 self.status = format!("Erro ao salvar paletas: {e}");
             }
+        }
+    }
+
+    /// Importar imagem via diálogo de arquivo (vira seleção flutuante editável).
+    fn importar(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Imagens", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
+            .pick_file()
+        {
+            match sketchmotion_io::load_image(&path) {
+                Ok((w, h, rgba)) => self.colocar_imagem(w, h, rgba),
+                Err(e) => self.status = format!("Erro ao importar: {e}"),
+            }
+        }
+    }
+
+    /// Coloca uma imagem RGBA no canvas como seleção flutuante (mover/
+    /// redimensionar/girar/opacidade/espelhar pela ferramenta Seleção).
+    fn colocar_imagem(&mut self, w: u32, h: u32, rgba: Vec<u8>) {
+        if w == 0 || h == 0 || rgba.len() < (w * h * 4) as usize {
+            self.status = "Imagem inválida".into();
+            return;
+        }
+        self.push_undo();
+        self.commit_float();
+        let (dw, dh) = (self.document.width as f32, self.document.height as f32);
+        let fit = (dw * 0.8 / w as f32)
+            .min(dh * 0.8 / h as f32)
+            .min(1.0)
+            .max(0.02);
+        let (dwid, dhei) = (w as f32 * fit, h as f32 * fit);
+        self.float_sel = Some(FloatSel {
+            pixels: rgba,
+            ow: w,
+            oh: h,
+            cx: dw / 2.0,
+            cy: dh / 2.0,
+            hw: dwid / 2.0,
+            hh: dhei / 2.0,
+            angle: 0.0,
+            opacity: 1.0,
+        });
+        self.float_tex = None;
+        self.tool = Tool::Select;
+        self.selected_obj = None;
+        self.dirty = true;
+        self.status = "Imagem importada — mova/redimensione e confirme".into();
+    }
+
+    /// Espelha horizontalmente os pixels da seleção flutuante.
+    fn float_flip_h(&mut self) {
+        if let Some(f) = &mut self.float_sel {
+            let (w, h) = (f.ow as usize, f.oh as usize);
+            let mut np = vec![0u8; f.pixels.len()];
+            for y in 0..h {
+                for x in 0..w {
+                    let sidx = (y * w + x) * 4;
+                    let didx = (y * w + (w - 1 - x)) * 4;
+                    if sidx + 4 <= f.pixels.len() && didx + 4 <= np.len() {
+                        np[didx..didx + 4].copy_from_slice(&f.pixels[sidx..sidx + 4]);
+                    }
+                }
+            }
+            f.pixels = np;
+        }
+        self.float_tex = None;
+        self.dirty = true;
+    }
+
+    /// Espelha verticalmente os pixels da seleção flutuante.
+    fn float_flip_v(&mut self) {
+        if let Some(f) = &mut self.float_sel {
+            let (w, h) = (f.ow as usize, f.oh as usize);
+            let mut np = vec![0u8; f.pixels.len()];
+            for y in 0..h {
+                for x in 0..w {
+                    let sidx = (y * w + x) * 4;
+                    let didx = ((h - 1 - y) * w + x) * 4;
+                    if sidx + 4 <= f.pixels.len() && didx + 4 <= np.len() {
+                        np[didx..didx + 4].copy_from_slice(&f.pixels[sidx..sidx + 4]);
+                    }
+                }
+            }
+            f.pixels = np;
+        }
+        self.float_tex = None;
+        self.dirty = true;
+    }
+
+    /// Exporta a animação como GIF (cada frame no FPS do documento).
+    fn exportar_gif(&mut self) {
+        self.document.sync_to_frames();
+        if self.document.frames.is_empty() {
+            self.status = "Nada para exportar".into();
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("GIF animado", &["gif"])
+            .set_file_name("animacao.gif")
+            .save_file()
+        {
+            let (w, h, bg, fps) = (
+                self.document.width,
+                self.document.height,
+                self.document.background,
+                self.document.fps,
+            );
+            let mut frames: Vec<Vec<u8>> = Vec::with_capacity(self.document.frames.len());
+            for f in &self.document.frames {
+                let img = render_frame(w, h, bg, &f.layers, &f.vectors);
+                frames.push(img.rgba);
+            }
+            let n = frames.len();
+            self.status = match sketchmotion_io::export_gif(w, h, &frames, fps, &path) {
+                Ok(()) => format!("GIF exportado ({n} frames, {fps} fps): {}", path.display()),
+                Err(e) => format!("Erro no GIF: {e}"),
+            };
+        }
+    }
+
+    /// Exporta cada frame como PNG numerado dentro de uma pasta.
+    fn exportar_sequencia(&mut self) {
+        self.document.sync_to_frames();
+        if self.document.frames.is_empty() {
+            self.status = "Nada para exportar".into();
+            return;
+        }
+        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+            let (w, h, bg) = (
+                self.document.width,
+                self.document.height,
+                self.document.background,
+            );
+            let mut ok = 0usize;
+            let mut erro: Option<String> = None;
+            for (i, f) in self.document.frames.iter().enumerate() {
+                let img = render_frame(w, h, bg, &f.layers, &f.vectors);
+                let fp = dir.join(format!("frame_{:04}.png", i + 1));
+                match sketchmotion_io::export_png(w, h, &img.rgba, &fp) {
+                    Ok(()) => ok += 1,
+                    Err(e) => {
+                        erro = Some(e);
+                        break;
+                    }
+                }
+            }
+            self.status = match erro {
+                Some(e) => format!("Erro na sequência: {e}"),
+                None => format!("{ok} PNG(s) salvos em {}", dir.display()),
+            };
         }
     }
 
@@ -2818,6 +2977,15 @@ impl SketchMotionApp {
                 self.dirty = true;
             }
             ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Espelhar H").clicked() {
+                    self.float_flip_h();
+                }
+                if ui.button("Espelhar V").clicked() {
+                    self.float_flip_v();
+                }
+            });
+            ui.separator();
             if ui.button("Confirmar").clicked() {
                 self.commit_float();
             }
@@ -3552,6 +3720,57 @@ impl SketchMotionApp {
         }
     }
 
+    /// Eixo (x em doc) de espelhamento do esqueleto `si`, ou None se não espelhado.
+    fn rig_axis(&self, si: usize) -> Option<f32> {
+        let sk = self.document.skeletons.get(si)?;
+        if !sk.flip_h {
+            return None;
+        }
+        let root = sk.bones.iter().find(|b| b.parent.is_none())?;
+        Some(sk.origin(root.id).0)
+    }
+
+    /// Inverte (espelha) o esqueleto ativo horizontalmente.
+    fn rig_mirror(&mut self, si: usize) {
+        self.push_undo();
+        if let Some(sk) = self.document.skeletons.get_mut(si) {
+            sk.flip_h = !sk.flip_h;
+        }
+        self.dirty = true;
+    }
+
+    /// Hit-test do rig em qualquer esqueleto visível (usado pela ferramenta
+    /// Seleção). Se acertar um osso, ativa esse esqueleto, faz o pick (com
+    /// resize liberado) e devolve o índice do esqueleto.
+    fn rig_pick_any(&mut self, p: (f32, f32)) -> Option<usize> {
+        if !self.show_bones {
+            return None;
+        }
+        let mut hit = None;
+        for (si, sk) in self.document.skeletons.iter().enumerate() {
+            if !sk.visible {
+                continue;
+            }
+            let axis = self.rig_axis(si);
+            let pp = (refl_x(axis, p.0), p.1);
+            for b in &sk.bones {
+                let wt = sk.tip(b.id);
+                let wo = sk.origin(b.id);
+                let dt = ((wt.0 - pp.0).powi(2) + (wt.1 - pp.1).powi(2)).sqrt();
+                let doo = ((wo.0 - pp.0).powi(2) + (wo.1 - pp.1).powi(2)).sqrt();
+                if dt <= 12.0 || doo <= 12.0 || self.piece_hit(sk, b.id, pp) {
+                    hit = Some(si);
+                }
+            }
+        }
+        let si = hit?;
+        self.rig_skel = si;
+        let axis = self.rig_axis(si);
+        let pp = (refl_x(axis, p.0), p.1);
+        self.rig_pick(si, pp, self.rig_resize_enabled);
+        Some(si)
+    }
+
     /// Cria um osso arrastando de `start` a `end`. Se `start` estiver perto da
     /// ponta de um osso existente, o novo osso vira filho dele (encadeia).
     fn rig_create_bone(&mut self, si: usize, start: (f32, f32), end: (f32, f32)) {
@@ -3587,13 +3806,13 @@ impl SketchMotionApp {
     }
 
     /// Seleciona o osso sob o ponto (prioriza a articulação para mover).
-    fn rig_pick(&mut self, si: usize, p: (f32, f32)) {
+    fn rig_pick(&mut self, si: usize, p: (f32, f32), allow_resize: bool) {
         let mut found: Option<u32> = None;
         let mut mode = RigDrag::Rotate;
         {
             let sk = &self.document.skeletons[si];
-            // 1) ponta (bola) -> redimensionar (só quando habilitado)
-            if self.rig_resize_enabled {
+            // 1) ponta (bola) -> redimensionar (quando permitido)
+            if allow_resize {
                 let mut best = 12.0_f32;
                 for b in &sk.bones {
                     let (tx, ty) = sk.tip(b.id);
@@ -4018,11 +4237,11 @@ impl SketchMotionApp {
             return;
         }
         const DATA: [&[u8]; 5] = [
-            include_bytes!("../../../cursores/caneta.png"),
-            include_bytes!("../../../cursores/balde.png"),
-            include_bytes!("../../../cursores/contagotas.png"),
-            include_bytes!("../../../cursores/laco.png"),
-            include_bytes!("../../../cursores/varinha_magica.png"),
+            include_bytes!("../../../cursores/render/caneta.png"),
+            include_bytes!("../../../cursores/render/balde.png"),
+            include_bytes!("../../../cursores/render/contagotas.png"),
+            include_bytes!("../../../cursores/render/laco.png"),
+            include_bytes!("../../../cursores/render/varinha_magica.png"),
         ];
         const NAMES: [&str; 5] = ["cur_caneta", "cur_balde", "cur_conta", "cur_laco", "cur_varinha"];
         for i in 0..5 {
@@ -4032,7 +4251,7 @@ impl SketchMotionApp {
             if let Ok(img) = image::load_from_memory(DATA[i]) {
                 let rgba = img.to_rgba8();
                 let (w, h) = rgba.dimensions();
-                let scale = (44.0_f32 / w.max(h) as f32).min(1.0);
+                let scale = (64.0_f32 / w.max(h) as f32).min(1.0);
                 let nw = ((w as f32 * scale) as u32).max(1);
                 let nh = ((h as f32 * scale) as u32).max(1);
                 let small =
@@ -4059,7 +4278,10 @@ impl SketchMotionApp {
         hotspot: (f32, f32),
     ) -> bool {
         if let Some(tex) = &self.cursor_tex[idx] {
-            let size = tex.size_vec2();
+            let raw = tex.size_vec2();
+            // Desenha pequeno (~30px), como um cursor de seta.
+            let scl = 30.0_f32 / raw.x.max(raw.y).max(1.0);
+            let size = raw * scl;
             let tl = hp - egui::vec2(size.x * hotspot.0, size.y * hotspot.1);
             let rect = egui::Rect::from_min_size(tl, size);
             painter.image(
@@ -4102,12 +4324,12 @@ impl SketchMotionApp {
         let painter = ui.painter_at(rect);
         let sp = |x: f32, y: f32| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom);
         // Mapeia as 4 quinas da imagem da peça para a tela.
-        let corners = |aspect: f32, oi: (f32, f32), ti: (f32, f32), wo: (f32, f32), wt: (f32, f32)| -> [egui::Pos2; 4] {
+        let corners = |aspect: f32, oi: (f32, f32), ti: (f32, f32), wo: (f32, f32), wt: (f32, f32), axis: Option<f32>| -> [egui::Pos2; 4] {
             let c = [(0.0, 0.0), (1.0, 0.0), (1.0, aspect), (0.0, aspect)];
             let mut out = [egui::pos2(0.0, 0.0); 4];
             for (k, &(cx, cy)) in c.iter().enumerate() {
                 let (wx, wy) = map_piece(oi, ti, wo, wt, cx, cy);
-                out[k] = sp(wx, wy);
+                out[k] = sp(refl_x(axis, wx), wy);
             }
             out
         };
@@ -4117,11 +4339,12 @@ impl SketchMotionApp {
                 continue;
             }
             let is_active = active == Some(si);
+            let axis = self.rig_axis(si);
             for b in &sk.bones {
                 let (aspect, oi, ti, _conns) = self.bone_geom(b.shape, b.img);
                 let wo = sk.origin(b.id);
                 let wt = sk.tip(b.id);
-                let v = corners(aspect, oi, ti, wo, wt);
+                let v = corners(aspect, oi, ti, wo, wt, axis);
                 if let Some(tex) = self.bone_tex(b.shape, b.img) {
                     let uv = [
                         egui::pos2(0.0, 0.0),
@@ -4140,8 +4363,8 @@ impl SketchMotionApp {
                     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
                     painter.add(egui::Shape::mesh(mesh));
                 } else {
-                    let o = sp(wo.0, wo.1);
-                    let t = sp(wt.0, wt.1);
+                    let o = sp(refl_x(axis, wo.0), wo.1);
+                    let t = sp(refl_x(axis, wt.0), wt.1);
                     painter.add(egui::Shape::convex_polygon(
                         rig_shape_points(b.shape, o, t),
                         egui::Color32::from_rgba_unmultiplied(0xFF, 0x9F, 0x1C, 70),
@@ -4156,16 +4379,17 @@ impl SketchMotionApp {
                     ));
                     if self.rig_resize_enabled {
                         // alça de redimensionar (bola da ponta)
-                        let tb = sp(wt.0, wt.1);
+                        let tb = sp(refl_x(axis, wt.0), wt.1);
                         painter.circle_stroke(tb, 7.0, egui::Stroke::new(2.0, azul));
                     }
                 }
             }
         }
         // Realce do encaixe (durante o arrasto para conectar).
+        let hax = active.and_then(|si| self.rig_axis(si));
         if let Some((_, hx, hy)) = self.rig_snap_hint {
             painter.circle_stroke(
-                sp(hx, hy),
+                sp(refl_x(hax, hx), hy),
                 12.0,
                 egui::Stroke::new(2.5, egui::Color32::from_rgb(0x3A, 0xC0, 0x50)),
             );
@@ -4173,8 +4397,9 @@ impl SketchMotionApp {
         // Preview da peça sendo criada (arrastar em modo Criar).
         if self.tool == Tool::Rig && self.rig_mode == RigMode::Create {
             if let (Some(a), Some(b)) = (self.rig_start, self.rig_preview) {
+                let pax = active.and_then(|si| self.rig_axis(si));
                 let (aspect, oi, ti, _) = self.bone_geom(self.rig_shape, None);
-                let v = corners(aspect, oi, ti, a, b);
+                let v = corners(aspect, oi, ti, a, b, pax);
                 painter.add(egui::Shape::closed_line(
                     v.to_vec(),
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(0x2F, 0x84, 0xFE)),
@@ -4195,6 +4420,7 @@ impl SketchMotionApp {
         let mut toggle_vis: Option<usize> = None;
         let mut set_mode: Option<RigMode> = None;
         let mut do_reset = false;
+        let mut mirror_skel = false;
         let mut do_setrest = false;
         let mut del_bone = false;
         let mut separar_bone = false;
@@ -4360,6 +4586,9 @@ impl SketchMotionApp {
                     if ui.button("Definir descanso").clicked() {
                         do_setrest = true;
                     }
+                    if ui.button("Inverter (espelhar)").clicked() {
+                        mirror_skel = true;
+                    }
                 });
                 if self.rig_sel_bone.is_some() {
                     ui.horizontal(|ui| {
@@ -4440,6 +4669,11 @@ impl SketchMotionApp {
         if do_setrest {
             if let Some(si) = self.rig_active_index() {
                 self.document.skeletons[si].set_rest();
+            }
+        }
+        if mirror_skel {
+            if let Some(si) = self.rig_active_index() {
+                self.rig_mirror(si);
             }
         }
         if del_bone {
@@ -4530,6 +4764,44 @@ impl eframe::App for SketchMotionApp {
             self.tela_inicial(ctx);
             return;
         }
+        // Importar imagens arrastando de fora para dentro do canvas.
+        let dropped: Vec<std::path::PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        for path in dropped {
+            let ext_ok = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    matches!(
+                        e.to_lowercase().as_str(),
+                        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp"
+                    )
+                })
+                .unwrap_or(false);
+            if ext_ok {
+                match sketchmotion_io::load_image(&path) {
+                    Ok((w, h, rgba)) => self.colocar_imagem(w, h, rgba),
+                    Err(e) => self.status = format!("Erro ao importar: {e}"),
+                }
+            } else {
+                self.status = format!("Arquivo não suportado para importação: {}", path.display());
+            }
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            let scr = ctx.screen_rect();
+            let pt = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("drop_overlay"),
+            ));
+            pt.rect_filled(scr, 0.0, egui::Color32::from_black_alpha(120));
+            pt.text(
+                scr.center(),
+                egui::Align2::CENTER_CENTER,
+                "Solte a imagem para importar",
+                egui::FontId::proportional(28.0),
+                egui::Color32::WHITE,
+            );
+        }
         // Ao sair da Caneta com um traço em aberto, finaliza-o (vira objeto)
         // em vez de descartá-lo — assim ele não "some" ao trocar de ferramenta.
         if self.tool != Tool::Pen && !self.pen_anchors.is_empty() {
@@ -4598,6 +4870,9 @@ impl eframe::App for SketchMotionApp {
         let mut a_salvar = false;
         let mut a_salvar_como = false;
         let mut a_exportar = false;
+        let mut a_importar = false;
+        let mut a_export_gif = false;
+        let mut a_export_seq = false;
         let mut img_rccw = false;
         let mut img_rcw = false;
         let mut img_r180 = false;
@@ -4614,6 +4889,10 @@ impl eframe::App for SketchMotionApp {
                         a_abrir = true;
                         ui.close_menu();
                     }
+                    if ui.button("Importar imagem...").clicked() {
+                        a_importar = true;
+                        ui.close_menu();
+                    }
                     ui.separator();
                     if ui.button("Salvar").clicked() {
                         a_salvar = true;
@@ -4624,8 +4903,16 @@ impl eframe::App for SketchMotionApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Exportar...").clicked() {
+                    if ui.button("Exportar imagem...").clicked() {
                         a_exportar = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Exportar animação (GIF)...").clicked() {
+                        a_export_gif = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Exportar sequência PNG...").clicked() {
+                        a_export_seq = true;
                         ui.close_menu();
                     }
                 });
@@ -4672,6 +4959,15 @@ impl eframe::App for SketchMotionApp {
         }
         if a_exportar {
             self.exportar();
+        }
+        if a_importar {
+            self.importar();
+        }
+        if a_export_gif {
+            self.exportar_gif();
+        }
+        if a_export_seq {
+            self.exportar_sequencia();
         }
         if img_rccw || img_rcw || img_r180 || img_fh || img_fv {
             self.push_undo();
@@ -4869,6 +5165,29 @@ impl eframe::App for SketchMotionApp {
                         self.last_pos = None;
                     } else if self.tool == Tool::Select {
                         let thr = 6.0 / zoom;
+                        // Rig: clicar num osso comporta-se como Posar (mover/girar/redimensionar).
+                        if pressed && self.sel_rig.is_none() && self.float_sel.is_none() {
+                            if let Some(p) = hover {
+                                self.sel_rig = self.rig_pick_any(to_doc(p));
+                            }
+                        }
+                        let on_rig = self.sel_rig.is_some();
+                        if on_rig {
+                            if let Some(si) = self.sel_rig {
+                                if down {
+                                    if let Some(p) = ppos {
+                                        let d = to_doc(p);
+                                        self.rig_drag_to(si, (refl_x(self.rig_axis(si), d.0), d.1));
+                                    }
+                                }
+                                if !down {
+                                    self.rig_release_pose(si);
+                                    self.sel_rig = None;
+                                }
+                            }
+                            self.last_pos = None;
+                        }
+                        if !on_rig {
                         if pressed {
                             if let Some(p) = hover {
                                 let dp = to_doc(p);
@@ -5053,6 +5372,7 @@ impl eframe::App for SketchMotionApp {
                             }
                         }
                         self.last_pos = None;
+                        }
                     } else if self.tool == Tool::Lasso {
                         if pressed {
                             if let Some(pp) = hover {
@@ -5104,34 +5424,41 @@ impl eframe::App for SketchMotionApp {
                         if let Some(si) = self.rig_active_index() {
                             match self.rig_mode {
                                 RigMode::Create => {
+                                    let ax = self.rig_axis(si);
                                     if pressed {
                                         if let Some(pp) = hover {
-                                            self.rig_start = Some(to_doc(pp));
+                                            let d = to_doc(pp);
+                                            self.rig_start = Some((refl_x(ax, d.0), d.1));
                                         }
                                     }
                                     if down {
                                         if let Some(pp) = ppos {
-                                            self.rig_preview = Some(to_doc(pp));
+                                            let d = to_doc(pp);
+                                            self.rig_preview = Some((refl_x(ax, d.0), d.1));
                                         }
                                     }
                                     if !down {
                                         if let Some(start) = self.rig_start.take() {
                                             if let Some(pp) = ppos {
-                                                self.rig_create_bone(si, start, to_doc(pp));
+                                                let d = to_doc(pp);
+                                                self.rig_create_bone(si, start, (refl_x(ax, d.0), d.1));
                                             }
                                         }
                                         self.rig_preview = None;
                                     }
                                 }
                                 RigMode::Pose => {
+                                    let ax = self.rig_axis(si);
                                     if pressed {
                                         if let Some(pp) = hover {
-                                            self.rig_pick(si, to_doc(pp));
+                                            let d = to_doc(pp);
+                                            self.rig_pick(si, (refl_x(ax, d.0), d.1), self.rig_resize_enabled);
                                         }
                                     }
                                     if down {
                                         if let Some(pp) = ppos {
-                                            self.rig_drag_to(si, to_doc(pp));
+                                            let d = to_doc(pp);
+                                            self.rig_drag_to(si, (refl_x(ax, d.0), d.1));
                                         }
                                     }
                                     if !down {
@@ -5250,7 +5577,7 @@ impl eframe::App for SketchMotionApp {
                                         ui.ctx(),
                                         hp,
                                         2,
-                                        (0.14, 0.9),
+                                        (0.0647, 0.0279),
                                     ) => {}
                                 _ => ui.ctx().set_cursor_icon(CI::Crosshair),
                             }
@@ -5284,7 +5611,7 @@ impl eframe::App for SketchMotionApp {
                                                 ui.ctx(),
                                                 hp,
                                                 0,
-                                                (0.12, 0.92),
+                                                (0.0568, 0.0427),
                                             ) => {}
                                         _ => ui.ctx().set_cursor_icon(CI::Crosshair),
                                     }
@@ -5297,7 +5624,7 @@ impl eframe::App for SketchMotionApp {
                                                 ui.ctx(),
                                                 hp,
                                                 1,
-                                                (0.22, 0.85),
+                                                (0.0297, 0.7874),
                                             ) => {}
                                         _ => ui.ctx().set_cursor_icon(CI::Crosshair),
                                     }
@@ -5317,9 +5644,9 @@ impl eframe::App for SketchMotionApp {
                                         ui.ctx().set_cursor_icon(c);
                                     } else if let Some(hp) = hover {
                                         let (idx, hs) = if self.tool == Tool::Lasso {
-                                            (3usize, (0.5_f32, 0.5_f32))
+                                            (3usize, (0.0426_f32, 0.0416_f32))
                                         } else {
-                                            (4usize, (0.82_f32, 0.14_f32))
+                                            (4usize, (0.2286_f32, 0.1169_f32))
                                         };
                                         if !self.desenhar_cursor_img(&painter, ui.ctx(), hp, idx, hs)
                                         {

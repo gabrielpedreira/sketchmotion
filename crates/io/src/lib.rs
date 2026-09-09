@@ -71,6 +71,36 @@ pub fn export_png(width: u32, height: u32, rgba: &[u8], path: &Path) -> Result<(
     .map_err(|e| e.to_string())
 }
 
+/// Carrega uma imagem (PNG/JPEG/GIF/BMP/WEBP) como RGBA8.
+pub fn load_image(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    let img = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
+    let (w, h) = img.dimensions();
+    Ok((w, h, img.into_raw()))
+}
+
+/// Exporta uma sequência de frames RGBA como GIF animado no FPS dado.
+pub fn export_gif(
+    width: u32,
+    height: u32,
+    frames: &[Vec<u8>],
+    fps: u32,
+    path: &Path,
+) -> Result<(), String> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    let file = File::create(path).map_err(|e| e.to_string())?;
+    let mut enc = GifEncoder::new(BufWriter::new(file));
+    enc.set_repeat(Repeat::Infinite).map_err(|e| e.to_string())?;
+    let fps = fps.max(1);
+    for rgba in frames {
+        let buf = image::RgbaImage::from_raw(width, height, rgba.clone())
+            .ok_or_else(|| "frame inválido".to_string())?;
+        let delay = image::Delay::from_numer_denom_ms(1000, fps);
+        let frame = image::Frame::from_parts(buf, 0, 0, delay);
+        enc.encode_frame(frame).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

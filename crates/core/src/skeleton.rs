@@ -78,6 +78,9 @@ pub struct Skeleton {
     pub name: String,
     #[serde(default = "vis_true")]
     pub visible: bool,
+    /// Espelhamento horizontal (para inverter esqueletos prontos).
+    #[serde(default)]
+    pub flip_h: bool,
     pub bones: Vec<Bone>,
     #[serde(default = "one")]
     next_id: u32,
@@ -88,6 +91,7 @@ impl Skeleton {
         Self {
             name: name.into(),
             visible: true,
+            flip_h: false,
             bones: Vec::new(),
             next_id: 1,
         }
