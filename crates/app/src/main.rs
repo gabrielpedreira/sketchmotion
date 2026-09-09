@@ -642,6 +642,24 @@ fn upscale_nn(w: u32, h: u32, rgba: &[u8], scale: u32) -> (u32, u32, Vec<u8>) {
     (w2, h2, out)
 }
 
+fn nudge_i32(ui: &mut egui::Ui, v: &mut i32, lo: i32, hi: i32) {
+    if ui.small_button("◀").on_hover_text("Diminuir").clicked() {
+        *v = (*v - 1).clamp(lo, hi);
+    }
+    if ui.small_button("▶").on_hover_text("Aumentar").clicked() {
+        *v = (*v + 1).clamp(lo, hi);
+    }
+}
+
+fn nudge_u32(ui: &mut egui::Ui, v: &mut u32, lo: u32, hi: u32) {
+    if ui.small_button("◀").on_hover_text("Diminuir").clicked() {
+        *v = (*v).saturating_sub(1).max(lo);
+    }
+    if ui.small_button("▶").on_hover_text("Aumentar").clicked() {
+        *v = (*v + 1).min(hi);
+    }
+}
+
 fn refl_x(axis: Option<f32>, x: f32) -> f32 {
     match axis {
         Some(a) => 2.0 * a - x,
@@ -1024,6 +1042,8 @@ struct SketchMotionApp {
     sel_rig: Option<usize>,
     current_path: Option<std::path::PathBuf>,
     export_scale: u32,
+    export_cols: u32,
+    bg_white: bool,
     pixel_mode: bool,
     screen: Screen,
     home_w: u32,
@@ -1156,6 +1176,8 @@ impl SketchMotionApp {
             sel_rig: None,
             current_path: None,
             export_scale: 1,
+            export_cols: 0,
+            bg_white: false,
             pixel_mode: false,
             screen: Screen::Home,
             home_w: 800,
@@ -1347,13 +1369,33 @@ impl SketchMotionApp {
     fn stamp_hard(&mut self, x: i32, y: i32, r: i32) {
         let color = self.active_color();
         let li = self.active_layer;
+        let pixel = self.pixel_mode;
         if let Some(layer) = self.document.layer_mut(li) {
-            for dy in -r..=r {
-                for dx in -r..=r {
-                    if dx * dx + dy * dy <= r * r {
+            if pixel {
+                // Pixel art: pincel quadrado de lado = raio (mínimo = 1 pixel).
+                let s = r.max(1);
+                let half = s / 2;
+                for dy in -half..=(s - 1 - half) {
+                    for dx in -half..=(s - 1 - half) {
                         let (px, py) = (x + dx, y + dy);
                         if px >= 0 && py >= 0 {
                             layer.set_pixel(px as u32, py as u32, color);
+                        }
+                    }
+                }
+            } else if r <= 1 {
+                // Tamanho mínimo = 1 pixel (precisão), mesmo fora do pixel art.
+                if x >= 0 && y >= 0 {
+                    layer.set_pixel(x as u32, y as u32, color);
+                }
+            } else {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if dx * dx + dy * dy <= r * r {
+                            let (px, py) = (x + dx, y + dy);
+                            if px >= 0 && py >= 0 {
+                                layer.set_pixel(px as u32, py as u32, color);
+                            }
                         }
                     }
                 }
@@ -1546,6 +1588,7 @@ impl SketchMotionApp {
         self.last_pos = None;
         self.current_path = None;
         self.pixel_mode = pixel;
+        self.document.pixel_art = pixel;
         self.zoom = if pixel {
             (512.0 / (w.max(h) as f32)).floor().max(1.0)
         } else {
@@ -1631,6 +1674,11 @@ impl SketchMotionApp {
                     self.frame_thumbs.clear();
                     self.onion_tex = None;
                     self.onion_for = None;
+                    self.pixel_mode = self.document.pixel_art;
+                    if self.pixel_mode {
+                        let m = self.document.width.max(self.document.height) as f32;
+                        self.zoom = (512.0 / m).floor().max(1.0);
+                    }
                     self.current_path = Some(path.clone());
                     self.status = format!("Aberto: {}", path.display());
                     return true;
@@ -1796,6 +1844,54 @@ impl SketchMotionApp {
             self.status = match erro {
                 Some(e) => format!("Erro na sequência: {e}"),
                 None => format!("{ok} PNG(s) salvos em {}", dir.display()),
+            };
+        }
+    }
+
+    /// Exporta todos os frames numa única imagem (sprite sheet) para uso em
+    /// motores de jogo. `export_cols` = colunas (0 = tudo numa linha).
+    fn exportar_spritesheet(&mut self) {
+        self.document.sync_to_frames();
+        let n = self.document.frames.len();
+        if n == 0 {
+            self.status = "Nada para exportar".into();
+            return;
+        }
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG", &["png"])
+            .set_file_name("spritesheet.png")
+            .save_file()
+        {
+            let (w, h, sc) = (self.document.width, self.document.height, self.export_scale.max(1));
+            let (fw, fh) = (w * sc, h * sc);
+            let cols = if self.export_cols == 0 {
+                n as u32
+            } else {
+                self.export_cols.max(1)
+            };
+            let rows = (n as u32 + cols - 1) / cols;
+            let (sw, sh) = (fw * cols, fh * rows);
+            let mut sheet = vec![0u8; (sw * sh * 4) as usize];
+            for (i, f) in self.document.frames.iter().enumerate() {
+                let img = render_frame_alpha(w, h, &f.layers, &f.vectors);
+                let (_, _, up) = upscale_nn(w, h, &img.rgba, sc);
+                let (cx, cy) = (i as u32 % cols, i as u32 / cols);
+                let (ox, oy) = (cx * fw, cy * fh);
+                let rowlen = (fw * 4) as usize;
+                for y in 0..fh {
+                    let dst = (((oy + y) * sw + ox) * 4) as usize;
+                    let src = ((y * fw) * 4) as usize;
+                    if dst + rowlen <= sheet.len() && src + rowlen <= up.len() {
+                        sheet[dst..dst + rowlen].copy_from_slice(&up[src..src + rowlen]);
+                    }
+                }
+            }
+            self.status = match sketchmotion_io::export_png(sw, sh, &sheet, &path) {
+                Ok(()) => format!(
+                    "Sprite sheet {sw}x{sh} — {n} frames de {fw}x{fh} ({cols}col x {rows}lin): {}",
+                    path.display()
+                ),
+                Err(e) => format!("Erro no sprite sheet: {e}"),
             };
         }
     }
@@ -2754,6 +2850,7 @@ impl SketchMotionApp {
                     if ui.add(egui::Slider::new(&mut fps, 1..=60)).changed() {
                         self.document.fps = fps.clamp(1, 60) as u32;
                     }
+                    nudge_u32(ui, &mut self.document.fps, 1, 60);
                     ui.separator();
                     ui.checkbox(&mut self.onion, "Onion skin")
                         .on_hover_text("Mostra o frame anterior a 30%");
@@ -2969,6 +3066,7 @@ impl SketchMotionApp {
         ui.separator();
         ui.label("Tamanho:");
         ui.add(egui::Slider::new(&mut self.brush_radius, 1..=40));
+        nudge_i32(ui, &mut self.brush_radius, 1, 40);
         ui.separator();
         self.swatch_cor(ui);
         ui.separator();
@@ -2978,6 +3076,7 @@ impl SketchMotionApp {
     fn opcoes_borracha(&mut self, ui: &mut egui::Ui) {
         ui.label("Tamanho:");
         ui.add(egui::Slider::new(&mut self.eraser_radius, 1..=60));
+        nudge_i32(ui, &mut self.eraser_radius, 1, 60);
         ui.separator();
         self.botao_limpar(ui);
     }
@@ -4900,6 +4999,7 @@ impl eframe::App for SketchMotionApp {
         let mut a_importar = false;
         let mut a_export_gif = false;
         let mut a_export_seq = false;
+        let mut a_export_sheet = false;
         let mut img_rccw = false;
         let mut img_rcw = false;
         let mut img_r180 = false;
@@ -4942,6 +5042,10 @@ impl eframe::App for SketchMotionApp {
                         a_export_seq = true;
                         ui.close_menu();
                     }
+                    if ui.button("Exportar sprite sheet (PNG)...").clicked() {
+                        a_export_sheet = true;
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("Imagem", |ui| {
                     if ui.button("Girar 90° à esquerda").clicked() {
@@ -4974,6 +5078,24 @@ impl eframe::App for SketchMotionApp {
                         .range(1..=16)
                         .suffix("x"),
                 );
+                nudge_u32(ui, &mut self.export_scale, 1, 16);
+                ui.label("Colunas:")
+                    .on_hover_text("Colunas do sprite sheet (0 = tudo numa linha)");
+                ui.add(egui::DragValue::new(&mut self.export_cols).range(0..=64));
+                nudge_u32(ui, &mut self.export_cols, 0, 64);
+                ui.separator();
+                ui.checkbox(&mut self.bg_white, "Fundo branco")
+                    .on_hover_text("Só visual — o arquivo salvo/exportado é sempre transparente");
+                let mut pm = self.pixel_mode;
+                if ui
+                    .checkbox(&mut pm, "Pixel art")
+                    .on_hover_text("Grade + pincel quadrado (1px). Fica salvo no arquivo.")
+                    .changed()
+                {
+                    self.pixel_mode = pm;
+                    self.document.pixel_art = pm;
+                    self.dirty = true;
+                }
                 if !self.status.is_empty() {
                     ui.separator();
                     ui.label(&self.status);
@@ -5003,6 +5125,9 @@ impl eframe::App for SketchMotionApp {
         }
         if a_export_seq {
             self.exportar_sequencia();
+        }
+        if a_export_sheet {
+            self.exportar_spritesheet();
         }
         if img_rccw || img_rcw || img_r180 || img_fh || img_fv {
             self.push_undo();
@@ -5076,6 +5201,9 @@ impl eframe::App for SketchMotionApp {
                     // Fundo xadrez indica transparência; a imagem (com alfa) vai por cima.
                     {
                         let p = ui.painter_at(rect);
+                        if self.bg_white {
+                            p.rect_filled(rect, 0.0, egui::Color32::WHITE);
+                        } else {
                         let cell = 8.0_f32.max(zoom);
                         p.rect_filled(rect, 0.0, egui::Color32::from_gray(210));
                         let nx = (rect.width() / cell).ceil() as i32;
@@ -5094,6 +5222,7 @@ impl eframe::App for SketchMotionApp {
                                 .intersect(rect);
                                 p.rect_filled(cr, 0.0, egui::Color32::from_gray(165));
                             }
+                        }
                         }
                         p.image(
                             tex_id,
@@ -5645,18 +5774,50 @@ impl eframe::App for SketchMotionApp {
                             match self.tool {
                                 Tool::Pencil | Tool::Eraser => {
                                     if let Some(hp) = hover {
-                                        let rr = (self.active_radius() as f32 * zoom).max(1.5);
-                                        painter.circle_stroke(
-                                            hp,
-                                            rr,
-                                            egui::Stroke::new(1.5_f32, egui::Color32::from_black_alpha(160)),
-                                        );
-                                        painter.circle_stroke(
-                                            hp,
-                                            rr + 1.0,
-                                            egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(180)),
-                                        );
-                                        painter.circle_filled(hp, 1.0, egui::Color32::from_black_alpha(160));
+                                        if self.pixel_mode {
+                                            // Contorno do quadrado exato que será pintado.
+                                            let s = self.active_radius().max(1);
+                                            let half = (s - 1) / 2;
+                                            let cellx = ((hp.x - rect.min.x) / zoom).floor() as i32;
+                                            let celly = ((hp.y - rect.min.y) / zoom).floor() as i32;
+                                            let (tlx, tly) = (cellx - half, celly - half);
+                                            let r0 = egui::Rect::from_min_size(
+                                                egui::pos2(
+                                                    rect.min.x + tlx as f32 * zoom,
+                                                    rect.min.y + tly as f32 * zoom,
+                                                ),
+                                                egui::vec2(s as f32 * zoom, s as f32 * zoom),
+                                            );
+                                            painter.rect_stroke(
+                                                r0,
+                                                0.0,
+                                                egui::Stroke::new(
+                                                    1.5_f32,
+                                                    egui::Color32::from_black_alpha(180),
+                                                ),
+                                            );
+                                            painter.rect_stroke(
+                                                r0.expand(1.0),
+                                                0.0,
+                                                egui::Stroke::new(
+                                                    1.0_f32,
+                                                    egui::Color32::from_white_alpha(180),
+                                                ),
+                                            );
+                                        } else {
+                                            let rr = (self.active_radius() as f32 * zoom).max(1.5);
+                                            painter.circle_stroke(
+                                                hp,
+                                                rr,
+                                                egui::Stroke::new(1.5_f32, egui::Color32::from_black_alpha(160)),
+                                            );
+                                            painter.circle_stroke(
+                                                hp,
+                                                rr + 1.0,
+                                                egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(180)),
+                                            );
+                                            painter.circle_filled(hp, 1.0, egui::Color32::from_black_alpha(160));
+                                        }
                                     }
                                     ui.ctx().set_cursor_icon(CI::None);
                                 }

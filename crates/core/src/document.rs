@@ -31,6 +31,9 @@ pub struct Document {
     /// Esqueletos de rigging 2D presentes na cena (independentes das camadas).
     #[serde(default)]
     pub skeletons: Vec<Skeleton>,
+    /// Modo pixel art (grade/nitidez) — persiste no arquivo.
+    #[serde(default)]
+    pub pixel_art: bool,
 }
 
 fn default_fps() -> u32 {
@@ -50,6 +53,7 @@ impl Document {
             current: 0,
             fps: 12,
             skeletons: Vec::new(),
+            pixel_art: false,
         };
         doc.add_layer("Camada 1");
         doc.frames = vec![Frame {
