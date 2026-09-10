@@ -188,4 +188,11 @@ impl VectorObject {
             self.map_points(|x, y| (2.0 * cx - x, 2.0 * cy - y));
         }
     }
+
+    /// Escala o objeto em torno do próprio centro por um fator.
+    pub fn scale_self(&mut self, f: f32) {
+        if let Some((cx, cy)) = self.center() {
+            self.map_points(|x, y| (cx + (x - cx) * f, cy + (y - cy) * f));
+        }
+    }
 }

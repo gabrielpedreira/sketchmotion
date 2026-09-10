@@ -1,0 +1,16 @@
+sketmotion
+
+- corrigir delay do canva
+- ao adicionar imagem os cursores não estão aparecendo sobre a imagem
+- ao selecionar uma camada o sistema deve informar em qual camada estamos trabalhando e a notificação só deve acontecer se estivermos tentando trabalhar na camada bloqueada, se outra camada, não precisa notificar
+- o canva deve ficar centralizado no meio do layout do programa, de modo que possamos com um scrol horizontal e vertical movelo pela area (igual do ilustrator)
+- a area de time line deve ter um botão para ocultala, fazendo com que fique uma area de trabalho maior no programa
+- a ferramenta de seleção deve ser capaz de selecionar imagens e qualquer outro tipo de objeto no canva, clicou seleciona!
+- elabore a ferramenta de inserir texto, um texto deve ser selecionavel, deve ser possivel ampliar ou diminuir atraves das caixinhas de selção, deve ser possivel usar fontes diferentes, negrito, italico, sublinhado... 
+- o sistema deve ser capaz de copiar e colar qualquer objeto selecionado, ou seja, ao selecionar um objeto e apertar ctrl + c copiase o objeto e ctrl+v cola.
+- adicione um footer com informação de versão e criador do sistema, com endereço do github https://github.com/gabrielpedreira, 
+- [PRIORIDADE] um erro gerou uma caracteristica incrivel no sistema, eu inseri uma imagem no modo pixelart e ao tentar extrair cor com o conta gotas a imagem simplesmente ficou no fomrato pixel, analise isso e transforme numa ferramenta intencional, e na oportunidade, corrija a questão do contagotas numa imagem, o cursor esta ficantdo atras da imagem
+- adicionar icone nos arquivos salvos como sketch motion
+- adicionar função de copiar e de mover objetos para outras camadas
+- se um item esta em uma camada, ele se mantem nessa mesma camada, mesmo que voce va para o segundo frame, ou seja, eu tenho objeto 1 camada 1, objeto 2 camada 2, ao duplicar o frame, esses objetos se mantem nessas camadas, isso facilita o trabalho
+- [PRIORIDADE] crie a função mesmo no modo pixel art para agrupar objetos, essa ferramenta fica na caixa de ferramentas a direita e funciona da seguinte forma, ao abrir essa ferramenta ela possui uma seleção livre igual ao laço, o usuario faz a seleção livre em torno do objeto desejado no desenho, exemplo a cabeça de um personagem, e o sistema pergunta se quer agrupar esse conjunto, se sim esse grupo é salvo como conjunto, a miniatura é exibida na janela da ferramenta e pode ser nomeada, ex: cabeça, e ao clicar sobre ela, selecionala e clicar no canva, a ferramenta adiciona esse objeto na mesma proporção em que foi salvo no original, isso facilita a adição de determinados elementos no trabalho, fazendo com que o usuario possa salvar expressoes diferentes, braços diferentes, poses, ou ate personagens inteiros. uma observação, deve ser possivel editar isoladamente esses itens salvos, pois na seleção, podem vir pixels indesejados, então o usuario poder abrir uma outra tela e apagar o entorno com os itens indesejados seria essencial, deixando a peça a pronto uso.

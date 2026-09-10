@@ -948,6 +948,7 @@ fn seletor_hue(ui: &mut egui::Ui, hsva: &mut egui::ecolor::Hsva, largura: f32, a
 /// Tela atual do app: inicial (escolher documento) ou editor.
 /// Seleção retangular de pixels recortada de uma camada (raster), flutuando
 /// sobre o canvas até ser movida e confirmada (estilo Paint).
+#[derive(Clone)]
 struct FloatSel {
     pixels: Vec<u8>,
     ow: u32,
@@ -958,6 +959,9 @@ struct FloatSel {
     hh: f32,
     angle: f32,
     opacity: f32,
+    /// Camada à qual este elemento pertence. O bloqueio e a confirmação
+    /// seguem ESTA camada, não a camada ativa no momento.
+    layer: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1086,9 +1090,16 @@ struct SketchMotionApp {
     rotate_center: (f32, f32),
     rotate_start: f32,
     rotate_orig: Vec<Anchor>,
+    // aviso temporário (ex.: tentativa de editar camada bloqueada)
+    warn_ticks: u32,
     // seleção retangular raster (estilo Paint)
     float_sel: Option<FloatSel>,
     float_tex: Option<egui::TextureHandle>,
+    // camadas ABAIXO e ACIMA da flutuante, para a flutuante respeitar o
+    // empilhamento (aparecer entre as camadas certas, não sempre no topo).
+    below_tex: Option<egui::TextureHandle>,
+    above_tex: Option<egui::TextureHandle>,
+    split_for: Option<usize>,
     float_dragging: bool,
     float_grab: (f32, f32),
     float_resize: Option<(f32, f32)>,
@@ -1223,8 +1234,12 @@ impl SketchMotionApp {
             rotate_center: (0.0, 0.0),
             rotate_start: 0.0,
             rotate_orig: Vec::new(),
+            warn_ticks: 0,
             float_sel: None,
             float_tex: None,
+            below_tex: None,
+            above_tex: None,
+            split_for: None,
             float_dragging: false,
             float_grab: (0.0, 0.0),
             float_resize: None,
@@ -1265,6 +1280,41 @@ impl SketchMotionApp {
 
     fn active_color(&self) -> Color {
         self.tool.effective_color(self.brush_core_color())
+    }
+
+    /// A camada `li` está bloqueada? (também true se não existir.)
+    fn layer_locked(&self, li: usize) -> bool {
+        self.document.layer(li).map_or(true, |l| l.locked)
+    }
+
+    /// A camada ativa está bloqueada? (também true se não existir camada.)
+    fn active_locked(&self) -> bool {
+        self.layer_locked(self.active_layer)
+    }
+
+    /// A camada à qual a seleção/imagem flutuante pertence está bloqueada?
+    fn float_locked(&self) -> bool {
+        match &self.float_sel {
+            Some(f) => self.layer_locked(f.layer),
+            None => false,
+        }
+    }
+
+    /// Dispara um aviso visível de que a camada `li` está bloqueada.
+    fn warn_locked_layer(&mut self, li: usize) {
+        let nome = self
+            .document
+            .layer(li)
+            .map(|l| l.name.clone())
+            .unwrap_or_default();
+        self.status = format!("⚠ Camada \"{nome}\" bloqueada — desbloqueie na aba Camadas para editar");
+        self.warn_ticks = 150;
+    }
+
+    /// Aviso de bloqueio da camada ativa (para ferramentas de desenho).
+    fn warn_lock(&mut self) {
+        let li = self.active_layer;
+        self.warn_locked_layer(li);
     }
 
     /// Salva o estado atual no histórico (limitado a MAX_UNDO) e limpa o refazer.
@@ -1526,6 +1576,7 @@ impl SketchMotionApp {
     fn stamp(&mut self, x: i32, y: i32, r: i32) {
         let li = self.active_layer;
         if self.document.layer(li).map_or(true, |l| l.locked) {
+            self.warn_lock();
             return;
         }
         if self.pixel_mode {
@@ -1612,6 +1663,11 @@ impl SketchMotionApp {
         self.between_key = None;
         self.onion_tex = None;
         self.onion_for = None;
+        self.float_sel = None;
+        self.float_tex = None;
+        self.split_for = None;
+        self.below_tex = None;
+        self.above_tex = None;
         self.status = if pixel {
             format!("Novo documento pixel art {w}x{h}")
         } else {
@@ -1690,6 +1746,11 @@ impl SketchMotionApp {
                     self.between_key = None;
                     self.onion_tex = None;
                     self.onion_for = None;
+                    self.float_sel = None;
+                    self.float_tex = None;
+                    self.split_for = None;
+                    self.below_tex = None;
+                    self.above_tex = None;
                     self.pixel_mode = self.document.pixel_art;
                     if self.pixel_mode {
                         let m = self.document.width.max(self.document.height) as f32;
@@ -1751,6 +1812,7 @@ impl SketchMotionApp {
             hh: dhei / 2.0,
             angle: 0.0,
             opacity: 1.0,
+            layer: self.active_layer,
         });
         self.float_tex = None;
         self.tool = Tool::Select;
@@ -1761,6 +1823,14 @@ impl SketchMotionApp {
 
     /// Espelha horizontalmente os pixels da seleção flutuante.
     fn float_flip_h(&mut self) {
+        let li = match &self.float_sel {
+            Some(f) => f.layer,
+            None => return,
+        };
+        if self.layer_locked(li) {
+            self.warn_locked_layer(li);
+            return;
+        }
         if let Some(f) = &mut self.float_sel {
             let (w, h) = (f.ow as usize, f.oh as usize);
             let mut np = vec![0u8; f.pixels.len()];
@@ -1781,6 +1851,14 @@ impl SketchMotionApp {
 
     /// Espelha verticalmente os pixels da seleção flutuante.
     fn float_flip_v(&mut self) {
+        let li = match &self.float_sel {
+            Some(f) => f.layer,
+            None => return,
+        };
+        if self.layer_locked(li) {
+            self.warn_locked_layer(li);
+            return;
+        }
         if let Some(f) = &mut self.float_sel {
             let (w, h) = (f.ow as usize, f.oh as usize);
             let mut np = vec![0u8; f.pixels.len()];
@@ -1797,6 +1875,47 @@ impl SketchMotionApp {
         }
         self.float_tex = None;
         self.dirty = true;
+    }
+
+    /// Escala a seleção/imagem flutuante por um fator (respeita o bloqueio).
+    fn escalar_float(&mut self, fator: f32) {
+        let li = match &self.float_sel {
+            Some(f) => f.layer,
+            None => return,
+        };
+        if self.layer_locked(li) {
+            self.warn_locked_layer(li);
+            return;
+        }
+        if let Some(f) = &mut self.float_sel {
+            f.hw = (f.hw * fator).clamp(1.0, 20000.0);
+            f.hh = (f.hh * fator).clamp(1.0, 20000.0);
+        }
+        self.float_tex = None;
+        self.dirty = true;
+    }
+
+    /// Carimba a flutuante atual na camada e cria uma cópia deslocada para
+    /// continuar posicionando (respeita o bloqueio da camada).
+    fn duplicar_float(&mut self) {
+        let li = match &self.float_sel {
+            Some(f) => f.layer,
+            None => return,
+        };
+        if self.layer_locked(li) {
+            self.warn_locked_layer(li);
+            return;
+        }
+        if let Some(orig) = self.float_sel.clone() {
+            self.commit_float();
+            let mut copia = orig;
+            copia.cx += 12.0;
+            copia.cy += 12.0;
+            self.float_sel = Some(copia);
+            self.float_tex = None;
+            self.dirty = true;
+            self.status = "Cópia criada — posicione e confirme".into();
+        }
     }
 
     /// Exporta a animação como GIF (cada frame no FPS do documento).
@@ -2023,6 +2142,10 @@ impl SketchMotionApp {
             return;
         }
         let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        if self.active_locked() {
+            self.warn_lock();
+            return;
+        }
         self.push_undo();
         let li = self.active_layer;
         let mut pixels = vec![0u8; (w * h * 4) as usize];
@@ -2051,6 +2174,7 @@ impl SketchMotionApp {
             hh: h as f32 / 2.0,
             angle: 0.0,
             opacity: 1.0,
+            layer: li,
         });
         self.float_tex = None;
         self.dirty = true;
@@ -2059,8 +2183,17 @@ impl SketchMotionApp {
 
     /// Carimba a seleção flutuante de volta na camada ativa (alpha over).
     fn commit_float(&mut self) {
+        // Confirma na camada à qual a flutuante pertence (respeita o bloqueio dela).
+        let li0 = match &self.float_sel {
+            Some(f) => f.layer,
+            None => return,
+        };
+        if self.layer_locked(li0) {
+            self.warn_locked_layer(li0);
+            return;
+        }
         if let Some(fs) = self.float_sel.take() {
-            let li = self.active_layer;
+            let li = fs.layer.min(self.document.layers.len().saturating_sub(1));
             let (dw, dh) = (self.document.width as i32, self.document.height as i32);
             let corners = [
                 float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, -1.0, -1.0),
@@ -2123,6 +2256,16 @@ impl SketchMotionApp {
     /// Detecção do clique sobre a seleção flutuante (rotação / alça / mover).
     /// Devolve true se o clique foi consumido por ela.
     fn float_press(&mut self, p: egui::Pos2, rect: egui::Rect, zoom: f32) -> bool {
+        // A imagem/seleção flutuante respeita o bloqueio da SUA camada: se ela
+        // estiver bloqueada, nem pode ser selecionada/movida (mesmo estando
+        // ativa outra camada). Só avisa.
+        let flayer = self.float_sel.as_ref().map(|f| f.layer);
+        if let Some(li) = flayer {
+            if self.layer_locked(li) {
+                self.warn_locked_layer(li);
+                return true;
+            }
+        }
         let dp = ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
         let mut consumed = false;
         if let Some(fs) = &self.float_sel {
@@ -2279,6 +2422,10 @@ impl SketchMotionApp {
             return;
         }
         let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        if self.active_locked() {
+            self.warn_lock();
+            return;
+        }
         self.push_undo();
         let li = self.active_layer;
         let mut pixels = vec![0u8; (w * h * 4) as usize];
@@ -2311,6 +2458,7 @@ impl SketchMotionApp {
             hh: h as f32 / 2.0,
             angle: 0.0,
             opacity: 1.0,
+            layer: li,
         });
         self.float_tex = None;
         self.dirty = true;
@@ -2327,6 +2475,7 @@ impl SketchMotionApp {
         }
         let li = self.active_layer;
         if self.document.layer(li).map_or(true, |l| l.locked) {
+            self.warn_lock();
             return;
         }
         let target = match self
@@ -2422,6 +2571,7 @@ impl SketchMotionApp {
             hh: bh as f32 / 2.0,
             angle: 0.0,
             opacity: 1.0,
+            layer: li,
         });
         self.float_tex = None;
         self.dirty = true;
@@ -2463,7 +2613,7 @@ impl SketchMotionApp {
         }
         let li = self.active_layer;
         if self.document.layer(li).map_or(true, |l| l.locked) {
-            self.status = "Camada bloqueada".into();
+            self.warn_lock();
             return;
         }
         let PixelImage { width, height, mut rgba } =
@@ -3397,32 +3547,62 @@ impl SketchMotionApp {
     /// Ferramenta Seleção: opera sobre o objeto vetorial selecionado.
     fn opcoes_selecao(&mut self, ui: &mut egui::Ui) {
         if self.float_sel.is_some() {
-            ui.label("Seleção de pixels.");
-            ui.separator();
-            ui.label("Opacidade:");
-            let mut pct = self.float_sel.as_ref().map(|f| f.opacity).unwrap_or(1.0) * 100.0;
-            if ui
-                .add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%"))
-                .changed()
-            {
-                if let Some(f) = &mut self.float_sel {
-                    f.opacity = (pct / 100.0).clamp(0.0, 1.0);
-                }
-                self.dirty = true;
+            let locked = self.float_locked();
+            let lname = self
+                .float_sel
+                .as_ref()
+                .and_then(|f| self.document.layer(f.layer))
+                .map(|l| l.name.clone())
+                .unwrap_or_default();
+            ui.label(format!("Imagem/seleção (camada \"{lname}\")."));
+            if locked {
+                ui.separator();
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xE0, 0x6C, 0x3A),
+                    "🔒 Camada bloqueada — desbloqueie para editar",
+                );
             }
             ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Espelhar H").clicked() {
-                    self.float_flip_h();
+            ui.add_enabled_ui(!locked, |ui| {
+                ui.label("Opacidade:");
+                let mut pct = self.float_sel.as_ref().map(|f| f.opacity).unwrap_or(1.0) * 100.0;
+                if ui
+                    .add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%"))
+                    .changed()
+                {
+                    if let Some(f) = &mut self.float_sel {
+                        f.opacity = (pct / 100.0).clamp(0.0, 1.0);
+                    }
+                    self.dirty = true;
                 }
-                if ui.button("Espelhar V").clicked() {
-                    self.float_flip_v();
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Espelhar H").clicked() {
+                        self.float_flip_h();
+                    }
+                    if ui.button("Espelhar V").clicked() {
+                        self.float_flip_v();
+                    }
+                    if ui.button("－").on_hover_text("Diminuir 10%").clicked() {
+                        self.escalar_float(1.0 / 1.1);
+                    }
+                    if ui.button("＋").on_hover_text("Aumentar 10%").clicked() {
+                        self.escalar_float(1.1);
+                    }
+                    if ui
+                        .button("Copiar")
+                        .on_hover_text("Carimba a atual e cria uma cópia para posicionar")
+                        .clicked()
+                    {
+                        self.duplicar_float();
+                    }
+                });
+                ui.separator();
+                if ui.button("Confirmar").clicked() {
+                    self.commit_float();
                 }
             });
-            ui.separator();
-            if ui.button("Confirmar").clicked() {
-                self.commit_float();
-            }
+            // Excluir a flutuante não altera a camada — permitido mesmo bloqueada.
             if ui.button("Excluir").clicked() {
                 self.float_sel = None;
                 self.float_tex = None;
@@ -3454,6 +3634,27 @@ impl SketchMotionApp {
                 if ui.button("Espelhar V").on_hover_text("Espelhar verticalmente").clicked() {
                     self.push_undo();
                     self.document.vectors[idx].flip_v_self();
+                }
+                ui.separator();
+                if ui.button("－").on_hover_text("Diminuir 10%").clicked() {
+                    self.push_undo();
+                    self.document.vectors[idx].scale_self(1.0 / 1.1);
+                }
+                if ui.button("＋").on_hover_text("Aumentar 10%").clicked() {
+                    self.push_undo();
+                    self.document.vectors[idx].scale_self(1.1);
+                }
+                if ui
+                    .button("Copiar")
+                    .on_hover_text("Duplica o traço selecionado")
+                    .clicked()
+                {
+                    self.push_undo();
+                    let mut copia = self.document.vectors[idx].clone();
+                    copia.translate(12.0, 12.0);
+                    self.document.vectors.push(copia);
+                    self.selected_obj = Some(self.document.vectors.len() - 1);
+                    self.dirty = true;
                 }
                 ui.separator();
                 ui.label("Espessura:");
@@ -5236,6 +5437,35 @@ impl eframe::App for SketchMotionApp {
                 egui::Color32::WHITE,
             );
         }
+        // Aviso temporário sobre o canvas (ex.: tentativa de editar camada bloqueada).
+        if self.warn_ticks > 0 {
+            self.warn_ticks -= 1;
+            ctx.request_repaint();
+            let scr = ctx.screen_rect();
+            let pt = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("lock_warn"),
+            ));
+            let msg = self.status.clone();
+            let cor_txt = egui::Color32::from_rgb(0xFF, 0xD9, 0xB3);
+            let galley =
+                pt.layout_no_wrap(msg, egui::FontId::proportional(15.0), cor_txt);
+            let pad = egui::vec2(16.0, 10.0);
+            let size = galley.size() + pad * 2.0;
+            let center = egui::pos2(scr.center().x, scr.top() + 90.0);
+            let rect = egui::Rect::from_center_size(center, size);
+            pt.rect_filled(
+                rect,
+                8.0,
+                egui::Color32::from_rgba_unmultiplied(60, 34, 20, 240),
+            );
+            pt.rect_stroke(
+                rect,
+                8.0,
+                egui::Stroke::new(1.5, egui::Color32::from_rgb(0xE0, 0x6C, 0x3A)),
+            );
+            pt.galley(rect.min + pad, galley, cor_txt);
+        }
         // Ao sair da Caneta com um traço em aberto, finaliza-o (vira objeto)
         // em vez de descartá-lo — assim ele não "some" ao trocar de ferramenta.
         if self.tool != Tool::Pen && !self.pen_anchors.is_empty() {
@@ -5305,8 +5535,47 @@ impl eframe::App for SketchMotionApp {
                 }
             }
             self.onion_for = None;
+            self.split_for = None; // camadas mudaram → refazer below/above
         }
         let tex_id = self.texture.as_ref().unwrap().id();
+
+        // Empilhamento da flutuante: monta as camadas ABAIXO (até a camada dela)
+        // e ACIMA (as de cima + vetores), para ela aparecer no z-index correto.
+        let float_layer = self.float_sel.as_ref().map(|f| {
+            f.layer
+                .min(self.document.layers.len().saturating_sub(1))
+        });
+        if let Some(l) = float_layer {
+            if self.split_for != Some(l)
+                || self.below_tex.is_none()
+                || self.above_tex.is_none()
+            {
+                let (dw, dh) = (self.document.width, self.document.height);
+                let below = render_layers_alpha(dw, dh, &self.document.layers[..=l]);
+                let mut above = render_layers_alpha(dw, dh, &self.document.layers[l + 1..]);
+                self.rasterizar_vetores(&mut above.rgba, dw, dh);
+                let bimg = egui::ColorImage::from_rgba_unmultiplied(
+                    [dw as usize, dh as usize],
+                    &below.rgba,
+                );
+                let aimg = egui::ColorImage::from_rgba_unmultiplied(
+                    [dw as usize, dh as usize],
+                    &above.rgba,
+                );
+                self.below_tex =
+                    Some(ctx.load_texture("below", bimg, egui::TextureOptions::NEAREST));
+                self.above_tex =
+                    Some(ctx.load_texture("above", aimg, egui::TextureOptions::NEAREST));
+                self.split_for = Some(l);
+            }
+        }
+        // Qual textura serve de base do canvas: sem flutuante = frame inteiro;
+        // com flutuante = só as camadas de baixo (o resto vai por cima dela).
+        let base_id = if float_layer.is_some() {
+            self.below_tex.as_ref().map(|t| t.id()).unwrap_or(tex_id)
+        } else {
+            tex_id
+        };
 
         let mut a_novo = false;
         let mut a_abrir = false;
@@ -5542,7 +5811,7 @@ impl eframe::App for SketchMotionApp {
                         }
                         }
                         p.image(
-                            tex_id,
+                            base_id,
                             rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
@@ -6356,6 +6625,19 @@ impl eframe::App for SketchMotionApp {
                             }
                             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
                             painter.add(egui::Shape::mesh(mesh));
+                        }
+                        // Camadas ACIMA da flutuante desenham por cima dela, para
+                        // ela ficar no z-index correto (não sempre no topo).
+                        if let Some(atex) = &self.above_tex {
+                            painter.image(
+                                atex.id(),
+                                rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
                         }
                         let azul = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
                         for i in 0..4 {
