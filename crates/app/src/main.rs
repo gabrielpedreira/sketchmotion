@@ -1112,6 +1112,9 @@ struct SketchMotionApp {
     marquee_cur: (i32, i32),
     lasso_points: Vec<(f32, f32)>,
     fill_tolerance: i32,
+    /// Área de transferência de pixels (largura, altura, RGBA) para copiar/colar
+    /// uma seleção — inclusive entre frames.
+    clip: Option<(u32, u32, Vec<u8>)>,
     // frames / animação
     onion: bool,
     onion_tex: Option<egui::TextureHandle>,
@@ -1252,6 +1255,7 @@ impl SketchMotionApp {
             marquee_cur: (0, 0),
             lasso_points: Vec::new(),
             fill_tolerance: 24,
+            clip: None,
             onion: true,
             onion_tex: None,
             onion_for: None,
@@ -5487,6 +5491,8 @@ impl eframe::App for SketchMotionApp {
         let mut k_enter = false;
         let mut k_esc = false;
         let mut k_del = false;
+        let mut k_copy = false;
+        let mut k_paste = false;
         ctx.input(|i| {
             if i.modifiers.command && i.key_pressed(egui::Key::Z) {
                 if i.modifiers.shift {
@@ -5497,6 +5503,12 @@ impl eframe::App for SketchMotionApp {
             }
             if i.modifiers.command && i.key_pressed(egui::Key::Y) {
                 do_redo = true;
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::C) {
+                k_copy = true;
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::V) {
+                k_paste = true;
             }
             if i.key_pressed(egui::Key::Enter) {
                 k_enter = true;
@@ -5750,6 +5762,45 @@ impl eframe::App for SketchMotionApp {
                         self.selected_obj = None;
                         self.dirty = true;
                     }
+                }
+            }
+            // Copiar (Ctrl+C): guarda os pixels da seleção flutuante e a devolve
+            // ao lugar (cópia não destrutiva — o frame de origem fica intacto).
+            if k_copy {
+                let data = self
+                    .float_sel
+                    .as_ref()
+                    .map(|fs| (fs.ow, fs.oh, fs.pixels.clone()));
+                if let Some(d) = data {
+                    self.clip = Some(d);
+                    self.commit_float();
+                    self.status = "Seleção copiada — Ctrl+V para colar (inclusive em outro frame)".into();
+                }
+            }
+            // Colar (Ctrl+V): cria uma nova seleção flutuante a partir do que foi
+            // copiado, no centro do canvas (funciona inclusive em outro frame).
+            if k_paste {
+                if let Some((ow, oh, px)) = self.clip.clone() {
+                    self.push_undo();
+                    self.commit_float();
+                    let (dw, dh) = (self.document.width as f32, self.document.height as f32);
+                    self.float_sel = Some(FloatSel {
+                        pixels: px,
+                        ow,
+                        oh,
+                        cx: dw / 2.0,
+                        cy: dh / 2.0,
+                        hw: ow as f32 / 2.0,
+                        hh: oh as f32 / 2.0,
+                        angle: 0.0,
+                        opacity: 1.0,
+                        layer: self.active_layer,
+                    });
+                    self.float_tex = None;
+                    self.tool = Tool::Select;
+                    self.selected_obj = None;
+                    self.dirty = true;
+                    self.status = "Colado — mova e confirme".into();
                 }
             }
         }
