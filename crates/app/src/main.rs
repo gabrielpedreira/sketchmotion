@@ -1054,7 +1054,7 @@ struct SketchMotionApp {
     rig_start: Option<(f32, f32)>,
     rig_preview: Option<(f32, f32)>,
     rig_shape: sketchmotion_core::BoneShape,
-    cursor_tex: [Option<egui::TextureHandle>; 5],
+    cursor_tex: [Option<egui::TextureHandle>; 6],
     piece_tex: [Option<egui::TextureHandle>; 6],
     part_tex: [Option<egui::TextureHandle>; 21],
     raptor_mini_tex: Option<egui::TextureHandle>,
@@ -1225,7 +1225,7 @@ impl SketchMotionApp {
             rig_start: None,
             rig_preview: None,
             rig_shape: sketchmotion_core::BoneShape::Limb,
-            cursor_tex: [None, None, None, None, None],
+            cursor_tex: [None, None, None, None, None, None],
             piece_tex: [None, None, None, None, None, None],
             part_tex: std::array::from_fn(|_| None),
             raptor_mini_tex: None,
@@ -2590,6 +2590,8 @@ impl SketchMotionApp {
         self.float_tex = None;
         self.tool = Tool::Select;
         self.selected_obj = None;
+        // Encerra a suspensão: cursor volta ao normal (agora é o modo Seleção).
+        self.place_piece = false;
         self.dirty = true;
         self.status = "Peça adicionada — mova e confirme".into();
     }
@@ -5416,15 +5418,23 @@ impl SketchMotionApp {
         if self.cursor_tex.iter().all(|t| t.is_some()) {
             return;
         }
-        const DATA: [&[u8]; 5] = [
+        const DATA: [&[u8]; 6] = [
             include_bytes!("../../../cursores/render/caneta.png"),
             include_bytes!("../../../cursores/render/balde.png"),
             include_bytes!("../../../cursores/render/contagotas.png"),
             include_bytes!("../../../cursores/render/laco.png"),
             include_bytes!("../../../cursores/render/varinha_magica.png"),
+            include_bytes!("../../../cursores/colocar_objeto.png"),
         ];
-        const NAMES: [&str; 5] = ["cur_caneta", "cur_balde", "cur_conta", "cur_laco", "cur_varinha"];
-        for i in 0..5 {
+        const NAMES: [&str; 6] = [
+            "cur_caneta",
+            "cur_balde",
+            "cur_conta",
+            "cur_laco",
+            "cur_varinha",
+            "cur_colocar",
+        ];
+        for i in 0..6 {
             if self.cursor_tex[i].is_some() {
                 continue;
             }
@@ -6845,6 +6855,8 @@ impl eframe::App for SketchMotionApp {
                             if !down && !self.lasso_points.is_empty() {
                                 let pts = std::mem::take(&mut self.lasso_points);
                                 self.capturar_grupo(&pts);
+                                // Laço é uma ação única: volta para Seleção (cursor normal).
+                                self.tool = Tool::Select;
                             }
                         }
                         self.last_pos = None;
@@ -7109,6 +7121,24 @@ impl eframe::App for SketchMotionApp {
                                             (3usize, (0.0426_f32, 0.0416_f32))
                                         } else {
                                             (4usize, (0.2286_f32, 0.1169_f32))
+                                        };
+                                        if !self.desenhar_cursor_img(&painter, ui.ctx(), hp, idx, hs)
+                                        {
+                                            ui.ctx().set_cursor_icon(CI::Crosshair);
+                                        }
+                                    } else {
+                                        ui.ctx().set_cursor_icon(CI::Crosshair);
+                                    }
+                                }
+                                Tool::Grupo => {
+                                    if let Some(hp) = hover {
+                                        // Colando peça = cursor colocar_objeto; senão = laço.
+                                        let (idx, hs) = if self.place_piece
+                                            && self.selected_piece.is_some()
+                                        {
+                                            (5usize, (0.06_f32, 0.05_f32))
+                                        } else {
+                                            (3usize, (0.0426_f32, 0.0416_f32))
                                         };
                                         if !self.desenhar_cursor_img(&painter, ui.ctx(), hp, idx, hs)
                                         {
