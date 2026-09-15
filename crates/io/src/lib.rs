@@ -9,7 +9,7 @@
 //! Erros são devolvidos como String por ora.
 
 use sketchmotion_color::PaletteLibrary;
-use sketchmotion_core::Document;
+use sketchmotion_core::{Document, PieceLibrary};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 pub const PROJECT_EXTENSION: &str = "sketchmotion";
 /// Extensão do arquivo de biblioteca de paletas.
 pub const LIBRARY_EXTENSION: &str = "smpalette";
+/// Extensão do arquivo de biblioteca de objetos/peças reutilizáveis.
+pub const PIECES_EXTENSION: &str = "smpieces";
 
 // ---------- Projeto ----------
 
@@ -55,6 +57,29 @@ pub fn save_library(lib: &PaletteLibrary, path: &Path) -> Result<(), String> {
 
 /// Carrega a biblioteca de paletas de um arquivo `.smpalette`.
 pub fn load_library(path: &Path) -> Result<PaletteLibrary, String> {
+    let file = File::open(path).map_err(|e| e.to_string())?;
+    ciborium::from_reader(BufReader::new(file)).map_err(|e| e.to_string())
+}
+
+// ---------- Biblioteca global de objetos/peças ----------
+
+/// Caminho padrão da biblioteca global de objetos
+/// (ex.: `%APPDATA%/SketchMotion/objetos.smpieces` no Windows).
+pub fn default_pieces_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("SketchMotion").join("objetos.smpieces"))
+}
+
+/// Salva a biblioteca de objetos no caminho dado (cria as pastas se preciso).
+pub fn save_pieces(lib: &PieceLibrary, path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let file = File::create(path).map_err(|e| e.to_string())?;
+    ciborium::into_writer(lib, BufWriter::new(file)).map_err(|e| e.to_string())
+}
+
+/// Carrega a biblioteca de objetos de um arquivo `.smpieces`.
+pub fn load_pieces(path: &Path) -> Result<PieceLibrary, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     ciborium::from_reader(BufReader::new(file)).map_err(|e| e.to_string())
 }

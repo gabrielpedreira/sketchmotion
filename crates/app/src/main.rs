@@ -9,7 +9,7 @@
 
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
-use sketchmotion_core::{Anchor, Color, Document, VectorObject};
+use sketchmotion_core::{Anchor, Color, Document, PieceLibrary, VectorObject};
 use sketchmotion_render::{render_frame_alpha, render_layers_alpha, PixelImage};
 use sketchmotion_tools::Tool;
 
@@ -1013,6 +1013,25 @@ struct SketchMotionApp {
     selected_char: Option<usize>,
     new_char_name: String,
     new_group_name: String,
+    // objetos/peças reutilizáveis (biblioteca global, colar como seleção)
+    pieces: PieceLibrary,
+    pieces_dirty: bool,
+    selected_piece: Option<usize>,
+    place_piece: bool,
+    win_pieces: bool,
+    /// Captura pendente aguardando confirmação de "agrupar" (w, h, rgba).
+    pending_group: Option<(u32, u32, Vec<u8>)>,
+    pending_name: String,
+    // edição isolada de uma peça (um "novo canvas" com o objeto desenhado)
+    win_edit_piece: Option<usize>,
+    edit_w: u32,
+    edit_h: u32,
+    edit_buf: Vec<u8>,
+    edit_erase: bool,
+    edit_size: i32,
+    edit_zoom: f32,
+    edit_tex: Option<egui::TextureHandle>,
+    edit_dirty: bool,
     icon_r_color: Option<egui::Rect>,
     icon_r_palette: Option<egui::Rect>,
     reopen_color: bool,
@@ -1146,6 +1165,9 @@ impl SketchMotionApp {
             .and_then(|p| sketchmotion_io::load_library(&p).ok())
             .unwrap_or_default();
         let selected_char = if library.characters.is_empty() { None } else { Some(0) };
+        let pieces = sketchmotion_io::default_pieces_path()
+            .and_then(|p| sketchmotion_io::load_pieces(&p).ok())
+            .unwrap_or_default();
 
         Self {
             document: Document::new(CANVAS_W, CANVAS_H, Color::WHITE),
@@ -1166,6 +1188,22 @@ impl SketchMotionApp {
             selected_char,
             new_char_name: String::new(),
             new_group_name: String::new(),
+            pieces,
+            pieces_dirty: false,
+            selected_piece: None,
+            place_piece: false,
+            win_pieces: false,
+            pending_group: None,
+            pending_name: String::new(),
+            win_edit_piece: None,
+            edit_w: 0,
+            edit_h: 0,
+            edit_buf: Vec::new(),
+            edit_erase: true,
+            edit_size: 3,
+            edit_zoom: 4.0,
+            edit_tex: None,
+            edit_dirty: false,
             icon_r_color: None,
             icon_r_palette: None,
             reopen_color: false,
@@ -2472,6 +2510,477 @@ impl SketchMotionApp {
         self.status = "Seleção livre recortada — arraste para mover".into();
     }
 
+    /// Captura (SEM apagar) o conteúdo visível dentro do contorno para virar uma
+    /// peça reutilizável, e abre a confirmação de "agrupar".
+    fn capturar_grupo(&mut self, pts: &[(f32, f32)]) {
+        if pts.len() < 3 {
+            return;
+        }
+        let (mut minx, mut miny) = (f32::INFINITY, f32::INFINITY);
+        let (mut maxx, mut maxy) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for &(x, y) in pts {
+            minx = minx.min(x);
+            miny = miny.min(y);
+            maxx = maxx.max(x);
+            maxy = maxy.max(y);
+        }
+        let x0 = (minx.floor() as i32).max(0);
+        let y0 = (miny.floor() as i32).max(0);
+        let x1 = (maxx.ceil() as i32).min(self.document.width as i32);
+        let y1 = (maxy.ceil() as i32).min(self.document.height as i32);
+        if x1 - x0 < 1 || y1 - y0 < 1 {
+            return;
+        }
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        // Composição atual (todas as camadas + vetores) = o que está visível.
+        let comp = render_frame_alpha(
+            self.document.width,
+            self.document.height,
+            &self.document.layers,
+            &self.document.vectors,
+        );
+        let cw = self.document.width as usize;
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        for yy in 0..h {
+            for xx in 0..w {
+                let wx = x0 as f32 + xx as f32 + 0.5;
+                let wy = y0 as f32 + yy as f32 + 0.5;
+                if ponto_no_poligono(wx, wy, pts) {
+                    let sx = x0 as usize + xx as usize;
+                    let sy = y0 as usize + yy as usize;
+                    let si = (sy * cw + sx) * 4;
+                    let di = ((yy * w + xx) * 4) as usize;
+                    if si + 4 <= comp.rgba.len() {
+                        pixels[di..di + 4].copy_from_slice(&comp.rgba[si..si + 4]);
+                    }
+                }
+            }
+        }
+        let n = self.pieces.pieces.len() + 1;
+        self.pending_group = Some((w, h, pixels));
+        self.pending_name = format!("Objeto {n}");
+        self.win_pieces = true;
+        self.status = "Agrupar como objeto? Confirme na janela Objetos".into();
+    }
+
+    /// Adiciona a peça selecionada como seleção flutuante (colar), centrada em
+    /// (dx, dy), entrando em modo de seleção para mover antes de confirmar.
+    fn colar_peca(&mut self, dx: f32, dy: f32) {
+        let Some(i) = self.selected_piece else {
+            return;
+        };
+        let (ow, oh, pixels) = match self.pieces.pieces.get(i) {
+            Some(p) if p.w > 0 && p.h > 0 => (p.w, p.h, p.rgba.clone()),
+            _ => return,
+        };
+        self.commit_float();
+        self.push_undo();
+        self.float_sel = Some(FloatSel {
+            pixels,
+            ow,
+            oh,
+            cx: dx,
+            cy: dy,
+            hw: ow as f32 / 2.0,
+            hh: oh as f32 / 2.0,
+            angle: 0.0,
+            opacity: 1.0,
+            layer: self.active_layer,
+        });
+        self.float_tex = None;
+        self.tool = Tool::Select;
+        self.selected_obj = None;
+        self.dirty = true;
+        self.status = "Peça adicionada — mova e confirme".into();
+    }
+
+    /// Salva a biblioteca de objetos no arquivo global.
+    fn salvar_pecas(&mut self) {
+        if let Some(path) = sketchmotion_io::default_pieces_path() {
+            if let Err(e) = sketchmotion_io::save_pieces(&self.pieces, &path) {
+                self.status = format!("Erro ao salvar objetos: {e}");
+            }
+        }
+    }
+
+    /// Janela "Objetos": confirmação de agrupar + lista de peças salvas
+    /// (miniatura, renomear, colar, excluir).
+    fn janela_objetos(&mut self, ctx: &egui::Context) {
+        // Confirmação de agrupar (após o laço capturar a seleção).
+        if self.pending_group.is_some() {
+            let mut salvar = false;
+            let mut cancelar = false;
+            egui::Window::new("Agrupar objeto")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("Salvar essa seleção como um objeto reutilizável?");
+                    if let Some((w, h, rgba)) = &self.pending_group {
+                        let full = PixelImage {
+                            width: *w as i32,
+                            height: *h as i32,
+                            rgba: rgba.clone(),
+                        };
+                        let img = thumb_image(&full, 80, 80);
+                        let tex = ui.ctx().load_texture(
+                            "pending_thumb",
+                            img,
+                            egui::TextureOptions::NEAREST,
+                        );
+                        ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                            tex.id(),
+                            egui::vec2(80.0, 80.0),
+                        )));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Nome:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pending_name)
+                                .desired_width(170.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Salvar").clicked() {
+                            salvar = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            cancelar = true;
+                        }
+                    });
+                });
+            if salvar {
+                if let Some((w, h, rgba)) = self.pending_group.take() {
+                    let name = if self.pending_name.trim().is_empty() {
+                        "Objeto".to_string()
+                    } else {
+                        self.pending_name.trim().to_string()
+                    };
+                    let idx = self.pieces.add(name, w, h, rgba);
+                    self.selected_piece = Some(idx);
+                    self.pieces_dirty = true;
+                    self.win_pieces = true;
+                    self.status = "Objeto salvo".into();
+                }
+            }
+            if cancelar {
+                self.pending_group = None;
+            }
+        }
+
+        let mut open = self.win_pieces;
+        let mut usar: Option<usize> = None;
+        let mut del: Option<usize> = None;
+        let mut abrir_edit: Option<usize> = None;
+        egui::Window::new("Objetos")
+            .open(&mut open)
+            .default_width(290.0)
+            .show(ctx, |ui| {
+                if ui
+                    .button("＋ Novo objeto (laço)")
+                    .on_hover_text("Desenhe um laço em volta do que quer agrupar")
+                    .clicked()
+                {
+                    self.place_piece = false;
+                    self.selected_piece = None;
+                    self.tool = Tool::Grupo;
+                    self.status = "Desenhe um laço em volta do objeto para agrupar".into();
+                }
+                ui.separator();
+                if self.pieces.pieces.is_empty() {
+                    ui.label("Nenhum objeto salvo ainda.");
+                }
+                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                    for i in 0..self.pieces.pieces.len() {
+                        let armed = self.place_piece && self.selected_piece == Some(i);
+                        let (w, h) = (self.pieces.pieces[i].w, self.pieces.pieces[i].h);
+                        let full = PixelImage {
+                            width: w as i32,
+                            height: h as i32,
+                            rgba: self.pieces.pieces[i].rgba.clone(),
+                        };
+                        let img = thumb_image(&full, 46, 46);
+                        let tex = ui.ctx().load_texture(
+                            format!("obj_thumb_{i}"),
+                            img,
+                            egui::TextureOptions::NEAREST,
+                        );
+                        ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Image::from_texture(
+                                        egui::load::SizedTexture::new(
+                                            tex.id(),
+                                            egui::vec2(46.0, 46.0),
+                                        ),
+                                    ));
+                                    ui.vertical(|ui| {
+                                        if armed {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(0x2F, 0x84, 0xFE),
+                                                "● pronto para colar",
+                                            );
+                                        }
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(
+                                                    &mut self.pieces.pieces[i].name,
+                                                )
+                                                .desired_width(160.0),
+                                            )
+                                            .changed()
+                                        {
+                                            self.pieces_dirty = true;
+                                        }
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .button("Colar")
+                                                .on_hover_text("Clique no canvas para adicionar")
+                                                .clicked()
+                                            {
+                                                usar = Some(i);
+                                            }
+                                            if ui
+                                                .button("Editar")
+                                                .on_hover_text("Abrir a peça para limpar/retocar")
+                                                .clicked()
+                                            {
+                                                abrir_edit = Some(i);
+                                            }
+                                            if ui
+                                                .button(egui_phosphor::regular::TRASH)
+                                                .on_hover_text("Excluir objeto")
+                                                .clicked()
+                                            {
+                                                del = Some(i);
+                                            }
+                                        });
+                                    });
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+                });
+                if self.place_piece {
+                    if let Some(i) = self.selected_piece {
+                        if let Some(p) = self.pieces.pieces.get(i) {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0x2F, 0x84, 0xFE),
+                                format!("\"{}\" pronto — clique no canvas para colar", p.name),
+                            );
+                        }
+                    }
+                }
+            });
+        if let Some(i) = usar {
+            self.selected_piece = Some(i);
+            self.place_piece = true;
+            self.tool = Tool::Grupo;
+            self.status = "Clique no canvas para colar a peça".into();
+        }
+        if let Some(i) = abrir_edit {
+            if let Some(p) = self.pieces.pieces.get(i) {
+                self.edit_w = p.w;
+                self.edit_h = p.h;
+                self.edit_buf = p.rgba.clone();
+                self.win_edit_piece = Some(i);
+                self.edit_tex = None;
+                self.edit_dirty = true;
+                let m = p.w.max(p.h).max(1) as f32;
+                self.edit_zoom = (360.0 / m).floor().clamp(1.0, 24.0);
+            }
+        }
+        if let Some(i) = del {
+            self.pieces.remove(i);
+            self.pieces_dirty = true;
+            match self.selected_piece {
+                Some(s) if s == i => {
+                    self.selected_piece = None;
+                    self.place_piece = false;
+                }
+                Some(s) if s > i => self.selected_piece = Some(s - 1),
+                _ => {}
+            }
+        }
+        self.win_pieces = open;
+    }
+
+    /// Pinta/apaga um quadrado no buffer de edição da peça (coords em pixel).
+    fn pintar_edit(&mut self, px: i32, py: i32) {
+        let (w, h) = (self.edit_w as i32, self.edit_h as i32);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let s = self.edit_size.max(1);
+        let half = (s - 1) / 2;
+        let (r, g, b, a) = if self.edit_erase {
+            (0u8, 0u8, 0u8, 0u8)
+        } else {
+            (
+                self.brush_color.r(),
+                self.brush_color.g(),
+                self.brush_color.b(),
+                self.brush_color.a(),
+            )
+        };
+        for dy in 0..s {
+            for dx in 0..s {
+                let x = px + dx - half;
+                let y = py + dy - half;
+                if x >= 0 && y >= 0 && x < w && y < h {
+                    let idx = ((y * w + x) * 4) as usize;
+                    if idx + 4 <= self.edit_buf.len() {
+                        self.edit_buf[idx] = r;
+                        self.edit_buf[idx + 1] = g;
+                        self.edit_buf[idx + 2] = b;
+                        self.edit_buf[idx + 3] = a;
+                    }
+                }
+            }
+        }
+        self.edit_dirty = true;
+    }
+
+    /// Tela de edição isolada da peça: um "novo canvas" com o objeto desenhado,
+    /// com pincel/borracha para limpar o entorno, e a opção de salvar.
+    fn janela_editar_peca(&mut self, ctx: &egui::Context) {
+        let Some(pi) = self.win_edit_piece else {
+            return;
+        };
+        if pi >= self.pieces.pieces.len() || self.edit_w == 0 || self.edit_h == 0 {
+            self.win_edit_piece = None;
+            return;
+        }
+        let (w, h) = (self.edit_w, self.edit_h);
+        // (Re)constrói a textura de pré-visualização quando o buffer muda.
+        if self.edit_dirty || self.edit_tex.is_none() {
+            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                [w as usize, h as usize],
+                &self.edit_buf,
+            );
+            match &mut self.edit_tex {
+                Some(t) => t.set(ci, egui::TextureOptions::NEAREST),
+                None => {
+                    self.edit_tex =
+                        Some(ctx.load_texture("edit_piece", ci, egui::TextureOptions::NEAREST))
+                }
+            }
+            self.edit_dirty = false;
+        }
+        let mut salvar = false;
+        let mut cancelar = false;
+        let mut open = true;
+        egui::Window::new("Editar objeto")
+            .open(&mut open)
+            .default_size(egui::vec2(560.0, 540.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.edit_erase, false, "Pincel");
+                    ui.selectable_value(&mut self.edit_erase, true, "Borracha");
+                    ui.separator();
+                    ui.label("Tamanho:");
+                    ui.add(egui::Slider::new(&mut self.edit_size, 1..=40));
+                    ui.separator();
+                    let (rc, resp) =
+                        ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                    ui.painter().rect_filled(rc, 3.0, self.brush_color);
+                    ui.painter().rect_stroke(
+                        rc,
+                        3.0,
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120)),
+                    );
+                    if resp
+                        .on_hover_text("Cor atual do pincel (clique para escolher)")
+                        .clicked()
+                    {
+                        self.win_color = true;
+                        self.reopen_color = true;
+                    }
+                    ui.separator();
+                    if ui.button("－").on_hover_text("Menos zoom").clicked() {
+                        self.edit_zoom = (self.edit_zoom / 1.25).max(1.0);
+                    }
+                    if ui.button("＋").on_hover_text("Mais zoom").clicked() {
+                        self.edit_zoom = (self.edit_zoom * 1.25).min(32.0);
+                    }
+                });
+                ui.separator();
+                let zoom = self.edit_zoom.max(1.0);
+                let size = egui::vec2(w as f32 * zoom, h as f32 * zoom);
+                egui::ScrollArea::both().max_height(400.0).show(ui, |ui| {
+                    let (rect, _response) =
+                        ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                    let p = ui.painter_at(rect);
+                    // Fundo xadrez (transparência).
+                    let cell = 8.0_f32.max(zoom);
+                    p.rect_filled(rect, 0.0, egui::Color32::from_gray(210));
+                    let nx = (rect.width() / cell).ceil() as i32;
+                    let ny = (rect.height() / cell).ceil() as i32;
+                    for j in 0..ny {
+                        for i in 0..nx {
+                            if (i + j) % 2 == 0 {
+                                continue;
+                            }
+                            let x = rect.left() + i as f32 * cell;
+                            let y = rect.top() + j as f32 * cell;
+                            let cr = egui::Rect::from_min_size(
+                                egui::pos2(x, y),
+                                egui::vec2(cell, cell),
+                            )
+                            .intersect(rect);
+                            p.rect_filled(cr, 0.0, egui::Color32::from_gray(165));
+                        }
+                    }
+                    if let Some(t) = &self.edit_tex {
+                        p.image(
+                            t.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    let down = ui.input(|i| i.pointer.primary_down());
+                    let pos = ui.input(|i| i.pointer.latest_pos());
+                    if down {
+                        if let Some(pp) = pos {
+                            if rect.contains(pp) {
+                                let px = ((pp.x - rect.min.x) / zoom).floor() as i32;
+                                let py = ((pp.y - rect.min.y) / zoom).floor() as i32;
+                                self.pintar_edit(px, py);
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Salvar alterações").clicked() {
+                        salvar = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        cancelar = true;
+                    }
+                });
+                ui.label(
+                    "Apague o entorno com a Borracha (fica transparente) e salve a peça limpa.",
+                );
+            });
+        if salvar {
+            if pi < self.pieces.pieces.len() {
+                self.pieces.pieces[pi].rgba = self.edit_buf.clone();
+                self.pieces.pieces[pi].w = w;
+                self.pieces.pieces[pi].h = h;
+                self.pieces_dirty = true;
+                self.status = "Objeto atualizado".into();
+            }
+            self.win_edit_piece = None;
+            self.edit_tex = None;
+        }
+        if cancelar || !open {
+            self.win_edit_piece = None;
+            self.edit_tex = None;
+        }
+    }
+
     /// Varinha mágica: seleciona a região de cor semelhante (contígua ou toda a
     /// camada) e recorta para uma seleção flutuante.
     fn lift_wand(&mut self, x0: i32, y0: i32) {
@@ -3451,6 +3960,7 @@ impl SketchMotionApp {
                         Tool::Shapes => self.opcoes_formas(ui),
                         Tool::Fill => self.opcoes_balde(ui),
                         Tool::Rig => self.opcoes_rig(ui),
+                        Tool::Grupo => self.opcoes_objetos(ui),
                     }
                 }
             });
@@ -3809,6 +4319,22 @@ impl SketchMotionApp {
         ui.weak("Arraste no canvas para desenhar a forma.");
     }
 
+    fn opcoes_objetos(&mut self, ui: &mut egui::Ui) {
+        if self.place_piece && self.selected_piece.is_some() {
+            ui.label("Clique no canvas para colar a peça.");
+            if ui.button("Parar de colar (voltar ao laço)").clicked() {
+                self.place_piece = false;
+                self.selected_piece = None;
+            }
+        } else {
+            ui.label("Laço: contorne o objeto e confirme para agrupar.");
+        }
+        ui.separator();
+        if ui.button("Janela de objetos").clicked() {
+            self.win_pieces = true;
+        }
+    }
+
     fn opcoes_balde(&mut self, ui: &mut egui::Ui) {
         ui.label("Tolerância:");
         ui.add(egui::Slider::new(&mut self.fill_tolerance, 0..=150));
@@ -3918,6 +4444,18 @@ impl SketchMotionApp {
                         self.win_rig = !self.win_rig;
                         if self.win_rig {
                             self.reopen_rig = true;
+                        }
+                    }
+                    ui.add_space(6.0);
+
+                    let resp_o = icon_button(ui, self.win_pieces, icon::COPY)
+                        .on_hover_text("Objetos — agrupar por laço e reutilizar peças");
+                    if resp_o.clicked() {
+                        self.win_pieces = !self.win_pieces;
+                        if self.win_pieces {
+                            self.tool = Tool::Grupo;
+                            self.place_piece = false;
+                            self.eyedropper = Eyedropper::Off;
                         }
                     }
                 });
@@ -5788,6 +6326,8 @@ impl eframe::App for SketchMotionApp {
         self.janela_paletas(ctx);
         self.janela_camadas(ctx);
         self.janela_rig(ctx);
+        self.janela_objetos(ctx);
+        self.janela_editar_peca(ctx);
         self.ensure_piece_textures(ctx);
         self.ensure_part_textures(ctx);
         self.barra_frames(ctx);
@@ -6281,6 +6821,33 @@ impl eframe::App for SketchMotionApp {
                             self.float_release();
                         }
                         self.last_pos = None;
+                    } else if self.tool == Tool::Grupo {
+                        if self.place_piece && self.selected_piece.is_some() {
+                            // Peça armada: um clique cola no ponto clicado.
+                            if pressed {
+                                if let Some(pp) = hover {
+                                    let (dx, dy) = to_doc(pp);
+                                    self.colar_peca(dx, dy);
+                                }
+                            }
+                        } else {
+                            // Laço para capturar/agrupar (não destrutivo).
+                            if pressed {
+                                if let Some(pp) = hover {
+                                    self.lasso_points = vec![to_doc(pp)];
+                                }
+                            }
+                            if down && !self.lasso_points.is_empty() {
+                                if let Some(pp) = ppos {
+                                    self.lasso_points.push(to_doc(pp));
+                                }
+                            }
+                            if !down && !self.lasso_points.is_empty() {
+                                let pts = std::mem::take(&mut self.lasso_points);
+                                self.capturar_grupo(&pts);
+                            }
+                        }
+                        self.last_pos = None;
                     } else if self.tool == Tool::Rig {
                         if let Some(si) = self.rig_active_index() {
                             match self.rig_mode {
@@ -6412,7 +6979,9 @@ impl eframe::App for SketchMotionApp {
                         }
                     }
 
-                    if self.tool == Tool::Lasso && self.lasso_points.len() >= 2 {
+                    if matches!(self.tool, Tool::Lasso | Tool::Grupo)
+                        && self.lasso_points.len() >= 2
+                    {
                         let painter = ui.painter_at(rect);
                         let pts: Vec<egui::Pos2> = self
                             .lasso_points
@@ -6829,6 +7398,10 @@ impl eframe::App for SketchMotionApp {
         if self.library_dirty {
             self.salvar_biblioteca();
             self.library_dirty = false;
+        }
+        if self.pieces_dirty {
+            self.salvar_pecas();
+            self.pieces_dirty = false;
         }
     }
 }

@@ -31,6 +31,8 @@ pub enum Tool {
     Eraser,
     /// Rig 2D — criar/posar esqueletos de ossos (painel direito).
     Rig,
+    /// Objetos — laço para agrupar/salvar peças e reutilizá-las (colar).
+    Grupo,
 }
 
 impl Tool {
@@ -60,6 +62,7 @@ impl Tool {
             Tool::Pencil => "Pincel",
             Tool::Eraser => "Borracha",
             Tool::Rig => "Rig",
+            Tool::Grupo => "Objetos",
         }
     }
 }
