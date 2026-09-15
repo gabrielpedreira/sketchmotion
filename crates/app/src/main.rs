@@ -9,7 +9,7 @@
 
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
-use sketchmotion_core::{Anchor, Color, Document, PieceLibrary, VectorObject};
+use sketchmotion_core::{Anchor, Color, Document, Frame, Layer, PieceLibrary, VectorObject};
 use sketchmotion_render::{render_frame_alpha, render_layers_alpha, PixelImage};
 use sketchmotion_tools::Tool;
 
@@ -71,6 +71,28 @@ fn to_color32(c: Color) -> egui::Color32 {
 }
 
 /// Reduz uma imagem RGBA a uma miniatura (amostragem nearest).
+/// Ajusta uma camada de outro documento ao tamanho (w, h) atual: mesma → clona;
+/// diferente → cria uma nova e copia a região que couber (topo-esquerda).
+fn fit_layer(src: &Layer, w: u32, h: u32) -> Layer {
+    if src.width() == w && src.height() == h {
+        return src.clone();
+    }
+    let mut nl = Layer::new(src.name.clone(), w, h);
+    let cw = w.min(src.width());
+    let ch = h.min(src.height());
+    for y in 0..ch {
+        for x in 0..cw {
+            if let Some(c) = src.get_pixel(x, y) {
+                nl.set_pixel(x, y, c);
+            }
+        }
+    }
+    nl.visible = src.visible;
+    nl.locked = src.locked;
+    nl.set_opacity(src.opacity());
+    nl
+}
+
 fn thumb_image(full: &PixelImage, tw: usize, th: usize) -> egui::ColorImage {
     let (fw, fh) = (full.width as usize, full.height as usize);
     let mut out = vec![0u8; tw * th * 4];
@@ -1140,6 +1162,10 @@ struct SketchMotionApp {
     // timelines (faixas)
     view_both: bool,
     play_both: bool,
+    /// Frame copiado (Copiar/Colar frames, inclusive entre timelines/arquivos).
+    frame_clip: Option<Frame>,
+    /// Arrasto de frame em andamento: (faixa, índice do frame).
+    drag_frame: Option<(usize, usize)>,
     /// Cache de miniaturas por faixa/frame (evita re-renderizar tudo a cada quadro).
     track_thumbs: Vec<Vec<Option<egui::TextureHandle>>>,
     /// Cache das texturas de sobreposição entre timelines (onion/ver ambas).
@@ -1298,6 +1324,8 @@ impl SketchMotionApp {
             onion_for: None,
             view_both: false,
             play_both: false,
+            frame_clip: None,
+            drag_frame: None,
             track_thumbs: Vec::new(),
             between_cache: Vec::new(),
             between_key: None,
@@ -1809,6 +1837,67 @@ impl SketchMotionApp {
             }
         }
         false
+    }
+
+    /// Abre OUTRO arquivo .sketchmotion como timelines adicionais neste trabalho
+    /// (para reaproveitar frames/elementos/referências). NÃO troca o arquivo de
+    /// salvamento: quem é salvo continua sendo o primeiro (current_path).
+    fn abrir_referencia(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
+            .pick_file()
+        else {
+            return;
+        };
+        let doc2 = match sketchmotion_io::load(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("Erro ao abrir referência: {e}");
+                return;
+            }
+        };
+        // Grava a faixa ativa antes de acrescentar as novas.
+        self.document.sync_to_frames();
+        let (dw, dh) = (self.document.width, self.document.height);
+        let base = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("referência")
+            .to_string();
+        let varias = doc2.tracks.len() > 1;
+        let mut adicionadas = 0usize;
+        for t in &doc2.tracks {
+            let mut frames_fit: Vec<Frame> = Vec::with_capacity(t.frames.len());
+            for f in &t.frames {
+                let layers_fit: Vec<Layer> =
+                    f.layers.iter().map(|l| fit_layer(l, dw, dh)).collect();
+                frames_fit.push(Frame {
+                    layers: layers_fit,
+                    vectors: f.vectors.clone(),
+                });
+            }
+            if frames_fit.is_empty() {
+                continue;
+            }
+            let name = if varias {
+                format!("{base} · {}", t.name)
+            } else {
+                base.clone()
+            };
+            self.document.push_track(name, frames_fit, t.fps);
+            adicionadas += 1;
+        }
+        self.track_thumbs.clear();
+        self.onion_for = None;
+        self.dirty = true;
+        self.status = if doc2.width != dw || doc2.height != dh {
+            format!(
+                "Referência aberta ({} timeline(s)) — tamanhos diferentes ({}x{}), elementos ajustados ao topo-esquerda",
+                adicionadas, doc2.width, doc2.height
+            )
+        } else {
+            format!("Referência aberta: {base} ({adicionadas} timeline(s))")
+        };
     }
 
     fn salvar_biblioteca(&mut self) {
@@ -3555,6 +3644,12 @@ impl SketchMotionApp {
         let mut do_prev: Option<usize> = None;
         let mut do_next: Option<usize> = None;
         let mut goto: Option<(usize, usize)> = None;
+        let mut open_ref = false;
+        let mut do_copy: Option<usize> = None;
+        let mut do_paste: Option<usize> = None;
+        // Arrasto de frames: início (faixa, frame) e aplicação (faixa, de, para).
+        let mut drag_start: Option<(usize, usize)> = None;
+        let mut drag_apply: Option<(usize, usize, usize)> = None;
 
         let ntr = self.document.tracks.len();
         let active = self.document.active_track;
@@ -3575,6 +3670,16 @@ impl SketchMotionApp {
                         .clicked()
                     {
                         track_add = true;
+                    }
+                    if ui
+                        .button("Abrir outro trabalho neste projeto")
+                        .on_hover_text(
+                            "Abre outro .sketchmotion como timelines abaixo (referência). \
+                             O salvamento continua sendo o arquivo atual.",
+                        )
+                        .clicked()
+                    {
+                        open_ref = true;
                     }
                     ui.separator();
                     if ui
@@ -3679,6 +3784,24 @@ impl SketchMotionApp {
                                             do_delframe = Some(ti);
                                         }
                                         ui.separator();
+                                        if ui
+                                            .button("Copiar")
+                                            .on_hover_text("Copiar o frame atual")
+                                            .clicked()
+                                        {
+                                            do_copy = Some(ti);
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                self.frame_clip.is_some(),
+                                                egui::Button::new("Colar"),
+                                            )
+                                            .on_hover_text("Colar o frame copiado após o atual")
+                                            .clicked()
+                                        {
+                                            do_paste = Some(ti);
+                                        }
+                                        ui.separator();
                                         if ui.button("◀").clicked() {
                                             do_prev = Some(ti);
                                         }
@@ -3715,9 +3838,11 @@ impl SketchMotionApp {
                                             }
                                         }
                                     });
-                                    // Tira de frames desta timeline.
+                                    // Tira de frames desta timeline (arrastável para reordenar).
                                     ui.push_id(ti, |ui| {
-                                        egui::ScrollArea::horizontal().show(ui, |ui| {
+                                        egui::ScrollArea::horizontal()
+                                            .drag_to_scroll(false)
+                                            .show(ui, |ui| {
                                             ui.horizontal(|ui| {
                                                 let total = if is_active {
                                                     self.document.frames.len()
@@ -3729,9 +3854,14 @@ impl SketchMotionApp {
                                                 } else {
                                                     self.document.tracks[ti].current
                                                 };
+                                                let dragging_this = matches!(
+                                                    self.drag_frame,
+                                                    Some((dt, _)) if dt == ti
+                                                );
+                                                let mut rects: Vec<egui::Rect> =
+                                                    Vec::with_capacity(total);
                                                 for fi in 0..total {
                                                     let sel = fi == cur;
-                                                    // Miniatura vem do cache (preparado antes do painel).
                                                     let tex = match self
                                                         .track_thumbs
                                                         .get(ti)
@@ -3746,12 +3876,14 @@ impl SketchMotionApp {
                                                             th_w as f32,
                                                             th_h as f32 + 14.0,
                                                         ),
-                                                        egui::Sense::click(),
+                                                        egui::Sense::click_and_drag(),
                                                     );
                                                     let img_rect = egui::Rect::from_min_size(
                                                         rect.min,
                                                         egui::vec2(th_w as f32, th_h as f32),
                                                     );
+                                                    rects.push(img_rect);
+                                                    let being = self.drag_frame == Some((ti, fi));
                                                     let painter = ui.painter_at(rect);
                                                     painter.rect_filled(
                                                         img_rect,
@@ -3767,7 +3899,14 @@ impl SketchMotionApp {
                                                         ),
                                                         egui::Color32::WHITE,
                                                     );
-                                                    let cor = if sel && is_active {
+                                                    if being {
+                                                        painter.rect_filled(
+                                                            img_rect,
+                                                            0.0,
+                                                            egui::Color32::from_black_alpha(130),
+                                                        );
+                                                    }
+                                                    let cor = if being || (sel && is_active) {
                                                         egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
                                                     } else if sel {
                                                         egui::Color32::from_gray(150)
@@ -3778,7 +3917,7 @@ impl SketchMotionApp {
                                                         img_rect,
                                                         0.0,
                                                         egui::Stroke::new(
-                                                            if sel { 2.0 } else { 1.0 },
+                                                            if sel || being { 2.0 } else { 1.0 },
                                                             cor,
                                                         ),
                                                     );
@@ -3792,10 +3931,53 @@ impl SketchMotionApp {
                                                         egui::FontId::proportional(11.0),
                                                         cor,
                                                     );
+                                                    if resp.drag_started() {
+                                                        drag_start = Some((ti, fi));
+                                                    }
                                                     if resp.clicked() {
                                                         goto = Some((ti, fi));
                                                     }
                                                     ui.add_space(5.0);
+                                                }
+                                                // Tarja azul de inserção enquanto arrasta nesta faixa.
+                                                if dragging_this && !rects.is_empty() {
+                                                    if let Some(px) =
+                                                        ui.input(|i| i.pointer.interact_pos()).map(|p| p.x)
+                                                    {
+                                                        let mut gap = rects
+                                                            .iter()
+                                                            .filter(|r| r.center().x < px)
+                                                            .count();
+                                                        if gap > rects.len() {
+                                                            gap = rects.len();
+                                                        }
+                                                        let bar_x = if gap == 0 {
+                                                            rects[0].left() - 3.0
+                                                        } else if gap >= rects.len() {
+                                                            rects[rects.len() - 1].right() + 3.0
+                                                        } else {
+                                                            (rects[gap - 1].right()
+                                                                + rects[gap].left())
+                                                                * 0.5
+                                                        };
+                                                        ui.painter().line_segment(
+                                                            [
+                                                                egui::pos2(bar_x, rects[0].top()),
+                                                                egui::pos2(bar_x, rects[0].bottom()),
+                                                            ],
+                                                            egui::Stroke::new(
+                                                                3.0,
+                                                                egui::Color32::from_rgb(
+                                                                    0x2F, 0x84, 0xFE,
+                                                                ),
+                                                            ),
+                                                        );
+                                                        if ui.input(|i| i.pointer.any_released()) {
+                                                            if let Some((_, from)) = self.drag_frame {
+                                                                drag_apply = Some((ti, from, gap));
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             });
                                         });
@@ -3899,6 +4081,53 @@ impl SketchMotionApp {
                 self.play_done = false;
                 self.playing = true;
             }
+        }
+        if let Some(ti) = do_copy {
+            let f = if ti == self.document.active_track {
+                self.document.current_frame_clone()
+            } else if let Some(t) = self.document.tracks.get(ti) {
+                let c = t.current.min(t.frames.len().saturating_sub(1));
+                t.frames.get(c).cloned()
+                    .unwrap_or_else(|| self.document.current_frame_clone())
+            } else {
+                self.document.current_frame_clone()
+            };
+            self.frame_clip = Some(f);
+            self.status = "Frame copiado — use Colar na timeline desejada".into();
+        }
+        if let Some(ti) = do_paste {
+            if let Some(f) = self.frame_clip.clone() {
+                if ti != self.document.active_track {
+                    self.document.go_to_track(ti);
+                }
+                self.document.paste_frame(f);
+                self.track_thumbs.clear();
+                self.onion_for = None;
+                self.dirty = true;
+                self.playing = false;
+                self.status = "Frame colado após o atual".into();
+            }
+        }
+        // Arrasto de frames: registra início e aplica movimento ao soltar.
+        if let Some((ti, fi)) = drag_start {
+            self.drag_frame = Some((ti, fi));
+        }
+        if let Some((ti, from, to)) = drag_apply {
+            if ti != self.document.active_track {
+                self.document.go_to_track(ti);
+            }
+            self.document.move_frame(from, to);
+            self.drag_frame = None;
+            self.track_thumbs.clear();
+            self.onion_for = None;
+            self.dirty = true;
+            self.playing = false;
+        } else if self.drag_frame.is_some() && ctx.input(|i| !i.pointer.any_down()) {
+            // Arrasto terminou sem alvo válido: cancela.
+            self.drag_frame = None;
+        }
+        if open_ref {
+            self.abrir_referencia();
         }
     }
 

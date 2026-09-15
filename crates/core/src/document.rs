@@ -217,6 +217,19 @@ impl Document {
         idx
     }
 
+    /// Acrescenta uma faixa já pronta (ex.: importar de outro arquivo como
+    /// referência). NÃO troca a faixa ativa. Devolve o índice dela.
+    pub fn push_track(&mut self, name: impl Into<String>, frames: Vec<Frame>, fps: u32) -> usize {
+        self.tracks.push(Track {
+            name: name.into(),
+            frames,
+            current: 0,
+            fps: fps.max(1),
+            visible: true,
+        });
+        self.tracks.len() - 1
+    }
+
     /// Remove uma faixa (mantém ao menos uma).
     pub fn remove_track(&mut self, i: usize) {
         if self.tracks.len() <= 1 || i >= self.tracks.len() {
@@ -268,6 +281,47 @@ impl Document {
         self.layers = self.frames[at].layers.clone();
         self.vectors = self.frames[at].vectors.clone();
         at
+    }
+
+    /// Clona o frame atual (cópia de trabalho) — para copiar/colar frames.
+    pub fn current_frame_clone(&self) -> Frame {
+        Frame {
+            layers: self.layers.clone(),
+            vectors: self.vectors.clone(),
+        }
+    }
+
+    /// Insere um frame (colado) logo após o atual e vai para ele.
+    pub fn paste_frame(&mut self, frame: Frame) -> usize {
+        self.sync_to_frames();
+        let at = (self.current + 1).min(self.frames.len());
+        self.frames.insert(at, frame);
+        self.current = at;
+        self.layers = self.frames[at].layers.clone();
+        self.vectors = self.frames[at].vectors.clone();
+        self.mirror_to_track();
+        at
+    }
+
+    /// Move um frame de `from` para a lacuna `to` (0..=len) na faixa ativa.
+    pub fn move_frame(&mut self, from: usize, to: usize) {
+        if from >= self.frames.len() {
+            return;
+        }
+        self.sync_to_frames();
+        let f = self.frames.remove(from);
+        let mut t = to.min(self.frames.len() + 1);
+        if t > from {
+            t -= 1;
+        }
+        if t > self.frames.len() {
+            t = self.frames.len();
+        }
+        self.frames.insert(t, f);
+        self.current = t;
+        self.layers = self.frames[self.current].layers.clone();
+        self.vectors = self.frames[self.current].vectors.clone();
+        self.mirror_to_track();
     }
 
     /// Remove um frame (mantém ao menos um).
