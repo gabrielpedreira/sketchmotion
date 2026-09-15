@@ -9,8 +9,10 @@
 
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
-use sketchmotion_core::{Anchor, Color, Document, Frame, Layer, PieceLibrary, VectorObject};
-use sketchmotion_render::{render_frame_alpha, render_layers_alpha, PixelImage};
+use sketchmotion_core::{
+    Anchor, Color, Document, Frame, ImageObject, Layer, PieceLibrary, VectorObject,
+};
+use sketchmotion_render::{rasterize_images, render_frame_alpha, render_layers_alpha, PixelImage};
 use sketchmotion_tools::Tool;
 
 const CANVAS_W: u32 = 800;
@@ -983,6 +985,10 @@ struct FloatSel {
     /// Camada à qual este elemento pertence. O bloqueio e a confirmação
     /// seguem ESTA camada, não a camada ativa no momento.
     layer: usize,
+    /// `true` quando a flutuante é um OBJETO DE IMAGEM (Caminho B): ao soltar,
+    /// vira um `ImageObject` persistente em vez de ser integrada aos pixels.
+    /// Só o botão "Integrar" a rasteriza na camada.
+    is_image: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1088,6 +1094,8 @@ struct SketchMotionApp {
     export_scale: u32,
     export_cols: u32,
     bg_white: bool,
+    /// Fundo escuro (cinza bem escuro) — só visual, ajuda a ver certos detalhes.
+    bg_dark: bool,
     pixel_mode: bool,
     screen: Screen,
     home_w: u32,
@@ -1279,6 +1287,7 @@ impl SketchMotionApp {
             export_scale: 1,
             export_cols: 0,
             bg_white: false,
+            bg_dark: false,
             pixel_mode: false,
             screen: Screen::Home,
             home_w: 800,
@@ -1815,6 +1824,7 @@ impl SketchMotionApp {
                 self.document.height,
                 &self.document.layers,
                 &self.document.vectors,
+                &self.document.images,
             );
             let (ew, eh, ergba) = upscale_nn(
                 self.document.width,
@@ -1901,6 +1911,7 @@ impl SketchMotionApp {
                 frames_fit.push(Frame {
                     layers: layers_fit,
                     vectors: f.vectors.clone(),
+                    images: f.images.clone(),
                 });
             }
             if frames_fit.is_empty() {
@@ -1956,7 +1967,7 @@ impl SketchMotionApp {
             return;
         }
         self.push_undo();
-        self.commit_float();
+        self.drop_float();
         let (dw, dh) = (self.document.width as f32, self.document.height as f32);
         let fit = (dw * 0.8 / w as f32)
             .min(dh * 0.8 / h as f32)
@@ -1974,6 +1985,7 @@ impl SketchMotionApp {
             angle: 0.0,
             opacity: 1.0,
             layer: self.active_layer,
+            is_image: true,
         });
         self.float_tex = None;
         self.tool = Tool::Select;
@@ -2068,7 +2080,7 @@ impl SketchMotionApp {
             return;
         }
         if let Some(orig) = self.float_sel.clone() {
-            self.commit_float();
+            self.drop_float();
             let mut copia = orig;
             copia.cx += 12.0;
             copia.cy += 12.0;
@@ -2100,7 +2112,7 @@ impl SketchMotionApp {
             let (ew, eh) = (w * sc, h * sc);
             let mut frames: Vec<Vec<u8>> = Vec::with_capacity(self.document.frames.len());
             for f in &self.document.frames {
-                let img = render_frame_alpha(w, h, &f.layers, &f.vectors);
+                let img = render_frame_alpha(w, h, &f.layers, &f.vectors, &f.images);
                 let (_, _, up) = upscale_nn(w, h, &img.rgba, sc);
                 frames.push(up);
             }
@@ -2126,7 +2138,7 @@ impl SketchMotionApp {
             let mut ok = 0usize;
             let mut erro: Option<String> = None;
             for (i, f) in self.document.frames.iter().enumerate() {
-                let img = render_frame_alpha(w, h, &f.layers, &f.vectors);
+                let img = render_frame_alpha(w, h, &f.layers, &f.vectors, &f.images);
                 let (ew, eh, up) = upscale_nn(w, h, &img.rgba, sc);
                 let fp = dir.join(format!("frame_{:04}.png", i + 1));
                 match sketchmotion_io::export_png(ew, eh, &up, &fp) {
@@ -2169,7 +2181,7 @@ impl SketchMotionApp {
             let (sw, sh) = (fw * cols, fh * rows);
             let mut sheet = vec![0u8; (sw * sh * 4) as usize];
             for (i, f) in self.document.frames.iter().enumerate() {
-                let img = render_frame_alpha(w, h, &f.layers, &f.vectors);
+                let img = render_frame_alpha(w, h, &f.layers, &f.vectors, &f.images);
                 let (_, _, up) = upscale_nn(w, h, &img.rgba, sc);
                 let (cx, cy) = (i as u32 % cols, i as u32 / cols);
                 let (ox, oy) = (cx * fw, cy * fh);
@@ -2336,6 +2348,7 @@ impl SketchMotionApp {
             angle: 0.0,
             opacity: 1.0,
             layer: li,
+            is_image: false,
         });
         self.float_tex = None;
         self.dirty = true;
@@ -2412,6 +2425,73 @@ impl SketchMotionApp {
             self.float_tex = None;
             self.dirty = true;
         }
+    }
+
+    /// Solta a flutuante conforme o Caminho B: se for OBJETO DE IMAGEM, guarda
+    /// como `ImageObject` persistente (salvo no arquivo, exportado na resolução
+    /// do trabalho) em vez de integrá-la aos pixels; caso contrário (seleção
+    /// raster comum), integra como sempre.
+    fn drop_float(&mut self) {
+        let is_img = matches!(&self.float_sel, Some(f) if f.is_image);
+        if !is_img {
+            self.commit_float();
+            return;
+        }
+        if let Some(fs) = self.float_sel.take() {
+            self.document.images.push(ImageObject::new(
+                fs.pixels, fs.ow, fs.oh, fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, fs.opacity, fs.layer,
+            ));
+            // Grava no frame atual para persistir (salvar/exportar) já refletir.
+            self.document.sync_to_frames();
+            self.float_tex = None;
+            self.dirty = true;
+            self.status = "Imagem posicionada (objeto editável) — use Integrar para rasterizar".into();
+        }
+    }
+
+    /// Tenta pegar um OBJETO DE IMAGEM sob o ponto (espaço do documento) para
+    /// editá-lo (mover/escalar/girar). Remove-o da lista e o transforma em
+    /// flutuante. Devolve true se pegou algum.
+    fn pick_image_at(&mut self, dp: (f32, f32)) -> bool {
+        let mut hit: Option<usize> = None;
+        for i in (0..self.document.images.len()).rev() {
+            let o = &self.document.images[i];
+            if o.hw <= 0.0 || o.hh <= 0.0 {
+                continue;
+            }
+            // Ponto local (desfaz a rotação em torno do centro).
+            let (s, c) = (-o.angle).sin_cos();
+            let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
+            let lx = rx * c - ry * s;
+            let ly = rx * s + ry * c;
+            if lx.abs() <= o.hw && ly.abs() <= o.hh {
+                hit = Some(i);
+                break;
+            }
+        }
+        let Some(i) = hit else {
+            return false;
+        };
+        let o = self.document.images.remove(i);
+        let layer = o.layer.min(self.document.layers.len().saturating_sub(1));
+        self.float_sel = Some(FloatSel {
+            pixels: o.pixels,
+            ow: o.ow,
+            oh: o.oh,
+            cx: o.cx,
+            cy: o.cy,
+            hw: o.hw,
+            hh: o.hh,
+            angle: o.angle,
+            opacity: o.opacity,
+            layer,
+            is_image: true,
+        });
+        self.float_tex = None;
+        self.selected_obj = None;
+        self.dirty = true;
+        self.status = "Imagem selecionada — mova/gire/redimensione; Integrar para rasterizar".into();
+        true
     }
 
     /// Detecção do clique sobre a seleção flutuante (rotação / alça / mover).
@@ -2620,6 +2700,7 @@ impl SketchMotionApp {
             angle: 0.0,
             opacity: 1.0,
             layer: li,
+            is_image: false,
         });
         self.float_tex = None;
         self.dirty = true;
@@ -2654,6 +2735,7 @@ impl SketchMotionApp {
             self.document.height,
             &self.document.layers,
             &self.document.vectors,
+            &self.document.images,
         );
         let cw = self.document.width as usize;
         let mut pixels = vec![0u8; (w * h * 4) as usize];
@@ -2689,7 +2771,7 @@ impl SketchMotionApp {
             Some(p) if p.w > 0 && p.h > 0 => (p.w, p.h, p.rgba.clone()),
             _ => return,
         };
-        self.commit_float();
+        self.drop_float();
         self.push_undo();
         self.float_sel = Some(FloatSel {
             pixels,
@@ -2702,6 +2784,7 @@ impl SketchMotionApp {
             angle: 0.0,
             opacity: 1.0,
             layer: self.active_layer,
+            is_image: false,
         });
         self.float_tex = None;
         self.tool = Tool::Select;
@@ -3206,6 +3289,7 @@ impl SketchMotionApp {
             angle: 0.0,
             opacity: 1.0,
             layer: li,
+            is_image: false,
         });
         self.float_tex = None;
         self.dirty = true;
@@ -3547,6 +3631,7 @@ impl SketchMotionApp {
                 self.document.height,
                 &self.document.frames[pf].layers,
                 &self.document.frames[pf].vectors,
+                &self.document.frames[pf].images,
             );
             egui::ColorImage::from_rgba_unmultiplied(
                 [img.width as usize, img.height as usize],
@@ -3626,13 +3711,20 @@ impl SketchMotionApp {
                 }
                 let full = if ti == active {
                     if fi == self.document.current {
-                        render_frame_alpha(dw, dh, &self.document.layers, &self.document.vectors)
+                        render_frame_alpha(
+                            dw,
+                            dh,
+                            &self.document.layers,
+                            &self.document.vectors,
+                            &self.document.images,
+                        )
                     } else {
                         render_frame_alpha(
                             dw,
                             dh,
                             &self.document.frames[fi].layers,
                             &self.document.frames[fi].vectors,
+                            &self.document.frames[fi].images,
                         )
                     }
                 } else {
@@ -3641,6 +3733,7 @@ impl SketchMotionApp {
                         dh,
                         &self.document.tracks[ti].frames[fi].layers,
                         &self.document.tracks[ti].frames[fi].vectors,
+                        &self.document.tracks[ti].frames[fi].images,
                     )
                 };
                 let img = thumb_image(&full, th_w, th_h);
@@ -4240,6 +4333,7 @@ impl SketchMotionApp {
                 self.document.height,
                 &t.frames[idx].layers,
                 &t.frames[idx].vectors,
+                &t.frames[idx].images,
             );
             for p in 0..(w * h) {
                 let sa = top.rgba[p * 4 + 3] as f32 / 255.0;
@@ -4308,6 +4402,111 @@ impl SketchMotionApp {
                 }
             });
         });
+    }
+
+    /// Quarta barra (abaixo da barra de status): ações rápidas. Hoje, integrar
+    /// objetos de imagem (Caminho B) aos pixels da camada. Mais botões de função
+    /// serão adicionados aqui no futuro.
+    fn barra_acoes(&mut self, ctx: &egui::Context) {
+        let mut integrar_sel = false;
+        let mut integrar_todas = false;
+        egui::TopBottomPanel::top("acoes")
+            .exact_height(30.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    ui.strong("Imagem:");
+                    let tem_sel = matches!(&self.float_sel, Some(f) if f.is_image);
+                    let n_obj = self.document.images.len();
+                    ui.add_enabled_ui(tem_sel, |ui| {
+                        if ui
+                            .button("Integrar")
+                            .on_hover_text(
+                                "Rasteriza a imagem selecionada na camada (deixa de ser objeto móvel)",
+                            )
+                            .clicked()
+                        {
+                            integrar_sel = true;
+                        }
+                    });
+                    ui.add_enabled_ui(n_obj > 0 || tem_sel, |ui| {
+                        if ui
+                            .button(format!("Integrar todas ({n_obj})"))
+                            .on_hover_text("Rasteriza TODOS os objetos de imagem deste frame")
+                            .clicked()
+                        {
+                            integrar_todas = true;
+                        }
+                    });
+                    ui.separator();
+                    ui.weak(
+                        "Imagens ficam como objetos móveis, são salvas no projeto e exportadas na resolução do trabalho.",
+                    );
+                });
+            });
+        if integrar_sel {
+            self.push_undo();
+            self.commit_float();
+            self.status = "Imagem integrada aos pixels".into();
+        }
+        if integrar_todas {
+            self.integrar_todas_imagens();
+        }
+    }
+
+    /// Integra (rasteriza) todos os objetos de imagem do frame atual nos pixels
+    /// das respectivas camadas. Objetos em camada bloqueada são preservados.
+    fn integrar_todas_imagens(&mut self) {
+        let tem_float = matches!(&self.float_sel, Some(f) if f.is_image);
+        if !tem_float && self.document.images.is_empty() {
+            return;
+        }
+        self.push_undo();
+        if tem_float {
+            self.commit_float();
+            // Se ficou por bloqueio, devolve como objeto para não se perder.
+            if let Some(fs) = self.float_sel.take() {
+                self.document.images.push(ImageObject::new(
+                    fs.pixels, fs.ow, fs.oh, fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, fs.opacity,
+                    fs.layer,
+                ));
+                self.float_tex = None;
+            }
+        }
+        let objs = std::mem::take(&mut self.document.images);
+        let mut restantes: Vec<ImageObject> = Vec::new();
+        for o in objs {
+            let li = o.layer.min(self.document.layers.len().saturating_sub(1));
+            if self.layer_locked(li) {
+                restantes.push(o);
+                continue;
+            }
+            self.float_sel = Some(FloatSel {
+                pixels: o.pixels,
+                ow: o.ow,
+                oh: o.oh,
+                cx: o.cx,
+                cy: o.cy,
+                hw: o.hw,
+                hh: o.hh,
+                angle: o.angle,
+                opacity: o.opacity,
+                layer: li,
+                is_image: true,
+            });
+            self.commit_float();
+            if let Some(fs) = self.float_sel.take() {
+                restantes.push(ImageObject::new(
+                    fs.pixels, fs.ow, fs.oh, fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, fs.opacity,
+                    fs.layer,
+                ));
+            }
+        }
+        self.document.images = restantes;
+        self.document.sync_to_frames();
+        self.float_tex = None;
+        self.dirty = true;
+        self.status = "Imagens integradas aos pixels".into();
     }
 
     /// Rodapé: versão, criador e link do GitHub.
@@ -4508,7 +4707,7 @@ impl SketchMotionApp {
                 });
                 ui.separator();
                 if ui.button("Confirmar").clicked() {
-                    self.commit_float();
+                    self.drop_float();
                 }
             });
             // Excluir a flutuante não altera a camada — permitido mesmo bloqueada.
@@ -6625,7 +6824,7 @@ impl eframe::App for SketchMotionApp {
             }
         }
         if !matches!(self.tool, Tool::Select | Tool::Lasso | Tool::MagicWand) && self.float_sel.is_some() {
-            self.commit_float();
+            self.drop_float();
         }
         if self.bloqueada_pixel(self.tool) {
             self.tool = Tool::Pencil;
@@ -6681,6 +6880,7 @@ impl eframe::App for SketchMotionApp {
                 self.document.height,
                 &self.document.layers,
                 &self.document.vectors,
+                &self.document.images,
             );
             let image =
                 egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
@@ -6720,6 +6920,9 @@ impl eframe::App for SketchMotionApp {
                 let below = render_layers_alpha(dw, dh, &self.document.layers[..=l]);
                 let mut above = render_layers_alpha(dw, dh, &self.document.layers[l + 1..]);
                 self.rasterizar_vetores(&mut above.rgba, dw, dh);
+                // Objetos de imagem já soltos ficam POR CIMA (topo) — para não
+                // sumirem enquanto outra flutuante está em edição.
+                rasterize_images(dw, dh, &self.document.images, &mut above.rgba);
                 let bimg = egui::ColorImage::from_rgba_unmultiplied(
                     [dw as usize, dh as usize],
                     &below.rgba,
@@ -6836,8 +7039,22 @@ impl eframe::App for SketchMotionApp {
                 ui.add(egui::DragValue::new(&mut self.export_cols).range(0..=64));
                 nudge_u32(ui, &mut self.export_cols, 0, 64);
                 ui.separator();
-                ui.checkbox(&mut self.bg_white, "Fundo branco")
-                    .on_hover_text("Só visual — o arquivo salvo/exportado é sempre transparente");
+                if ui
+                    .checkbox(&mut self.bg_white, "Fundo branco")
+                    .on_hover_text("Só visual — o arquivo salvo/exportado é sempre transparente")
+                    .changed()
+                    && self.bg_white
+                {
+                    self.bg_dark = false;
+                }
+                if ui
+                    .checkbox(&mut self.bg_dark, "Fundo escuro")
+                    .on_hover_text("Cinza bem escuro — ajuda a enxergar detalhes claros. Só visual.")
+                    .changed()
+                    && self.bg_dark
+                {
+                    self.bg_white = false;
+                }
                 let mut pm = self.pixel_mode;
                 if ui
                     .checkbox(&mut pm, "Pixel art")
@@ -6924,6 +7141,8 @@ impl eframe::App for SketchMotionApp {
         self.barra_opcoes(ctx);
         // Terceira barra: arquivo/timeline/frame/camada selecionados.
         self.barra_status(ctx);
+        // Quarta barra: ações (integrar imagem etc.).
+        self.barra_acoes(ctx);
         // Ferramentas (esquerda) e painéis (direita), sempre visíveis.
         self.barra_ferramentas(ctx);
         self.barra_icones(ctx);
@@ -6987,6 +7206,8 @@ impl eframe::App for SketchMotionApp {
                         let p = ui.painter_at(rect);
                         if self.bg_white {
                             p.rect_filled(rect, 0.0, egui::Color32::WHITE);
+                        } else if self.bg_dark {
+                            p.rect_filled(rect, 0.0, egui::Color32::from_gray(28));
                         } else {
                         let cell = 8.0_f32.max(zoom);
                         p.rect_filled(rect, 0.0, egui::Color32::from_gray(210));
@@ -7043,6 +7264,7 @@ impl eframe::App for SketchMotionApp {
                                 self.document.height,
                                 &self.document.frames[prev].layers,
                                 &self.document.frames[prev].vectors,
+                                &self.document.frames[prev].images,
                             );
                             let ci = egui::ColorImage::from_rgba_unmultiplied(
                                 [oi.width as usize, oi.height as usize],
@@ -7097,6 +7319,7 @@ impl eframe::App for SketchMotionApp {
                                     self.document.height,
                                     &self.document.tracks[ti].frames[page].layers,
                                     &self.document.tracks[ti].frames[page].vectors,
+                                    &self.document.tracks[ti].frames[page].images,
                                 );
                                 let ci = egui::ColorImage::from_rgba_unmultiplied(
                                     [oi.width as usize, oi.height as usize],
@@ -7235,11 +7458,15 @@ impl eframe::App for SketchMotionApp {
                                 // seleção flutuante (raster): dentro move; fora confirma
                                 let consumed = self.float_press(p, rect, zoom);
                                 if !consumed && self.float_sel.is_some() {
-                                    self.commit_float();
+                                    self.drop_float();
                                 }
                                 if !consumed {
-                                    let mut grabbed = false;
-                                    if let Some(si) = self.selected_obj {
+                                    // Caminho B: clicar sobre um objeto de imagem
+                                    // o "pega" para editar (vira flutuante). Tem
+                                    // prioridade sobre traços vetoriais/marquee.
+                                    self.pick_image_at(dp);
+                                    let mut grabbed = self.float_sel.is_some();
+                                    if !grabbed { if let Some(si) = self.selected_obj {
                                         if si < self.document.vectors.len() {
                                             if let Some((minx, miny, maxx, maxy)) =
                                                 self.document.vectors[si].bounds()
@@ -7277,7 +7504,7 @@ impl eframe::App for SketchMotionApp {
                                                 }
                                             }
                                         }
-                                    }
+                                    } }
                                     if !grabbed {
                                         let mut did_rot = false;
                                         if let Some(si) = self.selected_obj {
@@ -7419,7 +7646,7 @@ impl eframe::App for SketchMotionApp {
                             if let Some(pp) = hover {
                                 let consumed = self.float_press(pp, rect, zoom);
                                 if !consumed && self.float_sel.is_some() {
-                                    self.commit_float();
+                                    self.drop_float();
                                 }
                                 if !consumed {
                                     self.lasso_points = vec![to_doc(pp)];
@@ -7447,7 +7674,7 @@ impl eframe::App for SketchMotionApp {
                                 let consumed = self.float_press(pp, rect, zoom);
                                 if !consumed {
                                     if self.float_sel.is_some() {
-                                        self.commit_float();
+                                        self.drop_float();
                                     }
                                     let (x, y) = to_pixel(pp);
                                     self.lift_wand(x, y);
@@ -8014,7 +8241,7 @@ impl eframe::App for SketchMotionApp {
                 .map(|fs| (fs.ow, fs.oh, fs.pixels.clone()));
             if let Some(d) = data {
                 self.clip = Some(d);
-                self.commit_float();
+                self.drop_float();
                 self.status = "Seleção copiada — Ctrl+V para colar (inclusive em outro frame)".into();
             } else {
                 self.status = "Nada selecionado para copiar (use Seleção/Laço primeiro)".into();
@@ -8026,7 +8253,7 @@ impl eframe::App for SketchMotionApp {
             if let Some((ow, oh, px)) = self.clip.clone() {
                 // Finaliza a colagem anterior ANTES de registrar o histórico, para
                 // que cada colar seja uma ação de undo/redo separada (não uma só).
-                self.commit_float();
+                self.drop_float();
                 self.push_undo();
                 let (dw, dh) = (self.document.width as f32, self.document.height as f32);
                 self.float_sel = Some(FloatSel {
@@ -8040,6 +8267,7 @@ impl eframe::App for SketchMotionApp {
                     angle: 0.0,
                     opacity: 1.0,
                     layer: self.active_layer,
+                    is_image: false,
                 });
                 self.float_tex = None;
                 self.tool = Tool::Select;

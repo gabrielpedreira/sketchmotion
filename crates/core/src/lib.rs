@@ -7,6 +7,7 @@
 mod color;
 mod document;
 mod frame;
+mod image_object;
 mod layer;
 mod piece;
 mod skeleton;
@@ -15,6 +16,7 @@ mod vector;
 pub use color::Color;
 pub use document::Document;
 pub use frame::Frame;
+pub use image_object::ImageObject;
 pub use layer::Layer;
 pub use piece::{ObjectPiece, PieceLibrary};
 pub use skeleton::{Bone, BonePose, BoneShape, Skeleton, World};

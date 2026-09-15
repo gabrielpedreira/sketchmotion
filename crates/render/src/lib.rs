@@ -7,7 +7,7 @@
 //! v0.1. Quando entrarem formas vetoriais, blending avançado e onion skin
 //! (v0.2+), migramos esta etapa para o skia — por isso ele já é dependência.
 
-use sketchmotion_core::{Color, Document, Layer, VectorObject};
+use sketchmotion_core::{Color, Document, ImageObject, Layer, VectorObject};
 
 /// Imagem em pixels, pronta para virar textura no egui.
 pub struct PixelImage {
@@ -217,27 +217,105 @@ pub fn rasterize_vectors(width: u32, height: u32, vectors: &[VectorObject], rgba
     }
 }
 
-/// Frame completo (camadas + vetores) sobre fundo opaco.
+// ---------- Objetos de imagem (raster colocado como elemento) ----------
+
+/// Ponto local (relativo ao centro, desfeita a rotação) de um ponto de tela.
+fn img_local(cx: f32, cy: f32, angle: f32, px: f32, py: f32) -> (f32, f32) {
+    let (s, c) = (-angle).sin_cos();
+    let (dx, dy) = (px - cx, py - cy);
+    (dx * c - dy * s, dx * s + dy * c)
+}
+
+/// Um canto do retângulo do objeto (sx, sy ∈ {-1, 1}) no espaço do documento.
+fn img_corner(cx: f32, cy: f32, hw: f32, hh: f32, angle: f32, sx: f32, sy: f32) -> (f32, f32) {
+    let (s, c) = angle.sin_cos();
+    let (lx, ly) = (sx * hw, sy * hh);
+    (cx + lx * c - ly * s, cy + lx * s + ly * c)
+}
+
+/// Compõe os objetos de imagem (com transformação: centro/escala/rotação/opac.)
+/// sobre o buffer RGBA já existente — mesma resolução do documento.
+pub fn rasterize_images(width: u32, height: u32, images: &[ImageObject], rgba: &mut [u8]) {
+    let (w, h) = (width as i32, height as i32);
+    for obj in images {
+        let op = obj.opacity.clamp(0.0, 1.0);
+        if op <= 0.0 || obj.ow == 0 || obj.oh == 0 || obj.hw <= 0.0 || obj.hh <= 0.0 {
+            continue;
+        }
+        if obj.pixels.len() < (obj.ow * obj.oh * 4) as usize {
+            continue;
+        }
+        // Caixa envolvente (do retângulo girado) recortada ao documento.
+        let corners = [
+            img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, -1.0, -1.0),
+            img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, 1.0, -1.0),
+            img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, 1.0, 1.0),
+            img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, -1.0, 1.0),
+        ];
+        let (mut minx, mut miny) = (f32::INFINITY, f32::INFINITY);
+        let (mut maxx, mut maxy) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for (x, y) in corners {
+            minx = minx.min(x);
+            miny = miny.min(y);
+            maxx = maxx.max(x);
+            maxy = maxy.max(y);
+        }
+        let x0 = (minx.floor() as i32).max(0);
+        let y0 = (miny.floor() as i32).max(0);
+        let x1 = (maxx.ceil() as i32).min(w);
+        let y1 = (maxy.ceil() as i32).min(h);
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let (lx, ly) = img_local(obj.cx, obj.cy, obj.angle, px as f32 + 0.5, py as f32 + 0.5);
+                let u = lx / (2.0 * obj.hw) + 0.5;
+                let v = ly / (2.0 * obj.hh) + 0.5;
+                if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                    continue;
+                }
+                let sx = ((u * obj.ow as f32) as i32).clamp(0, obj.ow as i32 - 1);
+                let sy = ((v * obj.oh as f32) as i32).clamp(0, obj.oh as i32 - 1);
+                let si = ((sy * obj.ow as i32 + sx) * 4) as usize;
+                let sa = obj.pixels[si + 3];
+                if sa == 0 {
+                    continue;
+                }
+                let c = Color::rgba(
+                    obj.pixels[si],
+                    obj.pixels[si + 1],
+                    obj.pixels[si + 2],
+                    sa,
+                );
+                blend_px(rgba, ((py * w + px) * 4) as usize, c, op);
+            }
+        }
+    }
+}
+
+/// Frame completo (camadas + vetores + imagens) sobre fundo opaco.
 pub fn render_frame(
     width: u32,
     height: u32,
     background: Color,
     layers: &[Layer],
     vectors: &[VectorObject],
+    images: &[ImageObject],
 ) -> PixelImage {
     let mut img = render_layers(width, height, background, layers);
     rasterize_vectors(width, height, vectors, &mut img.rgba);
+    rasterize_images(width, height, images, &mut img.rgba);
     img
 }
 
-/// Frame completo (camadas + vetores) sobre fundo TRANSPARENTE (onion skin).
+/// Frame completo (camadas + vetores + imagens) sobre fundo TRANSPARENTE.
 pub fn render_frame_alpha(
     width: u32,
     height: u32,
     layers: &[Layer],
     vectors: &[VectorObject],
+    images: &[ImageObject],
 ) -> PixelImage {
     let mut img = render_layers_alpha(width, height, layers);
     rasterize_vectors(width, height, vectors, &mut img.rgba);
+    rasterize_images(width, height, images, &mut img.rgba);
     img
 }

@@ -3,6 +3,7 @@
 //! layers/vectors) espelha o frame atual para que todo o desenho já existente
 //! continue operando sobre ele sem mudanças.
 
+use crate::image_object::ImageObject;
 use crate::layer::Layer;
 use crate::vector::VectorObject;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,9 @@ pub struct Frame {
     pub layers: Vec<Layer>,
     #[serde(default)]
     pub vectors: Vec<VectorObject>,
+    /// Objetos de imagem (raster colocado como elemento, não integrado).
+    #[serde(default)]
+    pub images: Vec<ImageObject>,
 }
 
 impl Frame {
@@ -20,6 +24,7 @@ impl Frame {
         Self {
             layers: vec![Layer::new(name, width, height)],
             vectors: Vec::new(),
+            images: Vec::new(),
         }
     }
 }

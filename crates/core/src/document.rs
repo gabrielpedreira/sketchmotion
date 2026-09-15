@@ -5,6 +5,7 @@
 
 use crate::color::Color;
 use crate::frame::Frame;
+use crate::image_object::ImageObject;
 use crate::layer::Layer;
 use crate::skeleton::Skeleton;
 use crate::vector::VectorObject;
@@ -20,6 +21,10 @@ pub struct Document {
     /// Objetos vetoriais (ilustração vetorial), desenhados sobre as camadas.
     #[serde(default)]
     pub vectors: Vec<VectorObject>,
+    /// Objetos de imagem (cópia de trabalho do frame atual) — raster colocado
+    /// como elemento móvel/selecionável, não integrado aos pixels.
+    #[serde(default)]
+    pub images: Vec<ImageObject>,
     /// Frames da animação (cada um com suas camadas/vetores). `layers`/`vectors`
     /// acima são a cópia de trabalho do frame atual.
     #[serde(default)]
@@ -78,6 +83,7 @@ impl Document {
             background,
             layers: Vec::new(),
             vectors: Vec::new(),
+            images: Vec::new(),
             frames: Vec::new(),
             current: 0,
             fps: 12,
@@ -91,6 +97,7 @@ impl Document {
         doc.frames = vec![Frame {
             layers: doc.layers.clone(),
             vectors: doc.vectors.clone(),
+            images: doc.images.clone(),
         }];
         doc.tracks = vec![Track {
             name: "Timeline 1".to_string(),
@@ -110,6 +117,7 @@ impl Document {
             self.frames = vec![Frame {
                 layers: std::mem::take(&mut self.layers),
                 vectors: std::mem::take(&mut self.vectors),
+                images: std::mem::take(&mut self.images),
             }];
         }
         for f in &mut self.frames {
@@ -125,6 +133,7 @@ impl Document {
         }
         self.layers = self.frames[self.current].layers.clone();
         self.vectors = self.frames[self.current].vectors.clone();
+        self.images = self.frames[self.current].images.clone();
         // Migra projetos antigos (sem timelines) e carrega a faixa ativa.
         if self.tracks.is_empty() {
             self.tracks = vec![Track {
@@ -160,6 +169,7 @@ impl Document {
         self.fps = fps;
         self.layers = self.frames[self.current].layers.clone();
         self.vectors = self.frames[self.current].vectors.clone();
+        self.images = self.frames[self.current].images.clone();
     }
 
     /// Copia o espelho (frames/current/fps) de volta para a faixa ativa.
@@ -176,6 +186,7 @@ impl Document {
         let f = Frame {
             layers: self.layers.clone(),
             vectors: self.vectors.clone(),
+            images: self.images.clone(),
         };
         if self.frames.is_empty() {
             self.frames.push(f);
@@ -277,6 +288,7 @@ impl Document {
         self.current = i;
         self.layers = self.frames[i].layers.clone();
         self.vectors = self.frames[i].vectors.clone();
+        self.images = self.frames[i].images.clone();
     }
 
     /// Insere um frame em branco após o atual e vai para ele.
@@ -288,6 +300,7 @@ impl Document {
         self.current = at;
         self.layers = self.frames[at].layers.clone();
         self.vectors = self.frames[at].vectors.clone();
+        self.images = self.frames[at].images.clone();
         at
     }
 
@@ -300,6 +313,7 @@ impl Document {
         self.current = at;
         self.layers = self.frames[at].layers.clone();
         self.vectors = self.frames[at].vectors.clone();
+        self.images = self.frames[at].images.clone();
         at
     }
 
@@ -308,6 +322,7 @@ impl Document {
         Frame {
             layers: self.layers.clone(),
             vectors: self.vectors.clone(),
+            images: self.images.clone(),
         }
     }
 
@@ -319,6 +334,7 @@ impl Document {
         self.current = at;
         self.layers = self.frames[at].layers.clone();
         self.vectors = self.frames[at].vectors.clone();
+        self.images = self.frames[at].images.clone();
         self.mirror_to_track();
         at
     }
@@ -341,6 +357,7 @@ impl Document {
         self.current = t;
         self.layers = self.frames[self.current].layers.clone();
         self.vectors = self.frames[self.current].vectors.clone();
+        self.images = self.frames[self.current].images.clone();
         self.mirror_to_track();
     }
 
@@ -355,6 +372,7 @@ impl Document {
         }
         self.layers = self.frames[self.current].layers.clone();
         self.vectors = self.frames[self.current].vectors.clone();
+        self.images = self.frames[self.current].images.clone();
     }
 
     pub fn frame_count(&self) -> usize {
