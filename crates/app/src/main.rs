@@ -1166,6 +1166,22 @@ struct SketchMotionApp {
     frame_clip: Option<Frame>,
     /// Arrasto de frame em andamento: (faixa, índice do frame).
     drag_frame: Option<(usize, usize)>,
+    /// Recentralizar o canvas na próxima renderização (pedido único).
+    center_canvas: bool,
+    /// Fator da margem ao redor do canvas (pasteboard) — "estender a área".
+    workspace_pad: f32,
+    /// Timeline recolhida (mostra só uma barra para reabrir).
+    timeline_hidden: bool,
+    /// Altura (px) da área de timeline; arrastável pela alça superior.
+    timeline_h: f32,
+    // Prancheta: redimensionar o papel (canvas) sem mexer no desenho.
+    win_prancheta: bool,
+    pr_w: u32,
+    pr_h: u32,
+    /// Alça de prancheta em arrasto: 0=largura, 1=altura, 2=ambos.
+    prancheta_drag: Option<u8>,
+    /// Tamanho de pré-visualização durante o arrasto da prancheta.
+    prancheta_preview: Option<(u32, u32)>,
     /// Cache de miniaturas por faixa/frame (evita re-renderizar tudo a cada quadro).
     track_thumbs: Vec<Vec<Option<egui::TextureHandle>>>,
     /// Cache das texturas de sobreposição entre timelines (onion/ver ambas).
@@ -1326,6 +1342,15 @@ impl SketchMotionApp {
             play_both: false,
             frame_clip: None,
             drag_frame: None,
+            center_canvas: true,
+            workspace_pad: 0.9,
+            timeline_hidden: false,
+            timeline_h: 260.0,
+            win_prancheta: false,
+            pr_w: CANVAS_W,
+            pr_h: CANVAS_H,
+            prancheta_drag: None,
+            prancheta_preview: None,
             track_thumbs: Vec::new(),
             between_cache: Vec::new(),
             between_key: None,
@@ -1731,6 +1756,7 @@ impl SketchMotionApp {
             1.0
         };
         self.dirty = true;
+        self.center_canvas = true;
         self.track_thumbs.clear();
         self.between_cache.clear();
         self.between_key = None;
@@ -1829,6 +1855,7 @@ impl SketchMotionApp {
                         let m = self.document.width.max(self.document.height) as f32;
                         self.zoom = (512.0 / m).floor().max(1.0);
                     }
+                    self.center_canvas = true;
                     self.current_path = Some(path.clone());
                     self.status = format!("Aberto: {}", path.display());
                     return true;
@@ -3629,6 +3656,32 @@ impl SketchMotionApp {
     /// Timeline (rodapé): cada faixa de animação é uma "lane" completa, com
     /// seu botão de selecionar, excluir, controles de frame e tira de frames.
     fn barra_frames(&mut self, ctx: &egui::Context) {
+        // Timeline recolhida: mostra só uma barra fina para reabrir.
+        if self.timeline_hidden {
+            egui::TopBottomPanel::bottom("timeline_bar")
+                .resizable(false)
+                .exact_height(26.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("▲ Mostrar timeline")
+                            .on_hover_text("Reabrir a área de timeline")
+                            .clicked()
+                        {
+                            self.timeline_hidden = false;
+                        }
+                        ui.separator();
+                        if ui
+                            .button("Centralizar canvas")
+                            .on_hover_text("Recentralizar o canvas na área de trabalho")
+                            .clicked()
+                        {
+                            self.center_canvas = true;
+                        }
+                    });
+                });
+            return;
+        }
         let (dw, dh) = (self.document.width, self.document.height);
         let th_h = 44usize;
         let th_w = (((th_h as f32) * dw as f32 / dh as f32).round() as usize).clamp(20, 140);
@@ -3658,12 +3711,47 @@ impl SketchMotionApp {
         // (self.dirty) só a miniatura do frame atual da faixa ativa é refeita.
         self.ensure_track_thumbs(ctx, th_w, th_h);
 
+        let mut new_timeline_h: Option<f32> = None;
         egui::TopBottomPanel::bottom("timeline")
             .resizable(false)
+            .exact_height(self.timeline_h)
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                // Alça de redimensionar (fica PARADA; só move ao arrastar).
+                let (hrect, hresp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 6.0),
+                    egui::Sense::drag(),
+                );
+                let hcolor = if hresp.hovered() || hresp.dragged() {
+                    egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                } else {
+                    egui::Color32::from_gray(90)
+                };
+                ui.painter().rect_filled(hrect, 2.0, hcolor);
+                if hresp.hovered() || hresp.dragged() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                if hresp.dragged() {
+                    let nh = (self.timeline_h - hresp.drag_delta().y).clamp(90.0, 640.0);
+                    new_timeline_h = Some(nh);
+                }
+                ui.add_space(2.0);
                 // Barra superior: adicionar timeline + opções globais.
                 ui.horizontal(|ui| {
+                    if ui
+                        .button("▼ Ocultar")
+                        .on_hover_text("Recolher a área de timeline (deixa só uma barra)")
+                        .clicked()
+                    {
+                        self.timeline_hidden = true;
+                    }
+                    if ui
+                        .button("Centralizar")
+                        .on_hover_text("Recentralizar o canvas na área de trabalho")
+                        .clicked()
+                    {
+                        self.center_canvas = true;
+                    }
+                    ui.separator();
                     if ui
                         .button("＋ Timeline")
                         .on_hover_text("Adicionar nova timeline (uma camada de animação)")
@@ -3703,9 +3791,11 @@ impl SketchMotionApp {
                 });
                 ui.separator();
 
-                // Uma lane por timeline.
+                // Uma lane por timeline. Altura fixa derivada da altura do painel
+                // (evita o loop que fazia a barra "pular" para o topo).
+                let lanes_h = (self.timeline_h - 84.0).max(48.0);
                 egui::ScrollArea::vertical()
-                    .max_height(240.0)
+                    .max_height(lanes_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for ti in 0..ntr {
@@ -3989,6 +4079,9 @@ impl SketchMotionApp {
                     });
                 ui.add_space(2.0);
             });
+        if let Some(nh) = new_timeline_h {
+            self.timeline_h = nh;
+        }
 
         // ---- Aplicar ações ----
         if track_add {
@@ -4689,8 +4782,211 @@ impl SketchMotionApp {
                             self.eyedropper = Eyedropper::Off;
                         }
                     }
+                    ui.add_space(6.0);
+
+                    let resp_pr = icon_button(ui, self.win_prancheta, icon::SELECTION)
+                        .on_hover_text("Prancheta — mudar o tamanho do papel (canvas)");
+                    if resp_pr.clicked() {
+                        self.win_prancheta = !self.win_prancheta;
+                        if self.win_prancheta {
+                            self.pr_w = self.document.width;
+                            self.pr_h = self.document.height;
+                        } else {
+                            self.prancheta_drag = None;
+                            self.prancheta_preview = None;
+                        }
+                    }
                 });
             });
+    }
+
+    /// Aplica um novo tamanho de papel (redimensiona o canvas, sem escalar o
+    /// desenho) e recentraliza.
+    fn aplicar_prancheta(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 || (w == self.document.width && h == self.document.height) {
+            return;
+        }
+        self.push_undo();
+        self.document.resize_canvas(w, h);
+        self.pr_w = w;
+        self.pr_h = h;
+        self.center_canvas = true;
+        self.dirty = true;
+        self.track_thumbs.clear();
+        self.between_cache.clear();
+        self.between_key = None;
+        self.split_for = None;
+        self.below_tex = None;
+        self.above_tex = None;
+        self.onion_for = None;
+        self.status = format!("Papel: {w} x {h} px");
+    }
+
+    /// Janela Prancheta: muda o tamanho do papel (numérico) — o arrasto manual
+    /// pelas alças ao redor do canvas é tratado no próprio canvas.
+    fn janela_prancheta(&mut self, ctx: &egui::Context) {
+        let mut open = self.win_prancheta;
+        let mut aplicar: Option<(u32, u32)> = None;
+        egui::Window::new("Prancheta — tamanho do papel")
+            .open(&mut open)
+            .default_width(330.0)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Atual: {} x {} px",
+                    self.document.width, self.document.height
+                ));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Largura:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.pr_w)
+                            .range(1..=8192)
+                            .suffix(" px"),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("Altura:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.pr_h)
+                            .range(1..=8192)
+                            .suffix(" px"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Girar (trocar L×A)").clicked() {
+                        std::mem::swap(&mut self.pr_w, &mut self.pr_h);
+                    }
+                    if ui.button("Usar atual").clicked() {
+                        self.pr_w = self.document.width;
+                        self.pr_h = self.document.height;
+                    }
+                });
+                ui.separator();
+                ui.label("Predefinições:");
+                ui.horizontal_wrapped(|ui| {
+                    for (nome, w, h) in [
+                        ("32", 32u32, 32u32),
+                        ("64", 64, 64),
+                        ("128", 128, 128),
+                        ("256", 256, 256),
+                        ("512", 512, 512),
+                        ("800×520", 800, 520),
+                        ("1920×1080", 1920, 1080),
+                    ] {
+                        if ui.button(nome).clicked() {
+                            self.pr_w = w;
+                            self.pr_h = h;
+                        }
+                    }
+                });
+                ui.separator();
+                if ui
+                    .add(egui::Button::new("Aplicar").min_size(egui::vec2(100.0, 0.0)))
+                    .clicked()
+                {
+                    aplicar = Some((self.pr_w, self.pr_h));
+                }
+                ui.label(
+                    "Arraste os quadrados ao redor do canvas para redimensionar à mão. \
+                     O desenho não é escalado — só o papel muda (vale no pixel art também).",
+                );
+            });
+        if let Some((w, h)) = aplicar {
+            self.aplicar_prancheta(w, h);
+        }
+        self.win_prancheta = open;
+        if !self.win_prancheta {
+            self.prancheta_drag = None;
+            self.prancheta_preview = None;
+        }
+    }
+
+    /// Desenha as alças de redimensionamento ao redor do canvas e trata o
+    /// arrasto (ancorado no topo-esquerda; muda o tamanho do papel ao soltar).
+    fn prancheta_handles(&mut self, ui: &mut egui::Ui, rect: egui::Rect, zoom: f32) {
+        let blue = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+        let painter = ui.painter_at(ui.clip_rect());
+        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, blue));
+        // Quadradinhos de seleção em volta (8, estilo Illustrator).
+        let visuais = [
+            rect.left_top(),
+            rect.center_top(),
+            rect.right_top(),
+            rect.left_center(),
+            rect.left_bottom(),
+            rect.center_bottom(),
+            rect.right_center(),
+            rect.right_bottom(),
+        ];
+        for p in visuais {
+            let hr = egui::Rect::from_center_size(p, egui::vec2(9.0, 9.0));
+            painter.rect_filled(hr, 1.0, egui::Color32::WHITE);
+            painter.rect_stroke(hr, 1.0, egui::Stroke::new(1.0, blue));
+        }
+        // Alças funcionais (ancoradas no topo-esquerda): largura, altura, ambos.
+        let funcionais = [
+            (
+                rect.right_center(),
+                0u8,
+                egui::CursorIcon::ResizeHorizontal,
+            ),
+            (
+                rect.center_bottom(),
+                1u8,
+                egui::CursorIcon::ResizeVertical,
+            ),
+            (rect.right_bottom(), 2u8, egui::CursorIcon::ResizeNwSe),
+        ];
+        for (p, id, cur) in funcionais {
+            let hr = egui::Rect::from_center_size(p, egui::vec2(14.0, 14.0));
+            let resp = ui.interact(hr, ui.id().with(("prancheta_h", id)), egui::Sense::drag());
+            let ativo = resp.hovered() || self.prancheta_drag == Some(id);
+            if ativo {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(p, egui::vec2(11.0, 11.0)),
+                    1.0,
+                    blue,
+                );
+                ui.ctx().set_cursor_icon(cur);
+            }
+            if resp.drag_started() {
+                self.prancheta_drag = Some(id);
+            }
+        }
+        // Arrasto em andamento: preview + aplica ao soltar.
+        if let Some(id) = self.prancheta_drag {
+            if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
+                let px = (((pp.x - rect.left()) / zoom).round() as i32).clamp(1, 8192) as u32;
+                let py = (((pp.y - rect.top()) / zoom).round() as i32).clamp(1, 8192) as u32;
+                let mut nw = self.document.width;
+                let mut nh = self.document.height;
+                if id == 0 || id == 2 {
+                    nw = px;
+                }
+                if id == 1 || id == 2 {
+                    nh = py;
+                }
+                let prect = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(nw as f32 * zoom, nh as f32 * zoom),
+                );
+                painter.rect_stroke(prect, 0.0, egui::Stroke::new(2.0, blue));
+                painter.text(
+                    prect.right_bottom() + egui::vec2(6.0, 6.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{nw} x {nh}"),
+                    egui::FontId::proportional(13.0),
+                    blue,
+                );
+                self.pr_w = nw;
+                self.pr_h = nh;
+                if ui.input(|i| i.pointer.any_released()) {
+                    self.prancheta_drag = None;
+                    self.aplicar_prancheta(nw, nh);
+                }
+            } else if ui.input(|i| !i.pointer.any_down()) {
+                self.prancheta_drag = None;
+            }
+        }
     }
 
     /// Janela: Seleção de cores (visual + código + cores personalizadas).
@@ -6567,6 +6863,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_rig(ctx);
         self.janela_objetos(ctx);
         self.janela_editar_peca(ctx);
+        self.janela_prancheta(ctx);
         self.ensure_piece_textures(ctx);
         self.ensure_part_textures(ctx);
         self.barra_frames(ctx);
@@ -6581,13 +6878,38 @@ impl eframe::App for SketchMotionApp {
             } else {
                 self.zoom.max(0.05)
             };
-            egui::ScrollArea::both()
+            let avail = ui.available_size();
+            let cw = doc_w * zoom;
+            let ch = doc_h * zoom;
+            // "Pasteboard": margem ao redor do canvas para centralizá-lo e poder
+            // movê-lo com rolagem H/V (estilo Illustrator).
+            let pad_x = (avail.x * self.workspace_pad).max(120.0);
+            let pad_y = (avail.y * self.workspace_pad).max(120.0);
+            let mut area = egui::ScrollArea::both()
                 .auto_shrink([false, false])
-                .drag_to_scroll(false)
+                .drag_to_scroll(false);
+            if std::mem::take(&mut self.center_canvas) {
+                let off = egui::vec2(
+                    (pad_x + cw * 0.5 - avail.x * 0.5).max(0.0),
+                    (pad_y + ch * 0.5 - avail.y * 0.5).max(0.0),
+                );
+                area = area.scroll_offset(off);
+            }
+            area
                 .show(ui, |ui| {
-                    let size = egui::vec2(doc_w * zoom, doc_h * zoom);
-                    let (rect, response) =
-                        ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                    // Conteúdo = canvas + margem simétrica (pasteboard).
+                    let content = egui::vec2(cw + 2.0 * pad_x, ch + 2.0 * pad_y);
+                    let (content_rect, _cresp) =
+                        ui.allocate_exact_size(content, egui::Sense::hover());
+                    let rect = egui::Rect::from_min_size(
+                        content_rect.min + egui::vec2(pad_x, pad_y),
+                        egui::vec2(cw, ch),
+                    );
+                    let response = ui.interact(
+                        rect,
+                        ui.id().with("canvas_area"),
+                        egui::Sense::click_and_drag(),
+                    );
                     // Fundo xadrez indica transparência; a imagem (com alfa) vai por cima.
                     {
                         let p = ui.painter_at(rect);
@@ -6746,6 +7068,13 @@ impl eframe::App for SketchMotionApp {
                     let down = ui.input(|i| i.pointer.primary_down());
                     let pdelta = ui.input(|i| i.pointer.delta());
                     let ppos = ui.input(|i| i.pointer.latest_pos());
+
+                    // Prancheta aberta: mostra as alças e suspende o desenho normal.
+                    if self.win_prancheta {
+                        self.prancheta_handles(ui, rect, zoom);
+                    }
+                    let pressed = pressed && !self.win_prancheta;
+                    let down = down && !self.win_prancheta;
 
                     if self.eyedropper != Eyedropper::Off {
                         if pressed {

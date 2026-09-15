@@ -80,6 +80,27 @@ impl Layer {
         ))
     }
 
+    /// Redimensiona o BUFFER da camada (tamanho do papel), preservando o
+    /// conteúdo ancorado no topo-esquerda (corta ou preenche com transparente).
+    /// NÃO escala a imagem: os pixels desenhados ficam onde estão.
+    pub fn resize(&mut self, w: u32, h: u32) {
+        if self.width == w && self.height == h {
+            return;
+        }
+        let mut np = vec![0u8; (w as usize) * (h as usize) * 4];
+        let cw = w.min(self.width) as usize;
+        let ch = h.min(self.height) as usize;
+        for y in 0..ch {
+            let srow = y * (self.width as usize) * 4;
+            let drow = y * (w as usize) * 4;
+            let n = cw * 4;
+            np[drow..drow + n].copy_from_slice(&self.pixels[srow..srow + n]);
+        }
+        self.pixels = np;
+        self.width = w;
+        self.height = h;
+    }
+
     pub fn opacity(&self) -> f32 {
         self.opacity
     }

@@ -217,6 +217,26 @@ impl Document {
         idx
     }
 
+    /// Redimensiona o PAPEL (canvas) para (w, h) em pixels, preservando o
+    /// desenho ancorado no topo-esquerda em TODOS os frames de TODAS as faixas.
+    /// NÃO escala a imagem — só muda o tamanho do papel.
+    pub fn resize_canvas(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 || (w == self.width && h == self.height) {
+            return;
+        }
+        self.sync_to_frames();
+        for t in &mut self.tracks {
+            for f in &mut t.frames {
+                for l in &mut f.layers {
+                    l.resize(w, h);
+                }
+            }
+        }
+        self.width = w;
+        self.height = h;
+        self.load_active_track_mirror();
+    }
+
     /// Acrescenta uma faixa já pronta (ex.: importar de outro arquivo como
     /// referência). NÃO troca a faixa ativa. Devolve o índice dela.
     pub fn push_track(&mut self, name: impl Into<String>, frames: Vec<Frame>, fps: u32) -> usize {
