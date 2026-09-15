@@ -17,3 +17,4 @@ sketmotion
 -[PRIORIDADE] possibilidade de copiar um frame inteiro e colar na sequencia...
 -[PRIORIDADE] possibilidade de arrastar um frame trocando o de lugar com outro
 - habilitar clique do botão direito
+- poder abrir mais de uma pasta de trabalho sketch motion, em uma unica para que seja possivel copiar formas e desenhos umas das outras.

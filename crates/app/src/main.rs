@@ -15,7 +15,6 @@ use sketchmotion_tools::Tool;
 
 const CANVAS_W: u32 = 800;
 const CANVAS_H: u32 = 520;
-const MAX_UNDO: usize = 10;
 
 /// Nº de colunas da grade de cores básicas.
 const BASICAS_COLS: usize = 16;
@@ -1321,12 +1320,10 @@ impl SketchMotionApp {
         self.warn_locked_layer(li);
     }
 
-    /// Salva o estado atual no histórico (limitado a MAX_UNDO) e limpa o refazer.
+    /// Salva o estado atual no histórico e limpa o refazer. O histórico é
+    /// ilimitado (cresce conforme as ações; só a memória disponível o limita).
     fn push_undo(&mut self) {
         self.undo_stack.push(self.document.clone());
-        if self.undo_stack.len() > MAX_UNDO {
-            self.undo_stack.remove(0);
-        }
         self.redo_stack.clear();
     }
 
@@ -1338,6 +1335,10 @@ impl SketchMotionApp {
                 .active_layer
                 .min(self.document.layers.len().saturating_sub(1));
             self.last_pos = None;
+            // Uma colagem pendente (flutuante não confirmada) é cancelada pelo
+            // undo — assim cada colar é revertido isoladamente.
+            self.float_sel = None;
+            self.float_tex = None;
             self.dirty = true;
             self.status = "Desfeito".to_owned();
         }
@@ -1351,6 +1352,8 @@ impl SketchMotionApp {
                 .active_layer
                 .min(self.document.layers.len().saturating_sub(1));
             self.last_pos = None;
+            self.float_sel = None;
+            self.float_tex = None;
             self.dirty = true;
             self.status = "Refeito".to_owned();
         }
@@ -5504,11 +5507,21 @@ impl eframe::App for SketchMotionApp {
             if i.modifiers.command && i.key_pressed(egui::Key::Y) {
                 do_redo = true;
             }
+            // Copiar/colar: no eframe (Windows) o Ctrl+C/Ctrl+V normalmente NÃO
+            // chega como tecla — vira Event::Copy / Event::Paste. Detectamos os
+            // dois caminhos para garantir que funcione.
             if i.modifiers.command && i.key_pressed(egui::Key::C) {
                 k_copy = true;
             }
             if i.modifiers.command && i.key_pressed(egui::Key::V) {
                 k_paste = true;
+            }
+            for e in &i.events {
+                match e {
+                    egui::Event::Copy | egui::Event::Cut => k_copy = true,
+                    egui::Event::Paste(_) => k_paste = true,
+                    _ => {}
+                }
             }
             if i.key_pressed(egui::Key::Enter) {
                 k_enter = true;
@@ -5762,45 +5775,6 @@ impl eframe::App for SketchMotionApp {
                         self.selected_obj = None;
                         self.dirty = true;
                     }
-                }
-            }
-            // Copiar (Ctrl+C): guarda os pixels da seleção flutuante e a devolve
-            // ao lugar (cópia não destrutiva — o frame de origem fica intacto).
-            if k_copy {
-                let data = self
-                    .float_sel
-                    .as_ref()
-                    .map(|fs| (fs.ow, fs.oh, fs.pixels.clone()));
-                if let Some(d) = data {
-                    self.clip = Some(d);
-                    self.commit_float();
-                    self.status = "Seleção copiada — Ctrl+V para colar (inclusive em outro frame)".into();
-                }
-            }
-            // Colar (Ctrl+V): cria uma nova seleção flutuante a partir do que foi
-            // copiado, no centro do canvas (funciona inclusive em outro frame).
-            if k_paste {
-                if let Some((ow, oh, px)) = self.clip.clone() {
-                    self.push_undo();
-                    self.commit_float();
-                    let (dw, dh) = (self.document.width as f32, self.document.height as f32);
-                    self.float_sel = Some(FloatSel {
-                        pixels: px,
-                        ow,
-                        oh,
-                        cx: dw / 2.0,
-                        cy: dh / 2.0,
-                        hw: ow as f32 / 2.0,
-                        hh: oh as f32 / 2.0,
-                        angle: 0.0,
-                        opacity: 1.0,
-                        layer: self.active_layer,
-                    });
-                    self.float_tex = None;
-                    self.tool = Tool::Select;
-                    self.selected_obj = None;
-                    self.dirty = true;
-                    self.status = "Colado — mova e confirme".into();
                 }
             }
         }
@@ -6800,6 +6774,50 @@ impl eframe::App for SketchMotionApp {
         }
         if do_redo {
             self.redo();
+        }
+        // Copiar (Ctrl+C): guarda os pixels da seleção flutuante e a devolve ao
+        // lugar (cópia não destrutiva — o frame de origem fica intacto). Fica
+        // aqui, fora do gate de teclado, igual ao undo/redo, para sempre rodar.
+        if k_copy {
+            let data = self
+                .float_sel
+                .as_ref()
+                .map(|fs| (fs.ow, fs.oh, fs.pixels.clone()));
+            if let Some(d) = data {
+                self.clip = Some(d);
+                self.commit_float();
+                self.status = "Seleção copiada — Ctrl+V para colar (inclusive em outro frame)".into();
+            } else {
+                self.status = "Nada selecionado para copiar (use Seleção/Laço primeiro)".into();
+            }
+        }
+        // Colar (Ctrl+V): cria uma nova seleção flutuante a partir do que foi
+        // copiado, no centro do canvas (funciona inclusive em outro frame).
+        if k_paste {
+            if let Some((ow, oh, px)) = self.clip.clone() {
+                // Finaliza a colagem anterior ANTES de registrar o histórico, para
+                // que cada colar seja uma ação de undo/redo separada (não uma só).
+                self.commit_float();
+                self.push_undo();
+                let (dw, dh) = (self.document.width as f32, self.document.height as f32);
+                self.float_sel = Some(FloatSel {
+                    pixels: px,
+                    ow,
+                    oh,
+                    cx: dw / 2.0,
+                    cy: dh / 2.0,
+                    hw: ow as f32 / 2.0,
+                    hh: oh as f32 / 2.0,
+                    angle: 0.0,
+                    opacity: 1.0,
+                    layer: self.active_layer,
+                });
+                self.float_tex = None;
+                self.tool = Tool::Select;
+                self.selected_obj = None;
+                self.dirty = true;
+                self.status = "Colado — mova e confirme".into();
+            }
         }
         if do_zoom_in {
             self.zoom = (self.zoom * 1.25).min(64.0);
