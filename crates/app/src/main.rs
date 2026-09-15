@@ -4260,6 +4260,74 @@ impl SketchMotionApp {
         base
     }
 
+    /// Terceira barra (abaixo das duas do topo): mostra dinamicamente arquivo,
+    /// timeline, frame e camada selecionados — para o usuário não se perder.
+    fn barra_status(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("status").exact_height(24.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let arq = self
+                    .current_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Sem título");
+                ui.strong("Arquivo:");
+                ui.label(arq);
+                ui.separator();
+                let at = self.document.active_track;
+                let tname = self
+                    .document
+                    .tracks
+                    .get(at)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| format!("Timeline {}", at + 1));
+                ui.strong("Timeline:");
+                ui.label(tname);
+                ui.separator();
+                ui.strong("Frame:");
+                ui.label(format!(
+                    "{}/{}",
+                    self.document.current + 1,
+                    self.document.frames.len().max(1)
+                ));
+                ui.separator();
+                ui.strong("Camada:");
+                let (lname, locked) = self
+                    .document
+                    .layers
+                    .get(self.active_layer)
+                    .map(|l| (l.name.clone(), l.locked))
+                    .unwrap_or_else(|| (format!("Camada {}", self.active_layer + 1), false));
+                if locked {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xE0, 0x6C, 0x3A),
+                        format!("{lname} (bloqueada)"),
+                    );
+                } else {
+                    ui.label(lname);
+                }
+            });
+        });
+    }
+
+    /// Rodapé: versão, criador e link do GitHub.
+    fn rodape(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("rodape")
+            .exact_height(22.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("SketchMotion v{}", env!("CARGO_PKG_VERSION")));
+                    ui.separator();
+                    ui.label("por Gabriel Pedreira");
+                    ui.separator();
+                    ui.hyperlink_to(
+                        "github.com/gabrielpedreira",
+                        "https://github.com/gabrielpedreira",
+                    );
+                });
+            });
+    }
+
     /// Barra de opções (abaixo do menu): cada ferramenta abre aqui o seu
     /// próprio painel, com os controles que fazem sentido para ela.
     fn barra_opcoes(&mut self, ctx: &egui::Context) {
@@ -6854,6 +6922,8 @@ impl eframe::App for SketchMotionApp {
 
         // Barra de opções da ferramenta ativa (abaixo do menu).
         self.barra_opcoes(ctx);
+        // Terceira barra: arquivo/timeline/frame/camada selecionados.
+        self.barra_status(ctx);
         // Ferramentas (esquerda) e painéis (direita), sempre visíveis.
         self.barra_ferramentas(ctx);
         self.barra_icones(ctx);
@@ -6866,6 +6936,8 @@ impl eframe::App for SketchMotionApp {
         self.janela_prancheta(ctx);
         self.ensure_piece_textures(ctx);
         self.ensure_part_textures(ctx);
+        // Rodapé (fica no fundo, criado antes da timeline).
+        self.rodape(ctx);
         self.barra_frames(ctx);
         self.janela_reproducao(ctx);
 
@@ -7874,7 +7946,7 @@ impl eframe::App for SketchMotionApp {
         let mut do_zoom_in = false;
         let mut do_zoom_out = false;
         egui::Area::new(egui::Id::new("acoes_canvas"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-66.0, -104.0))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-66.0, 96.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
