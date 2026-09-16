@@ -10,10 +10,14 @@
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{
-    Anchor, CameraKeyframe, Color, Document, Frame, ImageObject, Interp, Layer, PieceLibrary,
-    VectorObject,
+    Anchor, Camera, CameraKeyframe, Color, Document, Frame, ImageObject, Interp, Layer,
+    PieceLibrary, VectorObject,
 };
 use sketchmotion_render::{rasterize_images, render_frame_alpha, render_layers_alpha, PixelImage};
+use sketchmotion_trace::{trace_bilevel, trace_quantized, BilevelParams, QuantParams, TracedRegion};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
 use sketchmotion_tools::Tool;
 
 const CANVAS_W: u32 = 800;
@@ -869,6 +873,226 @@ fn ui_paleta_quadrados(
 
 /// Botão de ícone da barra direita. Fica destacado quando a janela
 /// correspondente está aberta.
+/// Presets do Traçado de Imagem (índice = `trace_preset`).
+const TRACE_PRESETS: [&str; 12] = [
+    "[Padrão]",
+    "Foto de alta fidelidade",
+    "Foto de baixa fidelidade",
+    "3 cores",
+    "6 cores",
+    "16 cores",
+    "Tonalidades de cinza",
+    "Logotipo preto-e-branco",
+    "Esboço artístico",
+    "Silhuetas",
+    "Traçado",
+    "Desenho técnico",
+];
+
+/// Receita de traçado (parâmetros já resolvidos a partir do preset) — enviada a
+/// uma thread de trabalho para vetorizar sem travar a interface.
+enum TraceRecipe {
+    Quant(QuantParams),
+    Bilevel(BilevelParams),
+}
+
+/// Resolve o preset + remoção de fundo + escala numa receita concreta.
+fn trace_recipe(preset: usize, remove_bg: bool, escala: f32) -> TraceRecipe {
+    let es = escala.max(0.1);
+    let ee = es.sqrt(); // epsilon cresce devagar → mais nós, mais preciso
+    let ea = (es * es).max(1.0); // área mínima proporcional à resolução
+    let q = |colors: usize, gray: bool, simp: f32, min_a: usize| {
+        TraceRecipe::Quant(QuantParams {
+            colors,
+            grayscale: gray,
+            simplify: simp * ee,
+            min_area: ((min_a as f32) * ea) as usize,
+            remove_bg,
+        })
+    };
+    let b = |th: u8, inv: bool, alpha: bool, simp: f32, min_a: usize| {
+        TraceRecipe::Bilevel(BilevelParams {
+            threshold: th,
+            invert: inv,
+            alpha_only: alpha,
+            simplify: simp * ee,
+            min_area: ((min_a as f32) * ea) as usize,
+        })
+    };
+    match preset {
+        0 => q(12, false, 1.0, 20),          // Padrão
+        1 => q(32, false, 0.5, 8),           // Foto alta
+        2 => q(8, false, 1.6, 40),           // Foto baixa
+        3 => q(3, false, 1.0, 16),           // 3 cores
+        4 => q(6, false, 1.0, 16),           // 6 cores
+        5 => q(16, false, 0.8, 12),          // 16 cores
+        6 => q(6, true, 1.2, 20),            // Tons de cinza
+        7 => b(128, false, false, 0.8, 16),  // Logotipo P&B
+        8 => b(120, false, false, 1.2, 12),  // Esboço
+        9 => b(210, false, false, 2.0, 30),  // Silhuetas
+        10 => b(128, false, false, 0.8, 8),  // Traçado
+        _ => q(4, false, 2.4, 30),           // Desenho técnico
+    }
+}
+
+/// Executa a receita sobre a imagem (rgba, w, h), reportando progresso.
+fn apply_recipe(r: &TraceRecipe, rgba: &[u8], w: u32, h: u32, prog: &AtomicU32) -> Vec<TracedRegion> {
+    match r {
+        TraceRecipe::Quant(p) => trace_quantized(rgba, w, h, p, prog),
+        TraceRecipe::Bilevel(p) => trace_bilevel(rgba, w, h, p, prog),
+    }
+}
+
+/// Tipo de exportação para o job de fundo.
+#[derive(Clone, Copy)]
+enum ExportKind {
+    Gif,
+    Mp4,
+    Seq,
+    Sheet,
+}
+
+/// Abertura de projeto em andamento (thread de fundo → tela de carregamento).
+struct OpenJob {
+    rx: mpsc::Receiver<Result<Document, String>>,
+    started: std::time::Instant,
+    path: std::path::PathBuf,
+}
+
+/// Trabalho pesado (exportar/salvar) em andamento: barra de progresso + bloqueio.
+struct BusyJob {
+    rx: mpsc::Receiver<Result<String, String>>,
+    progress: Arc<AtomicU32>,
+    started: std::time::Instant,
+    titulo: String,
+    determinate: bool,
+    set_path: Option<std::path::PathBuf>,
+}
+
+/// Aplica o enquadramento da câmera (frame `pf`) sobre `full` — versão livre
+/// (sem `self`), para rodar na thread de exportação.
+fn aplicar_camera_livre(cam: &Camera, full: &[u8], dw: u32, dh: u32, pf: usize) -> Vec<u8> {
+    let s = cam.sample(pf);
+    let (ow, oh) = (dw as usize, dh as usize);
+    let mut out = vec![0u8; ow * oh * 4];
+    if full.len() < ow * oh * 4 {
+        return out;
+    }
+    let ang = s.rotation.to_radians();
+    let (sin, cos) = ang.sin_cos();
+    for oy in 0..oh {
+        for ox in 0..ow {
+            let u = (ox as f32 + 0.5) / ow as f32 - 0.5;
+            let v = (oy as f32 + 0.5) / oh as f32 - 0.5;
+            let lx = u * s.w;
+            let ly = v * s.h;
+            let dx = s.x + lx * cos - ly * sin;
+            let dy = s.y + lx * sin + ly * cos;
+            let sx = dx.floor() as i32;
+            let sy = dy.floor() as i32;
+            let di = (oy * ow + ox) * 4;
+            if sx >= 0 && sy >= 0 && (sx as u32) < dw && (sy as u32) < dh {
+                let si = ((sy as u32 * dw + sx as u32) * 4) as usize;
+                out[di..di + 4].copy_from_slice(&full[si..si + 4]);
+            }
+        }
+    }
+    out
+}
+
+/// Renderiza + codifica a exportação (roda na thread), reportando progresso.
+#[allow(clippy::too_many_arguments)]
+fn run_export(
+    kind: ExportKind,
+    path: std::path::PathBuf,
+    frames: Vec<Frame>,
+    camera: Camera,
+    export_camera: bool,
+    w: u32,
+    h: u32,
+    fps: u32,
+    scale: u32,
+    cols: u32,
+    progress: &AtomicU32,
+) -> Result<String, String> {
+    let sc = scale.max(1);
+    let (ew, eh) = (w * sc, h * sc);
+    let nf = frames.len().max(1) as u32;
+    let render = |i: usize, f: &Frame| -> Vec<u8> {
+        let img = render_frame_alpha(w, h, &f.layers, &f.vectors, &f.images);
+        let base = if export_camera {
+            aplicar_camera_livre(&camera, &img.rgba, w, h, i)
+        } else {
+            img.rgba
+        };
+        let (_, _, up) = upscale_nn(w, h, &base, sc);
+        up
+    };
+    match kind {
+        ExportKind::Gif | ExportKind::Mp4 => {
+            let mut ups: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
+            for (i, f) in frames.iter().enumerate() {
+                ups.push(render(i, f));
+                progress.store((i as u32 * 900 / nf).min(899), Ordering::Relaxed);
+            }
+            progress.store(910, Ordering::Relaxed);
+            let r = match kind {
+                ExportKind::Gif => sketchmotion_io::export_gif(ew, eh, &ups, fps, &path),
+                _ => sketchmotion_io::export_mp4(ew, eh, &ups, fps, &path),
+            };
+            progress.store(1000, Ordering::Relaxed);
+            r.map(|_| format!("Exportado ({} frames): {}", ups.len(), path.display()))
+        }
+        ExportKind::Seq => {
+            let mut ok = 0usize;
+            for (i, f) in frames.iter().enumerate() {
+                let up = render(i, f);
+                let fp = path.join(format!("frame_{:04}.png", i + 1));
+                sketchmotion_io::export_png(ew, eh, &up, &fp)?;
+                ok += 1;
+                progress.store((i as u32 * 1000 / nf).min(999), Ordering::Relaxed);
+            }
+            progress.store(1000, Ordering::Relaxed);
+            Ok(format!("{ok} PNG(s) salvos em {}", path.display()))
+        }
+        ExportKind::Sheet => {
+            let (fw, fh) = (ew, eh);
+            let ncols = if cols == 0 { nf } else { cols.max(1) };
+            let rows = (nf + ncols - 1) / ncols;
+            let (sw, sh) = (fw * ncols, fh * rows);
+            let mut sheet = vec![0u8; (sw * sh * 4) as usize];
+            for (i, f) in frames.iter().enumerate() {
+                let up = render(i, f);
+                let (cx, cy) = (i as u32 % ncols, i as u32 / ncols);
+                let (ox, oy) = (cx * fw, cy * fh);
+                let rowlen = (fw * 4) as usize;
+                for y in 0..fh {
+                    let dst = (((oy + y) * sw + ox) * 4) as usize;
+                    let src = ((y * fw) * 4) as usize;
+                    if dst + rowlen <= sheet.len() && src + rowlen <= up.len() {
+                        sheet[dst..dst + rowlen].copy_from_slice(&up[src..src + rowlen]);
+                    }
+                }
+                progress.store((i as u32 * 1000 / nf).min(999), Ordering::Relaxed);
+            }
+            progress.store(1000, Ordering::Relaxed);
+            sketchmotion_io::export_png(sw, sh, &sheet, &path)
+                .map(|_| format!("Sprite sheet {sw}x{sh}: {}", path.display()))
+        }
+    }
+}
+
+/// Trabalho de vetorização em andamento (thread de fundo + progresso).
+struct TraceJob {
+    rx: mpsc::Receiver<Vec<TracedRegion>>,
+    progress: Arc<AtomicU32>,
+    sw: f32,
+    sh: f32,
+    from_float: bool,
+    img_idx: Option<usize>,
+    preset: usize,
+}
+
 fn icon_button(ui: &mut egui::Ui, active: bool, icon: &str) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(38.0, 38.0), egui::Sense::click());
     let bg = if active {
@@ -994,6 +1218,8 @@ struct FloatSel {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
+    /// Splash de inicialização (GIF que roda uma vez e congela no último frame).
+    Splash,
     Home,
     Editor,
 }
@@ -1094,6 +1320,8 @@ struct SketchMotionApp {
     current_path: Option<std::path::PathBuf>,
     export_scale: u32,
     export_cols: u32,
+    /// Exportar já enquadrado pela câmera (keyframes). Ligado por padrão.
+    export_camera: bool,
     bg_white: bool,
     /// Fundo escuro (cinza bem escuro) — só visual, ajuda a ver certos detalhes.
     bg_dark: bool,
@@ -1117,6 +1345,10 @@ struct SketchMotionApp {
     pen_width: i32,
     // estado vetorial
     selected_obj: Option<usize>,
+    /// Seleção múltipla de objetos vetoriais (para mover em conjunto / agrupar).
+    sel_set: Vec<usize>,
+    /// Próximo id de grupo a distribuir.
+    next_group: u32,
     pen_anchors: Vec<Anchor>,
     pen_drag_idx: Option<usize>,
     dragging_obj: bool,
@@ -1172,7 +1404,12 @@ struct SketchMotionApp {
     view_both: bool,
     play_both: bool,
     /// Frame copiado (Copiar/Colar frames, inclusive entre timelines/arquivos).
-    frame_clip: Option<Frame>,
+    /// Seleção de vários frames (na faixa ativa) para copiar em conjunto.
+    frame_sel: Vec<usize>,
+    /// Modo "selecionar frames": clique alterna a seleção em vez de navegar.
+    frame_sel_mode: bool,
+    /// Conjunto de frames copiados (colados em sequência).
+    frames_clip: Vec<Frame>,
     /// Arrasto de frame em andamento: (faixa, índice do frame).
     drag_frame: Option<(usize, usize)>,
     /// Recentralizar o canvas na próxima renderização (pedido único).
@@ -1198,6 +1435,62 @@ struct SketchMotionApp {
     cam_grab: (f32, f32),
     /// Ângulo inicial do ponteiro (rad) para rotacionar.
     cam_start_ang: f32,
+    /// Frame de origem ao arrastar um keyframe na trilha da câmera (timeline).
+    cam_kf_drag: Option<usize>,
+    /// Textura da logo (tela inicial), carregada uma vez.
+    logo_tex: Option<egui::TextureHandle>,
+    /// Ícone de página pixel art (tela inicial), carregado uma vez.
+    page_tex: Option<egui::TextureHandle>,
+    /// Ícone de página normal (tela inicial), carregado uma vez.
+    page_normal_tex: Option<egui::TextureHandle>,
+    // Traçado de Imagem (raster → vetor).
+    win_trace: bool,
+    /// Imagem de origem para traçar (já reduzida): (w, h, rgba).
+    trace_src: Option<(u32, u32, Vec<u8>)>,
+    /// Transformação do objeto de imagem no canvas: (cx, cy, hw, hh, angle).
+    /// Os contornos são mapeados por ela (fica alinhado sobre a imagem).
+    trace_tf: (f32, f32, f32, f32, f32),
+    /// A origem é a flutuante de imagem atual (para acompanhar mover/escalar).
+    trace_from_float: bool,
+    /// Índice do objeto de imagem (document.images) usado como origem, se aplicável.
+    trace_img_idx: Option<usize>,
+    /// Preset aguardando confirmação "deseja vetorizar?" (índice em TRACE_PRESETS).
+    trace_confirm: Option<usize>,
+    /// Preset de traçado escolhido (índice em TRACE_PRESETS).
+    trace_preset: usize,
+    /// Remover fundo (cor de borda vira transparência nos modos coloridos).
+    trace_remove_bg: bool,
+    /// Prévia calculada (regiões em coords da imagem de origem).
+    trace_regions: Vec<TracedRegion>,
+    trace_dirty: bool,
+    /// Vetorização final rodando em segundo plano (com barra de progresso).
+    trace_job: Option<TraceJob>,
+    /// Exportar/salvar rodando em segundo plano (barra de progresso + bloqueio).
+    busy_job: Option<BusyJob>,
+    /// Abertura de projeto em andamento (tela de carregamento).
+    open_job: Option<OpenJob>,
+    /// Splash: frames do GIF (textura + duração em segundos).
+    splash_frames: Vec<(egui::TextureHandle, f32)>,
+    /// Splash: já decodificou o GIF?
+    splash_loaded: bool,
+    /// Splash: índice do frame atual.
+    splash_idx: usize,
+    /// Splash: quando o frame atual começou a ser exibido.
+    splash_frame_started: Option<std::time::Instant>,
+    /// Splash: chegou ao último frame (congelado)?
+    splash_done: bool,
+    /// Splash: instante em que congelou no último frame.
+    splash_done_at: Option<std::time::Instant>,
+    /// Splash: janela já ajustada ao tamanho do GIF (sem bordas)?
+    splash_win_set: bool,
+    /// Splash: janela já centralizada na tela?
+    splash_centered: bool,
+    /// O trabalho foi modificado desde o último salvamento.
+    modificado: bool,
+    /// Diálogo "salvar antes de sair?" visível.
+    win_fechar: bool,
+    /// Fechamento já confirmado (permite a janela fechar sem novo diálogo).
+    confirmado_fechar: bool,
     // Prancheta: redimensionar o papel (canvas) sem mexer no desenho.
     win_prancheta: bool,
     pr_w: u32,
@@ -1304,10 +1597,11 @@ impl SketchMotionApp {
             current_path: None,
             export_scale: 1,
             export_cols: 0,
+            export_camera: true,
             bg_white: false,
             bg_dark: false,
             pixel_mode: false,
-            screen: Screen::Home,
+            screen: Screen::Splash,
             home_w: 800,
             home_h: 520,
             home_pixel: false,
@@ -1324,6 +1618,8 @@ impl SketchMotionApp {
             wand_contiguo: true,
             pen_width: 2,
             selected_obj: None,
+            sel_set: Vec::new(),
+            next_group: 1,
             pen_anchors: Vec::new(),
             pen_drag_idx: None,
             dragging_obj: false,
@@ -1367,7 +1663,9 @@ impl SketchMotionApp {
             onion_for: None,
             view_both: false,
             play_both: false,
-            frame_clip: None,
+            frame_sel: Vec::new(),
+            frame_sel_mode: false,
+            frames_clip: Vec::new(),
             drag_frame: None,
             center_canvas: true,
             workspace_pad: 0.9,
@@ -1380,6 +1678,34 @@ impl SketchMotionApp {
             cam_orig: CameraKeyframe::default(),
             cam_grab: (0.0, 0.0),
             cam_start_ang: 0.0,
+            cam_kf_drag: None,
+            logo_tex: None,
+            page_tex: None,
+            page_normal_tex: None,
+            win_trace: false,
+            trace_src: None,
+            trace_tf: (0.0, 0.0, 0.0, 0.0, 0.0),
+            trace_from_float: false,
+            trace_img_idx: None,
+            trace_confirm: None,
+            trace_preset: 3, // "3 cores" por padrão
+            trace_remove_bg: true,
+            trace_regions: Vec::new(),
+            trace_dirty: false,
+            trace_job: None,
+            busy_job: None,
+            open_job: None,
+            splash_frames: Vec::new(),
+            splash_loaded: false,
+            splash_idx: 0,
+            splash_frame_started: None,
+            splash_done: false,
+            splash_done_at: None,
+            splash_win_set: false,
+            splash_centered: false,
+            modificado: false,
+            win_fechar: false,
+            confirmado_fechar: false,
             win_prancheta: false,
             pr_w: CANVAS_W,
             pr_h: CANVAS_H,
@@ -1451,6 +1777,7 @@ impl SketchMotionApp {
     fn push_undo(&mut self) {
         self.undo_stack.push(self.document.clone());
         self.redo_stack.clear();
+        self.modificado = true;
     }
 
     fn undo(&mut self) {
@@ -1465,6 +1792,9 @@ impl SketchMotionApp {
             // undo — assim cada colar é revertido isoladamente.
             self.float_sel = None;
             self.float_tex = None;
+            self.sel_set.clear();
+            self.selected_obj = None;
+            self.modificado = true;
             self.dirty = true;
             self.status = "Desfeito".to_owned();
         }
@@ -1480,6 +1810,9 @@ impl SketchMotionApp {
             self.last_pos = None;
             self.float_sel = None;
             self.float_tex = None;
+            self.sel_set.clear();
+            self.selected_obj = None;
+            self.modificado = true;
             self.dirty = true;
             self.status = "Refeito".to_owned();
         }
@@ -1809,32 +2142,71 @@ impl SketchMotionApp {
         };
     }
 
-    fn salvar(&mut self) {
+    /// Salva o projeto em segundo plano (indicador "Salvando…" bloqueante).
+    fn iniciar_salvar(&mut self, path: std::path::PathBuf) {
         self.document.sync_to_frames();
+        let doc = self.document.clone();
+        let progress = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = mpsc::channel();
+        let p2 = path.clone();
+        std::thread::spawn(move || {
+            let r = sketchmotion_io::save(&doc, &p2).map(|_| format!("Salvo em {}", p2.display()));
+            let _ = tx.send(r);
+        });
+        self.busy_job = Some(BusyJob {
+            rx,
+            progress,
+            started: std::time::Instant::now(),
+            titulo: "Salvando…".into(),
+            determinate: false,
+            set_path: Some(path),
+        });
+    }
+
+    fn salvar(&mut self) {
         if let Some(path) = self.current_path.clone() {
-            self.status = match sketchmotion_io::save(&self.document, &path) {
-                Ok(()) => format!("Salvo em {}", path.display()),
-                Err(e) => format!("Erro ao salvar: {e}"),
-            };
+            self.iniciar_salvar(path);
         } else {
             self.salvar_como();
         }
     }
 
-    fn salvar_como(&mut self) {
+    /// Salva de forma SÍNCRONA (bloqueante) — usado ao fechar o app. Devolve
+    /// true se salvou (ou false se o usuário cancelou o diálogo / deu erro).
+    fn salvar_sync(&mut self) -> bool {
         self.document.sync_to_frames();
+        let path = match self.current_path.clone() {
+            Some(p) => p,
+            None => match rfd::FileDialog::new()
+                .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
+                .set_file_name("desenho.sketchmotion")
+                .save_file()
+            {
+                Some(p) => p,
+                None => return false,
+            },
+        };
+        match sketchmotion_io::save(&self.document, &path) {
+            Ok(()) => {
+                self.current_path = Some(path);
+                self.modificado = false;
+                self.status = "Salvo".into();
+                true
+            }
+            Err(e) => {
+                self.status = format!("Erro ao salvar: {e}");
+                false
+            }
+        }
+    }
+
+    fn salvar_como(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
             .set_file_name("desenho.sketchmotion")
             .save_file()
         {
-            match sketchmotion_io::save(&self.document, &path) {
-                Ok(()) => {
-                    self.status = format!("Salvo em {}", path.display());
-                    self.current_path = Some(path);
-                }
-                Err(e) => self.status = format!("Erro ao salvar: {e}"),
-            }
+            self.iniciar_salvar(path);
         }
     }
 
@@ -1845,19 +2217,20 @@ impl SketchMotionApp {
             .set_file_name("desenho.png")
             .save_file()
         {
+            let (w, h) = (self.document.width, self.document.height);
             let img = render_frame_alpha(
-                self.document.width,
-                self.document.height,
+                w,
+                h,
                 &self.document.layers,
                 &self.document.vectors,
                 &self.document.images,
             );
-            let (ew, eh, ergba) = upscale_nn(
-                self.document.width,
-                self.document.height,
-                &img.rgba,
-                self.export_scale,
-            );
+            let base = if self.export_camera {
+                self.aplicar_camera_rgba(&img.rgba, w, h, self.document.current)
+            } else {
+                img.rgba
+            };
+            let (ew, eh, ergba) = upscale_nn(w, h, &base, self.export_scale);
             self.status = match sketchmotion_io::export_png(ew, eh, &ergba, &path) {
                 Ok(()) => format!("Exportado ({ew}x{eh}): {}", path.display()),
                 Err(e) => format!("Erro ao exportar: {e}"),
@@ -1865,41 +2238,58 @@ impl SketchMotionApp {
         }
     }
 
+    /// Abre um projeto: o carregamento (que pode ser lento em arquivos grandes)
+    /// roda numa thread e mostra a tela de carregamento (open_job). Devolve true
+    /// se iniciou a abertura (o documento é aplicado quando a thread termina).
     fn abrir(&mut self) -> bool {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("SketchMotion", &[sketchmotion_io::PROJECT_EXTENSION])
             .pick_file()
         {
-            match sketchmotion_io::load(&path) {
-                Ok(doc) => {
-                    self.document = doc;
-                    self.active_layer = 0;
-                    self.last_pos = None;
-                    self.dirty = true;
-                    self.track_thumbs.clear();
-                    self.between_cache.clear();
-                    self.between_key = None;
-                    self.onion_tex = None;
-                    self.onion_for = None;
-                    self.float_sel = None;
-                    self.float_tex = None;
-                    self.split_for = None;
-                    self.below_tex = None;
-                    self.above_tex = None;
-                    self.pixel_mode = self.document.pixel_art;
-                    if self.pixel_mode {
-                        let m = self.document.width.max(self.document.height) as f32;
-                        self.zoom = (512.0 / m).floor().max(1.0);
-                    }
-                    self.center_canvas = true;
-                    self.current_path = Some(path.clone());
-                    self.status = format!("Aberto: {}", path.display());
-                    return true;
-                }
-                Err(e) => self.status = format!("Erro ao abrir: {e}"),
-            }
+            let p2 = path.clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(sketchmotion_io::load(&p2));
+            });
+            self.open_job = Some(OpenJob {
+                rx,
+                started: std::time::Instant::now(),
+                path,
+            });
+            return true;
         }
         false
+    }
+
+    /// Aplica um documento recém-aberto ao estado do app.
+    fn aplicar_documento_aberto(&mut self, doc: Document, path: std::path::PathBuf) {
+        self.document = doc;
+        self.active_layer = 0;
+        self.last_pos = None;
+        self.dirty = true;
+        self.track_thumbs.clear();
+        self.between_cache.clear();
+        self.between_key = None;
+        self.onion_tex = None;
+        self.onion_for = None;
+        self.float_sel = None;
+        self.float_tex = None;
+        self.split_for = None;
+        self.below_tex = None;
+        self.above_tex = None;
+        self.sel_set.clear();
+        self.selected_obj = None;
+        self.frame_sel.clear();
+        self.pixel_mode = self.document.pixel_art;
+        if self.pixel_mode {
+            let m = self.document.width.max(self.document.height) as f32;
+            self.zoom = (512.0 / m).floor().max(1.0);
+        }
+        self.center_canvas = true;
+        self.current_path = Some(path.clone());
+        self.modificado = false;
+        self.screen = Screen::Editor;
+        self.status = format!("Aberto: {}", path.display());
     }
 
     /// Abre OUTRO arquivo .sketchmotion como timelines adicionais neste trabalho
@@ -2118,116 +2508,181 @@ impl SketchMotionApp {
     }
 
     /// Exporta a animação como GIF (cada frame no FPS do documento).
-    fn exportar_gif(&mut self) {
+    /// Inicia uma exportação em segundo plano (barra de progresso + bloqueio).
+    fn iniciar_export(&mut self, kind: ExportKind) {
         self.document.sync_to_frames();
         if self.document.frames.is_empty() {
             self.status = "Nada para exportar".into();
             return;
         }
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("GIF animado", &["gif"])
-            .set_file_name("animacao.gif")
-            .save_file()
-        {
-            let (w, h, fps, sc) = (
-                self.document.width,
-                self.document.height,
-                self.document.fps,
-                self.export_scale.max(1),
+        let path = match kind {
+            ExportKind::Gif => rfd::FileDialog::new()
+                .add_filter("GIF animado", &["gif"])
+                .set_file_name("animacao.gif")
+                .save_file(),
+            ExportKind::Mp4 => rfd::FileDialog::new()
+                .add_filter("MP4 (vídeo)", &["mp4"])
+                .set_file_name("animacao.mp4")
+                .save_file(),
+            ExportKind::Sheet => rfd::FileDialog::new()
+                .add_filter("PNG", &["png"])
+                .set_file_name("spritesheet.png")
+                .save_file(),
+            ExportKind::Seq => rfd::FileDialog::new().pick_folder(),
+        };
+        let Some(path) = path else {
+            return;
+        };
+        let frames = self.document.frames.clone();
+        let camera = self.document.camera.clone();
+        let (w, h, fps, sc, cols) = (
+            self.document.width,
+            self.document.height,
+            self.document.fps,
+            self.export_scale.max(1),
+            self.export_cols,
+        );
+        let export_camera = self.export_camera;
+        let progress = Arc::new(AtomicU32::new(0));
+        let prog2 = progress.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let r = run_export(
+                kind,
+                path,
+                frames,
+                camera,
+                export_camera,
+                w,
+                h,
+                fps,
+                sc,
+                cols,
+                &prog2,
             );
-            let (ew, eh) = (w * sc, h * sc);
-            let mut frames: Vec<Vec<u8>> = Vec::with_capacity(self.document.frames.len());
-            for f in &self.document.frames {
-                let img = render_frame_alpha(w, h, &f.layers, &f.vectors, &f.images);
-                let (_, _, up) = upscale_nn(w, h, &img.rgba, sc);
-                frames.push(up);
-            }
-            let n = frames.len();
-            self.status = match sketchmotion_io::export_gif(ew, eh, &frames, fps, &path) {
-                Ok(()) => {
-                    format!("GIF exportado ({n} frames, {fps} fps, {ew}x{eh}): {}", path.display())
-                }
-                Err(e) => format!("Erro no GIF: {e}"),
-            };
+            let _ = tx.send(r);
+        });
+        let titulo = match kind {
+            ExportKind::Gif => "Exportando GIF…",
+            ExportKind::Mp4 => "Exportando MP4…",
+            ExportKind::Seq => "Exportando sequência PNG…",
+            ExportKind::Sheet => "Exportando sprite sheet…",
         }
+        .to_string();
+        self.busy_job = Some(BusyJob {
+            rx,
+            progress,
+            started: std::time::Instant::now(),
+            titulo,
+            determinate: true,
+            set_path: None,
+        });
     }
 
-    /// Exporta cada frame como PNG numerado dentro de uma pasta.
-    fn exportar_sequencia(&mut self) {
-        self.document.sync_to_frames();
-        if self.document.frames.is_empty() {
-            self.status = "Nada para exportar".into();
-            return;
-        }
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            let (w, h, sc) = (self.document.width, self.document.height, self.export_scale.max(1));
-            let mut ok = 0usize;
-            let mut erro: Option<String> = None;
-            for (i, f) in self.document.frames.iter().enumerate() {
-                let img = render_frame_alpha(w, h, &f.layers, &f.vectors, &f.images);
-                let (ew, eh, up) = upscale_nn(w, h, &img.rgba, sc);
-                let fp = dir.join(format!("frame_{:04}.png", i + 1));
-                match sketchmotion_io::export_png(ew, eh, &up, &fp) {
-                    Ok(()) => ok += 1,
-                    Err(e) => {
-                        erro = Some(e);
-                        break;
+    /// Verifica jobs de exportar/salvar; mostra a tela de progresso (bloqueante).
+    /// Devolve true enquanto um job está ativo (o `update` deve parar aí).
+    fn busy_poll(&mut self, ctx: &egui::Context) -> bool {
+        // Abertura de projeto (tela de carregamento — arquivos grandes demoram).
+        if self.open_job.is_some() {
+            ctx.request_repaint();
+            let elapsed = self.open_job.as_ref().unwrap().started.elapsed().as_secs_f32();
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.4);
+                    ui.heading("Abrindo projeto…");
+                    ui.add_space(10.0);
+                    ui.add(egui::Spinner::new().size(30.0));
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_gray(150),
+                        format!("Carregando… ({:.0}s)", elapsed),
+                    );
+                });
+            });
+            match self.open_job.as_ref().unwrap().rx.try_recv() {
+                Ok(res) => {
+                    let job = self.open_job.take().unwrap();
+                    match res {
+                        Ok(doc) => self.aplicar_documento_aberto(doc, job.path),
+                        Err(e) => self.status = format!("Erro ao abrir: {e}"),
                     }
                 }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.open_job = None;
+                    self.status = "Falha ao abrir".into();
+                }
             }
-            self.status = match erro {
-                Some(e) => format!("Erro na sequência: {e}"),
-                None => format!("{ok} PNG(s) salvos em {}", dir.display()),
+            return true;
+        }
+        let (frac, elapsed, titulo, determinate) = {
+            let Some(job) = &self.busy_job else {
+                return false;
             };
-        }
-    }
-
-    /// Exporta todos os frames numa única imagem (sprite sheet) para uso em
-    /// motores de jogo. `export_cols` = colunas (0 = tudo numa linha).
-    fn exportar_spritesheet(&mut self) {
-        self.document.sync_to_frames();
-        let n = self.document.frames.len();
-        if n == 0 {
-            self.status = "Nada para exportar".into();
-            return;
-        }
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG", &["png"])
-            .set_file_name("spritesheet.png")
-            .save_file()
-        {
-            let (w, h, sc) = (self.document.width, self.document.height, self.export_scale.max(1));
-            let (fw, fh) = (w * sc, h * sc);
-            let cols = if self.export_cols == 0 {
-                n as u32
+            (
+                (job.progress.load(Ordering::Relaxed) as f32 / 1000.0).clamp(0.0, 1.0),
+                job.started.elapsed().as_secs_f32(),
+                job.titulo.clone(),
+                job.determinate,
+            )
+        };
+        ctx.request_repaint();
+        let eta = if determinate && frac > 0.03 {
+            let total = elapsed / frac;
+            let rem = (total - elapsed).max(0.0);
+            if rem >= 60.0 {
+                format!("~{}min {}s restantes", (rem / 60.0) as u32, (rem % 60.0) as u32)
             } else {
-                self.export_cols.max(1)
-            };
-            let rows = (n as u32 + cols - 1) / cols;
-            let (sw, sh) = (fw * cols, fh * rows);
-            let mut sheet = vec![0u8; (sw * sh * 4) as usize];
-            for (i, f) in self.document.frames.iter().enumerate() {
-                let img = render_frame_alpha(w, h, &f.layers, &f.vectors, &f.images);
-                let (_, _, up) = upscale_nn(w, h, &img.rgba, sc);
-                let (cx, cy) = (i as u32 % cols, i as u32 / cols);
-                let (ox, oy) = (cx * fw, cy * fh);
-                let rowlen = (fw * 4) as usize;
-                for y in 0..fh {
-                    let dst = (((oy + y) * sw + ox) * 4) as usize;
-                    let src = ((y * fw) * 4) as usize;
-                    if dst + rowlen <= sheet.len() && src + rowlen <= up.len() {
-                        sheet[dst..dst + rowlen].copy_from_slice(&up[src..src + rowlen]);
+                format!("~{}s restantes", rem.ceil() as u32)
+            }
+        } else {
+            String::new()
+        };
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.4);
+                ui.heading(&titulo);
+                ui.add_space(10.0);
+                if determinate {
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(360.0)
+                            .show_percentage(),
+                    );
+                    ui.add_space(4.0);
+                    ui.colored_label(egui::Color32::from_gray(170), eta);
+                } else {
+                    ui.add(egui::Spinner::new().size(28.0));
+                }
+                ui.add_space(6.0);
+                ui.colored_label(
+                    egui::Color32::from_gray(150),
+                    "Aguarde — outras ações estão bloqueadas até terminar.",
+                );
+            });
+        });
+        // Verifica conclusão.
+        match self.busy_job.as_ref().unwrap().rx.try_recv() {
+            Ok(res) => {
+                let job = self.busy_job.take().unwrap();
+                match res {
+                    Ok(msg) => {
+                        if let Some(p) = job.set_path {
+                            self.current_path = Some(p);
+                            self.modificado = false;
+                        }
+                        self.status = msg;
                     }
+                    Err(e) => self.status = format!("Erro: {e}"),
                 }
             }
-            self.status = match sketchmotion_io::export_png(sw, sh, &sheet, &path) {
-                Ok(()) => format!(
-                    "Sprite sheet {sw}x{sh} — {n} frames de {fw}x{fh} ({cols}col x {rows}lin): {}",
-                    path.display()
-                ),
-                Err(e) => format!("Erro no sprite sheet: {e}"),
-            };
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.busy_job = None;
+                self.status = "Processo interrompido".into();
+            }
         }
+        true
     }
 
     /// Barra direita de ícones (uma ferramenta por ícone).
@@ -2250,9 +2705,17 @@ impl SketchMotionApp {
     /// dentro da tolerância `thr`; None se nenhum estiver perto.
     fn hit_test(&self, ponto: (f32, f32), thr: f32) -> Option<usize> {
         let (px, py) = ponto;
-        let mut best: Option<(usize, f32)> = None;
-        for (i, obj) in self.document.vectors.iter().enumerate() {
+        // Do TOPO para baixo: clicar em QUALQUER parte do objeto seleciona —
+        // dentro do preenchimento (área) ou perto do traço (contorno).
+        for i in (0..self.document.vectors.len()).rev() {
+            let obj = &self.document.vectors[i];
             let flat = obj.flatten(20);
+            // Dentro da área preenchida (objeto fechado com fill)?
+            if obj.fill.is_some() && obj.closed && flat.len() >= 3 && ponto_no_poligono(px, py, &flat)
+            {
+                return Some(i);
+            }
+            // Perto do contorno?
             let mut dmin = f32::INFINITY;
             if flat.len() == 1 {
                 dmin = ((flat[0].0 - px).powi(2) + (flat[0].1 - py).powi(2)).sqrt();
@@ -2265,11 +2728,91 @@ impl SketchMotionApp {
                 }
             }
             let tol = thr + obj.stroke_width * 0.5;
-            if dmin <= tol && best.map_or(true, |(_, bd)| dmin < bd) {
-                best = Some((i, dmin));
+            if dmin <= tol {
+                return Some(i);
             }
         }
-        best.map(|(i, _)| i)
+        None
+    }
+
+    /// Índices dos objetos vetoriais cuja caixa cruza a marca (rubber-band).
+    fn vetores_na_marca(&self, a: (i32, i32), b: (i32, i32)) -> Vec<usize> {
+        let (x0, x1) = (a.0.min(b.0) as f32, a.0.max(b.0) as f32);
+        let (y0, y1) = (a.1.min(b.1) as f32, a.1.max(b.1) as f32);
+        if (x1 - x0) < 2.0 && (y1 - y0) < 2.0 {
+            return Vec::new(); // foi clique, não marca
+        }
+        let mut out = Vec::new();
+        for (i, obj) in self.document.vectors.iter().enumerate() {
+            if let Some((minx, miny, maxx, maxy)) = obj.bounds() {
+                if minx <= x1 && maxx >= x0 && miny <= y1 && maxy >= y0 {
+                    out.push(i);
+                }
+            }
+        }
+        out
+    }
+
+    /// Agrupa os objetos do conjunto atual (passam a mover/selecionar juntos).
+    fn agrupar_selecao(&mut self) {
+        if self.sel_set.len() < 2 {
+            self.status = "Selecione 2+ objetos (Shift-clique ou marca) para agrupar".into();
+            return;
+        }
+        self.push_undo();
+        let g = self.next_group;
+        self.next_group += 1;
+        for idx in 0..self.sel_set.len() {
+            let i = self.sel_set[idx];
+            if i < self.document.vectors.len() {
+                self.document.vectors[i].group = Some(g);
+            }
+        }
+        self.dirty = true;
+        self.status = format!("{} objetos agrupados", self.sel_set.len());
+    }
+
+    /// Desagrupa os objetos do conjunto atual (e seus colegas de grupo).
+    fn desagrupar_selecao(&mut self) {
+        if self.sel_set.is_empty() {
+            self.status = "Nada selecionado para desagrupar".into();
+            return;
+        }
+        self.push_undo();
+        let grupos: Vec<u32> = self
+            .sel_set
+            .iter()
+            .filter_map(|&i| self.document.vectors.get(i).and_then(|o| o.group))
+            .collect();
+        for obj in self.document.vectors.iter_mut() {
+            if let Some(g) = obj.group {
+                if grupos.contains(&g) {
+                    obj.group = None;
+                }
+            }
+        }
+        self.dirty = true;
+        self.status = "Desagrupado".into();
+    }
+
+    /// Contorno azul ao redor de cada objeto do conjunto (seleção múltipla).
+    fn desenhar_sel_set(&self, ui: &mut egui::Ui, rect: egui::Rect, zoom: f32) {
+        if self.sel_set.len() < 2 {
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        let blue = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+        for &i in &self.sel_set {
+            if let Some(obj) = self.document.vectors.get(i) {
+                if let Some((minx, miny, maxx, maxy)) = obj.bounds() {
+                    let r = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x + minx * zoom, rect.min.y + miny * zoom),
+                        egui::pos2(rect.min.x + maxx * zoom, rect.min.y + maxy * zoom),
+                    );
+                    painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0_f32, blue));
+                }
+            }
+        }
     }
 
     /// Apaga apenas a parte dos traços vetoriais que passa pelo círculo da
@@ -3831,6 +4374,11 @@ impl SketchMotionApp {
         // Arrasto de frames: início (faixa, frame) e aplicação (faixa, de, para).
         let mut drag_start: Option<(usize, usize)> = None;
         let mut drag_apply: Option<(usize, usize, usize)> = None;
+        // Trilha da câmera (deferidos).
+        let mut cam_goto: Option<usize> = None;
+        let mut cam_kf_toggle: Option<usize> = None;
+        let mut cam_kf_move: Option<(usize, usize)> = None;
+        let mut cam_reset = false;
 
         let ntr = self.document.tracks.len();
         let active = self.document.active_track;
@@ -3916,6 +4464,26 @@ impl SketchMotionApp {
                         .on_hover_text("Compõe todas as timelines visíveis no canvas");
                     ui.checkbox(&mut self.play_both, "Play ambas")
                         .on_hover_text("Reproduz todas as timelines juntas");
+                    ui.separator();
+                    // Botão de modo "Selecionar frames" (clique alterna a seleção).
+                    let sel_btn = egui::Button::new("Selecionar frames").fill(if self.frame_sel_mode {
+                        egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                    } else {
+                        egui::Color32::from_gray(60)
+                    });
+                    if ui
+                        .add(sel_btn)
+                        .on_hover_text("Ligado: clicar nos frames marca vários (para copiar em conjunto)")
+                        .clicked()
+                    {
+                        self.frame_sel_mode = !self.frame_sel_mode;
+                    }
+                    if !self.frame_sel.is_empty() {
+                        ui.label(format!("{} selec.", self.frame_sel.len()));
+                        if ui.button("Limpar").clicked() {
+                            self.frame_sel.clear();
+                        }
+                    }
                 });
                 ui.separator();
 
@@ -4011,10 +4579,10 @@ impl SketchMotionApp {
                                         }
                                         if ui
                                             .add_enabled(
-                                                self.frame_clip.is_some(),
+                                                !self.frames_clip.is_empty(),
                                                 egui::Button::new("Colar"),
                                             )
-                                            .on_hover_text("Colar o frame copiado após o atual")
+                                            .on_hover_text("Cola o(s) frame(s) copiado(s) em sequência")
                                             .clicked()
                                         {
                                             do_paste = Some(ti);
@@ -4149,11 +4717,42 @@ impl SketchMotionApp {
                                                         egui::FontId::proportional(11.0),
                                                         cor,
                                                     );
+                                                    // Marca de seleção múltipla (Shift-clique): faixa laranja no topo.
+                                                    if is_active && self.frame_sel.contains(&fi) {
+                                                        let bar = egui::Rect::from_min_max(
+                                                            img_rect.left_top(),
+                                                            egui::pos2(
+                                                                img_rect.right(),
+                                                                img_rect.top() + 4.0,
+                                                            ),
+                                                        );
+                                                        painter.rect_filled(
+                                                            bar,
+                                                            0.0,
+                                                            egui::Color32::from_rgb(0xE0, 0xB0, 0x3A),
+                                                        );
+                                                    }
                                                     if resp.drag_started() {
                                                         drag_start = Some((ti, fi));
                                                     }
                                                     if resp.clicked() {
-                                                        goto = Some((ti, fi));
+                                                        let shift = ui.input(|i| i.modifiers.shift);
+                                                        // Modo seleção OU Shift: alterna a seleção.
+                                                        if is_active && (shift || self.frame_sel_mode)
+                                                        {
+                                                            if let Some(p) = self
+                                                                .frame_sel
+                                                                .iter()
+                                                                .position(|&x| x == fi)
+                                                            {
+                                                                self.frame_sel.remove(p);
+                                                            } else {
+                                                                self.frame_sel.push(fi);
+                                                            }
+                                                        } else {
+                                                            self.frame_sel.clear();
+                                                            goto = Some((ti, fi));
+                                                        }
                                                     }
                                                     ui.add_space(5.0);
                                                 }
@@ -4205,10 +4804,155 @@ impl SketchMotionApp {
                             ui.separator();
                         }
                     });
+
+                // ---- Trilha da CÂMERA (keyframes na timeline ativa) ----
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.strong("Câmera");
+                    let cur = self.document.current;
+                    let has = self.document.camera.keyframe_index(cur).is_some();
+                    if ui
+                        .button(if has {
+                            "◆ Remover keyframe"
+                        } else {
+                            "◇ Keyframe aqui"
+                        })
+                        .on_hover_text("Cria/remove keyframe da câmera no frame atual")
+                        .clicked()
+                    {
+                        cam_kf_toggle = Some(cur);
+                    }
+                    ui.separator();
+                    ui.label("Interp:");
+                    egui::ComboBox::from_id_salt("cam_interp_tl")
+                        .selected_text(self.cam_interp.label())
+                        .show_ui(ui, |ui| {
+                            for it in Interp::all() {
+                                ui.selectable_value(&mut self.cam_interp, it, it.label());
+                            }
+                        });
+                    ui.separator();
+                    if ui.button("Reset").on_hover_text("Câmera = canvas cheio").clicked() {
+                        cam_reset = true;
+                    }
+                    ui.separator();
+                    if ui
+                        .button("Controles…")
+                        .on_hover_text("Abrir a janela de controles da câmera")
+                        .clicked()
+                    {
+                        self.win_camera = true;
+                        self.tool = Tool::Camera;
+                    }
+                    ui.weak("(arraste um ◆ para mover de frame)");
+                });
+                ui.push_id("cam_track_strip", |ui| {
+                egui::ScrollArea::horizontal()
+                    .max_height(30.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let total = self.document.frames.len();
+                            let cur = self.document.current;
+                            let cell = 26.0_f32;
+                            let mut cells: Vec<egui::Rect> = Vec::with_capacity(total);
+                            for fi in 0..total {
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(cell, 22.0),
+                                    egui::Sense::click_and_drag(),
+                                );
+                                cells.push(rect);
+                                let has_kf = self.document.camera.keyframe_index(fi).is_some();
+                                let is_cur = fi == cur;
+                                let p = ui.painter_at(rect);
+                                p.rect_filled(
+                                    rect,
+                                    0.0,
+                                    if is_cur {
+                                        egui::Color32::from_rgb(0x22, 0x3A, 0x5A)
+                                    } else {
+                                        egui::Color32::from_gray(38)
+                                    },
+                                );
+                                p.rect_stroke(
+                                    rect,
+                                    0.0,
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                                );
+                                if has_kf {
+                                    let cc = rect.center();
+                                    let r = 5.0;
+                                    let pts = vec![
+                                        egui::pos2(cc.x, cc.y - r),
+                                        egui::pos2(cc.x + r, cc.y),
+                                        egui::pos2(cc.x, cc.y + r),
+                                        egui::pos2(cc.x - r, cc.y),
+                                    ];
+                                    p.add(egui::Shape::convex_polygon(
+                                        pts,
+                                        egui::Color32::from_rgb(0x2F, 0x84, 0xFE),
+                                        egui::Stroke::new(1.0, egui::Color32::WHITE),
+                                    ));
+                                }
+                                if resp.drag_started() && has_kf {
+                                    self.cam_kf_drag = Some(fi);
+                                }
+                                if resp.clicked() {
+                                    cam_goto = Some(fi);
+                                }
+                            }
+                            // Soltar um keyframe arrastado sobre outra célula = mover.
+                            if let Some(from) = self.cam_kf_drag {
+                                if ui.input(|i| i.pointer.any_released()) {
+                                    if let Some(px) =
+                                        ui.input(|i| i.pointer.interact_pos()).map(|p| p.x)
+                                    {
+                                        if let Some((to, _)) = cells
+                                            .iter()
+                                            .enumerate()
+                                            .min_by(|a, b| {
+                                                (a.1.center().x - px)
+                                                    .abs()
+                                                    .partial_cmp(&(b.1.center().x - px).abs())
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            })
+                                        {
+                                            cam_kf_move = Some((from, to));
+                                        }
+                                    }
+                                    self.cam_kf_drag = None;
+                                }
+                            }
+                        });
+                    });
+                });
                 ui.add_space(2.0);
             });
         if let Some(nh) = new_timeline_h {
             self.timeline_h = nh;
+        }
+        if let Some(fi) = cam_goto {
+            let at = self.document.active_track;
+            self.document.go_to_frame(fi);
+            let _ = at;
+            self.dirty = true;
+            self.playing = false;
+        }
+        if let Some(cur) = cam_kf_toggle {
+            if self.document.camera.keyframe_index(cur).is_some() {
+                self.document.camera.remove_keyframe(cur);
+            } else {
+                self.camera_keyframe_atual();
+            }
+            self.dirty = true;
+        }
+        if let Some((from, to)) = cam_kf_move {
+            self.document.camera.move_keyframe(from, to);
+            self.dirty = true;
+        }
+        if cam_reset {
+            let (w, h) = (self.document.width, self.document.height);
+            self.document.camera.reset(w, h);
+            self.dirty = true;
         }
 
         // ---- Aplicar ações ----
@@ -4304,29 +5048,54 @@ impl SketchMotionApp {
             }
         }
         if let Some(ti) = do_copy {
-            let f = if ti == self.document.active_track {
-                self.document.current_frame_clone()
-            } else if let Some(t) = self.document.tracks.get(ti) {
-                let c = t.current.min(t.frames.len().saturating_sub(1));
-                t.frames.get(c).cloned()
-                    .unwrap_or_else(|| self.document.current_frame_clone())
+            // Se há vários frames selecionados na faixa ativa, copia o conjunto
+            // (em ordem); senão, copia o frame atual/da faixa.
+            if ti == self.document.active_track && !self.frame_sel.is_empty() {
+                self.document.sync_to_frames();
+                let mut idxs = self.frame_sel.clone();
+                idxs.sort_unstable();
+                idxs.dedup();
+                let clip: Vec<Frame> = idxs
+                    .iter()
+                    .filter_map(|&i| self.document.frames.get(i).cloned())
+                    .collect();
+                let n = clip.len();
+                self.frames_clip = clip;
+                self.status = format!("{n} frames copiados — Colar insere na sequência");
             } else {
-                self.document.current_frame_clone()
-            };
-            self.frame_clip = Some(f);
-            self.status = "Frame copiado — use Colar na timeline desejada".into();
+                let f = if ti == self.document.active_track {
+                    self.document.current_frame_clone()
+                } else if let Some(t) = self.document.tracks.get(ti) {
+                    let c = t.current.min(t.frames.len().saturating_sub(1));
+                    t.frames
+                        .get(c)
+                        .cloned()
+                        .unwrap_or_else(|| self.document.current_frame_clone())
+                } else {
+                    self.document.current_frame_clone()
+                };
+                self.frames_clip = vec![f];
+                self.status = "Frame copiado — use Colar na timeline desejada".into();
+            }
         }
         if let Some(ti) = do_paste {
-            if let Some(f) = self.frame_clip.clone() {
+            if !self.frames_clip.is_empty() {
                 if ti != self.document.active_track {
                     self.document.go_to_track(ti);
                 }
-                self.document.paste_frame(f);
+                let n = self.frames_clip.len();
+                for f in self.frames_clip.clone() {
+                    self.document.paste_frame(f);
+                }
                 self.track_thumbs.clear();
                 self.onion_for = None;
                 self.dirty = true;
                 self.playing = false;
-                self.status = "Frame colado após o atual".into();
+                self.status = if n > 1 {
+                    format!("{n} frames colados em sequência")
+                } else {
+                    "Frame colado após o atual".into()
+                };
             }
         }
         // Arrasto de frames: registra início e aplica movimento ao soltar.
@@ -4445,6 +5214,8 @@ impl SketchMotionApp {
     fn barra_acoes(&mut self, ctx: &egui::Context) {
         let mut integrar_sel = false;
         let mut integrar_todas = false;
+        let mut do_group = false;
+        let mut do_ungroup = false;
         egui::TopBottomPanel::top("acoes")
             .exact_height(30.0)
             .show(ctx, |ui| {
@@ -4474,9 +5245,27 @@ impl SketchMotionApp {
                         }
                     });
                     ui.separator();
-                    ui.weak(
-                        "Imagens ficam como objetos móveis, são salvas no projeto e exportadas na resolução do trabalho.",
-                    );
+                    ui.strong("Vetores:");
+                    let n_sel = self.sel_set.len();
+                    ui.add_enabled_ui(n_sel >= 2, |ui| {
+                        if ui
+                            .button("Agrupar")
+                            .on_hover_text("Agrupa os objetos selecionados (movem juntos)")
+                            .clicked()
+                        {
+                            do_group = true;
+                        }
+                    });
+                    ui.add_enabled_ui(n_sel >= 1, |ui| {
+                        if ui
+                            .button("Desagrupar")
+                            .on_hover_text("Solta os objetos do grupo selecionado")
+                            .clicked()
+                        {
+                            do_ungroup = true;
+                        }
+                    });
+                    ui.label(format!("({n_sel} selec.)"));
                 });
             });
         if integrar_sel {
@@ -4486,6 +5275,12 @@ impl SketchMotionApp {
         }
         if integrar_todas {
             self.integrar_todas_imagens();
+        }
+        if do_group {
+            self.agrupar_selecao();
+        }
+        if do_ungroup {
+            self.desagrupar_selecao();
         }
     }
 
@@ -5101,7 +5896,7 @@ impl SketchMotionApp {
                     }
                     ui.add_space(6.0);
 
-                    let resp_cam = icon_button(ui, self.win_camera, icon::SELECTION)
+                    let resp_cam = icon_button(ui, self.win_camera, icon::VIDEO_CAMERA)
                         .on_hover_text("Câmera — enquadramento animado por keyframes");
                     if resp_cam.clicked() {
                         self.win_camera = !self.win_camera;
@@ -5109,6 +5904,13 @@ impl SketchMotionApp {
                             self.tool = Tool::Camera;
                             self.eyedropper = Eyedropper::Off;
                         }
+                    }
+                    ui.add_space(6.0);
+
+                    let resp_tr = icon_button(ui, self.win_trace, icon::VECTOR_TWO)
+                        .on_hover_text("Traçado de Imagem — vetorizar (raster → vetor)");
+                    if resp_tr.clicked() {
+                        self.win_trace = !self.win_trace;
                     }
                 });
             });
@@ -5474,6 +6276,18 @@ impl SketchMotionApp {
             painter.rect_filled(hr, 1.0, egui::Color32::WHITE);
             painter.rect_stroke(hr, 1.0, egui::Stroke::new(1.0_f32, blue));
         }
+        // Alças laterais (meios das bordas) — largura/altura independentes.
+        let edges = [
+            egui::pos2((c[0].x + c[1].x) * 0.5, (c[0].y + c[1].y) * 0.5),
+            egui::pos2((c[1].x + c[2].x) * 0.5, (c[1].y + c[2].y) * 0.5),
+            egui::pos2((c[2].x + c[3].x) * 0.5, (c[2].y + c[3].y) * 0.5),
+            egui::pos2((c[3].x + c[0].x) * 0.5, (c[3].y + c[0].y) * 0.5),
+        ];
+        for p in edges {
+            let hr = egui::Rect::from_center_size(p, egui::vec2(7.0, 7.0));
+            painter.rect_filled(hr, 1.0, egui::Color32::WHITE);
+            painter.rect_stroke(hr, 1.0, egui::Stroke::new(1.0_f32, blue));
+        }
         // Alça de rotação: acima do meio do topo.
         let topc = egui::pos2((c[0].x + c[1].x) * 0.5, (c[0].y + c[1].y) * 0.5);
         let mut dir = topc - egui::pos2((c[2].x + c[3].x) * 0.5, (c[2].y + c[3].y) * 0.5);
@@ -5525,6 +6339,13 @@ impl SketchMotionApp {
             cam_point(1.0, 1.0),
             cam_point(-1.0, 1.0),
         ];
+        // Alças laterais (meios das bordas): 0 topo, 1 direita, 2 base, 3 esquerda.
+        let edges = [
+            cam_point(0.0, -1.0),
+            cam_point(1.0, 0.0),
+            cam_point(0.0, 1.0),
+            cam_point(-1.0, 0.0),
+        ];
         // Alça de rotação (mesma geometria do desenho).
         let topc = egui::pos2(
             (corners[0].x + corners[1].x) * 0.5,
@@ -5572,6 +6393,9 @@ impl SketchMotionApp {
                 } else if let Some(hi) = corners.iter().position(|&h| near(p, h)) {
                     self.cam_act = 2;
                     self.cam_h = hi;
+                } else if let Some(ei) = edges.iter().position(|&h| near(p, h)) {
+                    self.cam_act = 2;
+                    self.cam_h = ei + 4;
                 } else if self.camera_ponto_dentro(&s, dp) {
                     self.cam_act = 1;
                     self.cam_grab = (dp.0 - s.x, dp.1 - s.y);
@@ -5596,11 +6420,46 @@ impl SketchMotionApp {
                         let (rx, ry) = (dp.0 - self.cam_orig.x, dp.1 - self.cam_orig.y);
                         let lx = rx * cos - ry * sin;
                         let ly = rx * sin + ry * cos;
-                        // Cantos preservam o centro: nova meia-dimensão = |local|.
-                        k.w = (lx.abs() * 2.0).max(4.0);
-                        k.h = (ly.abs() * 2.0).max(4.0);
-                        k.x = self.cam_orig.x;
-                        k.y = self.cam_orig.y;
+                        let hw0 = self.cam_orig.w * 0.5;
+                        let hh0 = self.cam_orig.h * 0.5;
+                        if self.cam_h < 4 {
+                            // Cantos: preservam o centro (nova meia-dim = |local|).
+                            k.w = (lx.abs() * 2.0).max(4.0);
+                            k.h = (ly.abs() * 2.0).max(4.0);
+                            k.x = self.cam_orig.x;
+                            k.y = self.cam_orig.y;
+                        } else {
+                            // Laterais: ancoram o lado OPOSTO (o centro desloca).
+                            // 4 topo, 5 direita, 6 base, 7 esquerda.
+                            let (mut cxl, mut cyl) = (0.0f32, 0.0f32);
+                            match self.cam_h {
+                                5 => {
+                                    let fixed = -hw0;
+                                    k.w = (lx - fixed).abs().max(4.0);
+                                    cxl = (lx + fixed) * 0.5;
+                                }
+                                7 => {
+                                    let fixed = hw0;
+                                    k.w = (lx - fixed).abs().max(4.0);
+                                    cxl = (lx + fixed) * 0.5;
+                                }
+                                4 => {
+                                    let fixed = hh0;
+                                    k.h = (ly - fixed).abs().max(4.0);
+                                    cyl = (ly + fixed) * 0.5;
+                                }
+                                6 => {
+                                    let fixed = -hh0;
+                                    k.h = (ly - fixed).abs().max(4.0);
+                                    cyl = (ly + fixed) * 0.5;
+                                }
+                                _ => {}
+                            }
+                            // Converte o novo centro local (cxl, cyl) para o documento.
+                            let (fs, fc) = self.cam_orig.rotation.to_radians().sin_cos();
+                            k.x = self.cam_orig.x + cxl * fc - cyl * fs;
+                            k.y = self.cam_orig.y + cxl * fs + cyl * fc;
+                        }
                     }
                     3 => {
                         let ang = (dp.1 - self.cam_orig.y).atan2(dp.0 - self.cam_orig.x);
@@ -5666,6 +6525,383 @@ impl SketchMotionApp {
             }
         }
         out
+    }
+
+    // ---------------- Traçado de Imagem (raster → vetor) ----------------
+
+    /// Reduz uma imagem RGBA para no máx. `max` px no maior lado (prévia ágil).
+    fn trace_reduzir(ow: u32, oh: u32, px: &[u8], max: u32) -> (u32, u32, Vec<u8>) {
+        if let Some(img) = image::RgbaImage::from_raw(ow, oh, px.to_vec()) {
+            let d = image::DynamicImage::ImageRgba8(img).thumbnail(max, max).to_rgba8();
+            let (w, h) = d.dimensions();
+            (w, h, d.into_raw())
+        } else {
+            (ow, oh, px.to_vec())
+        }
+    }
+
+    /// Mapeia (px, py) da imagem (dims sw×sh) para o canvas via a transformação
+    /// do objeto de imagem (posição/escala/rotação).
+    fn trace_map_dims(&self, px: f32, py: f32, sw: f32, sh: f32) -> (f32, f32) {
+        let (cx, cy, hw, hh, angle) = self.trace_tf;
+        let u = if sw > 0.0 { px / sw } else { 0.0 };
+        let v = if sh > 0.0 { py / sh } else { 0.0 };
+        let lx = (u - 0.5) * 2.0 * hw;
+        let ly = (v - 0.5) * 2.0 * hh;
+        let (s, c) = angle.sin_cos();
+        (cx + lx * c - ly * s, cy + lx * s + ly * c)
+    }
+
+    /// Mapeia usando as dimensões da imagem de PRÉVIA (trace_src).
+    fn trace_map(&self, px: f32, py: f32) -> (f32, f32) {
+        let (sw, sh) = match &self.trace_src {
+            Some((w, h, _)) => (*w as f32, *h as f32),
+            None => return (px, py),
+        };
+        self.trace_map_dims(px, py, sw, sh)
+    }
+
+    /// Define como origem do traçado a flutuante de imagem atual (se houver).
+    fn trace_usar_selecionada(&mut self) -> bool {
+        self.trace_confirm = None;
+        if let Some(fs) = &self.float_sel {
+            if fs.is_image {
+                let (w, h, rgba) = Self::trace_reduzir(fs.ow, fs.oh, &fs.pixels, 640);
+                self.trace_tf = (fs.cx, fs.cy, fs.hw, fs.hh, fs.angle);
+                self.trace_src = Some((w, h, rgba));
+                self.trace_from_float = true;
+                self.trace_img_idx = None;
+                self.trace_dirty = true;
+                self.status = "Traçando a imagem selecionada".into();
+                return true;
+            }
+        }
+        // Sem flutuante: tenta o último objeto de imagem solto no frame.
+        if !self.document.images.is_empty() {
+            let i = self.document.images.len() - 1;
+            let o = &self.document.images[i];
+            let (w, h, rgba) = Self::trace_reduzir(o.ow, o.oh, &o.pixels, 640);
+            self.trace_tf = (o.cx, o.cy, o.hw, o.hh, o.angle);
+            self.trace_src = Some((w, h, rgba));
+            self.trace_from_float = false;
+            self.trace_img_idx = Some(i);
+            self.trace_dirty = true;
+            self.status = "Traçando o objeto de imagem do frame".into();
+            return true;
+        }
+        self.status = "Selecione/importe uma imagem primeiro (Caminho B ou Carregar)".into();
+        false
+    }
+
+    /// Abre uma imagem (PNG/JPG/BMP), coloca no canvas como objeto móvel
+    /// (Caminho B) e a define como origem do traçado.
+    fn trace_carregar(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Imagem", &["png", "jpg", "jpeg", "bmp"])
+            .pick_file()
+        {
+            match image::open(&path) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    self.colocar_imagem(w, h, rgba.into_raw());
+                    self.trace_usar_selecionada();
+                    self.status = format!("Imagem carregada p/ traçar: {w}×{h}");
+                }
+                Err(e) => self.status = format!("Erro ao abrir imagem: {e}"),
+            }
+        }
+    }
+
+    /// Recalcula a PRÉVIA (na imagem reduzida — rápido) conforme o preset.
+    fn trace_recalcular(&mut self) {
+        let Some((w, h, rgba)) = self.trace_src.clone() else {
+            self.trace_regions.clear();
+            return;
+        };
+        let recipe = trace_recipe(self.trace_preset, self.trace_remove_bg, 1.0);
+        let prog = AtomicU32::new(0);
+        self.trace_regions = apply_recipe(&recipe, &rgba, w, h, &prog);
+    }
+
+    /// Se a origem é a flutuante, acompanha o transform atual dela (mover/escalar).
+    fn trace_sync_float(&mut self) {
+        if self.trace_from_float {
+            if let Some(fs) = &self.float_sel {
+                if fs.is_image {
+                    self.trace_tf = (fs.cx, fs.cy, fs.hw, fs.hh, fs.angle);
+                }
+            }
+        }
+    }
+
+    /// Cria os VectorObjects a partir das regiões traçadas (entra no Undo).
+    /// Vetoriza no preset dado: EXPAND (cria os vetores) + DESAGRUPA (cada região
+    /// vira um objeto solto) e SUBSTITUI a imagem de origem (some o raster).
+    /// Inicia a vetorização em RESOLUÇÃO CHEIA numa thread de fundo (com barra de
+    /// progresso). O resultado é aplicado quando a thread termina (trace_poll).
+    fn trace_vetorizar(&mut self, preset: usize) {
+        if self.trace_src.is_none() {
+            self.status = "Selecione/carregue uma imagem primeiro".into();
+            return;
+        }
+        if self.trace_job.is_some() {
+            return; // já vetorizando
+        }
+        self.trace_preset = preset;
+        self.trace_sync_float();
+        // Pixels em alta resolução do objeto de origem (limite 2000px por lado).
+        let cheio: Option<(u32, u32, Vec<u8>)> = if self.trace_from_float {
+            self.float_sel
+                .as_ref()
+                .filter(|f| f.is_image)
+                .map(|f| Self::trace_reduzir(f.ow, f.oh, &f.pixels, 2000))
+        } else if let Some(i) = self.trace_img_idx {
+            self.document
+                .images
+                .get(i)
+                .map(|o| Self::trace_reduzir(o.ow, o.oh, &o.pixels, 2000))
+        } else {
+            self.trace_src.clone()
+        };
+        let (sw, sh, rgba) = match cheio {
+            Some(v) => v,
+            None => {
+                self.status = "Não encontrei a imagem de origem".into();
+                return;
+            }
+        };
+        let escala = (sw.max(sh) as f32 / 640.0).max(1.0);
+        let recipe = trace_recipe(preset, self.trace_remove_bg, escala);
+        let progress = Arc::new(AtomicU32::new(0));
+        let prog2 = progress.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let regs = apply_recipe(&recipe, &rgba, sw, sh, &prog2);
+            let _ = tx.send(regs);
+        });
+        self.trace_job = Some(TraceJob {
+            rx,
+            progress,
+            sw: sw as f32,
+            sh: sh as f32,
+            from_float: self.trace_from_float,
+            img_idx: self.trace_img_idx,
+            preset,
+        });
+        self.trace_confirm = None;
+        self.status = "Vetorizando… (pode levar alguns segundos)".into();
+    }
+
+    /// Verifica o andamento da vetorização; mostra a barra e finaliza quando pronto.
+    fn trace_poll(&mut self, ctx: &egui::Context) {
+        let done: Option<Result<Vec<TracedRegion>, ()>> = if let Some(job) = &self.trace_job {
+            ctx.request_repaint();
+            let frac = job.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+            egui::Window::new("Vetorizando…")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("Convertendo a imagem em vetores.");
+                    ui.label("Em imagens grandes isso pode demorar um pouco.");
+                    ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).show_percentage());
+                });
+            match job.rx.try_recv() {
+                Ok(regs) => Some(Ok(regs)),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+            }
+        } else {
+            None
+        };
+        match done {
+            Some(Ok(regs)) => {
+                if let Some(job) = self.trace_job.take() {
+                    self.trace_finalizar(job, regs);
+                }
+            }
+            Some(Err(())) => {
+                self.trace_job = None;
+                self.status = "Falha na vetorização".into();
+            }
+            None => {}
+        }
+    }
+
+    /// Cria os vetores do resultado, substitui a imagem e limpa o estado.
+    fn trace_finalizar(&mut self, job: TraceJob, regioes: Vec<TracedRegion>) {
+        if regioes.is_empty() {
+            self.status = "Nada para vetorizar (tente outro tipo)".into();
+            return;
+        }
+        self.trace_sync_float();
+        self.push_undo();
+        let (swf, shf) = (job.sw, job.sh);
+        let mut criados = 0usize;
+        for reg in &regioes {
+            if reg.points.len() < 3 {
+                continue;
+            }
+            let fill = Color::rgba(reg.color[0], reg.color[1], reg.color[2], reg.color[3]);
+            let mut obj = VectorObject::new(Color::TRANSPARENT, 1.0);
+            obj.points = reg
+                .points
+                .iter()
+                .map(|&(x, y)| {
+                    let (cx, cy) = self.trace_map_dims(x, y, swf, shf);
+                    Anchor::new(cx, cy)
+                })
+                .collect();
+            obj.closed = true;
+            obj.fill = Some(fill);
+            self.document.vectors.push(obj);
+            criados += 1;
+        }
+        // Substitui a imagem de origem: some o raster (fica só o vetor).
+        if job.from_float {
+            self.float_sel = None;
+            self.float_tex = None;
+        } else if let Some(i) = job.img_idx {
+            if i < self.document.images.len() {
+                self.document.images.remove(i);
+            }
+        }
+        self.document.sync_to_frames();
+        self.trace_src = None;
+        self.trace_regions.clear();
+        self.trace_from_float = false;
+        self.trace_img_idx = None;
+        self.trace_confirm = None;
+        self.tool = Tool::Select;
+        self.dirty = true;
+        self.status = format!(
+            "Vetorizado ({}): {criados} componentes soltos",
+            TRACE_PRESETS[job.preset]
+        );
+    }
+
+    /// Janela da ferramenta Traçado de Imagem.
+    fn janela_trace(&mut self, ctx: &egui::Context) {
+        let mut open = self.win_trace;
+        let mut do_load = false;
+        let mut do_sel = false;
+        let mut do_close = false;
+        let mut do_vec: Option<usize> = None;
+        let amarelo = egui::Color32::from_rgb(0xE0, 0xB0, 0x3A);
+        egui::Window::new("Traçado de Imagem")
+            .open(&mut open)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Usar imagem selecionada")
+                        .on_hover_text("Usa a imagem-objeto selecionada no canvas (Caminho B)")
+                        .clicked()
+                    {
+                        do_sel = true;
+                    }
+                    if ui
+                        .button("Carregar imagem…")
+                        .on_hover_text("Abre um PNG/JPG/BMP e coloca no canvas")
+                        .clicked()
+                    {
+                        do_load = true;
+                    }
+                });
+                let tem_img = self.trace_src.is_some();
+                if let Some((w, h, _)) = &self.trace_src {
+                    ui.label(format!("Imagem pronta: {w}×{h}"));
+                } else {
+                    ui.weak("Selecione ou carregue uma imagem para vetorizar.");
+                }
+                ui.separator();
+
+                // Confirmação "deseja vetorizar?" após clicar num tipo.
+                if let Some(pi) = self.trace_confirm {
+                    ui.colored_label(amarelo, format!("Vetorizar em \"{}\"?", TRACE_PRESETS[pi]));
+                    ui.horizontal(|ui| {
+                        if ui.button("Sim, vetorizar").clicked() {
+                            do_vec = Some(pi);
+                        }
+                        if ui.button("Não").clicked() {
+                            self.trace_confirm = None;
+                        }
+                    });
+                    ui.separator();
+                }
+
+                ui.strong("Tipo de traçado:");
+                let livre = tem_img && self.trace_job.is_none();
+                ui.add_enabled_ui(livre, |ui| {
+                    for (i, nome) in TRACE_PRESETS.iter().enumerate() {
+                        if ui.selectable_label(self.trace_preset == i, *nome).clicked() {
+                            // Mostra a prévia deste tipo e pede confirmação.
+                            self.trace_preset = i;
+                            self.trace_dirty = true;
+                            self.trace_confirm = Some(i);
+                        }
+                    }
+                });
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.trace_remove_bg, "Remover fundo")
+                    .on_hover_text("A cor do fundo (borda) vira transparência (modos coloridos)")
+                    .changed()
+                {
+                    self.trace_dirty = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Fechar").clicked() {
+                        do_close = true;
+                    }
+                });
+                ui.weak(
+                    "Clique num tipo, confirme, e a imagem vira vetores: cada componente fica \
+                     SOLTO (mover/editar/cor/Undo). A imagem original é substituída pelos vetores.",
+                );
+            });
+        self.win_trace = open && !do_close;
+        if do_sel {
+            self.trace_usar_selecionada();
+        }
+        if do_load {
+            self.trace_carregar();
+        }
+        self.trace_sync_float();
+        if self.trace_dirty {
+            self.trace_recalcular();
+            self.trace_dirty = false;
+        }
+        if let Some(pi) = do_vec {
+            self.trace_vetorizar(pi);
+        }
+    }
+
+    /// Desenha a prévia do traçado (contornos azuis) sobre o canvas.
+    fn desenhar_trace_preview(&self, ui: &mut egui::Ui, rect: egui::Rect, zoom: f32) {
+        if self.trace_src.is_none() {
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        let blue = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+        for reg in &self.trace_regions {
+            if reg.points.len() < 2 {
+                continue;
+            }
+            let pts: Vec<egui::Pos2> = reg
+                .points
+                .iter()
+                .map(|&(x, y)| {
+                    let (cx, cy) = self.trace_map(x, y);
+                    egui::pos2(rect.min.x + cx * zoom, rect.min.y + cy * zoom)
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(
+                pts,
+                egui::Stroke::new(1.2_f32, blue),
+            ));
+        }
     }
 
     /// Desenha as alças de redimensionamento ao redor do canvas e trata o
@@ -7177,72 +8413,342 @@ impl SketchMotionApp {
         self.win_rig = open;
     }
 
+    /// Decodifica o GIF de splash em texturas (uma vez), guardando cada frame
+    /// com sua duração em segundos.
+    fn carregar_splash(&mut self, ctx: &egui::Context) {
+        const GIF: &[u8] = include_bytes!("../../../assets/animação_splash_intro1.gif");
+        use image::AnimationDecoder;
+        let dec = match image::codecs::gif::GifDecoder::new(std::io::Cursor::new(GIF)) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let frames = match dec.into_frames().collect_frames() {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        for (i, fr) in frames.iter().enumerate() {
+            let (num, den) = fr.delay().numer_denom_ms();
+            let mut secs = if den == 0 { 0.1 } else { (num as f32 / den as f32) / 1000.0 };
+            if secs <= 0.0 {
+                secs = 0.05;
+            }
+            let buf = fr.buffer();
+            let (w, h) = (buf.width() as usize, buf.height() as usize);
+            let img = egui::ColorImage::from_rgba_unmultiplied([w, h], buf.as_raw());
+            let tex = ctx.load_texture(format!("splash_{i}"), img, egui::TextureOptions::LINEAR);
+            self.splash_frames.push((tex, secs));
+        }
+    }
+
+    /// Splash de inicialização: exibe o GIF uma única vez, congela no último
+    /// frame por um instante e então abre a tela inicial.
+    fn tela_splash(&mut self, ctx: &egui::Context) {
+        if !self.splash_loaded {
+            self.splash_loaded = true;
+            self.carregar_splash(ctx);
+            self.splash_frame_started = Some(std::time::Instant::now());
+        }
+        // Falha ao decodificar → não trava a inicialização.
+        if self.splash_frames.is_empty() {
+            self.screen = Screen::Home;
+            ctx.request_repaint();
+            return;
+        }
+        // Ajusta a janela ao tamanho exato do GIF, sem bordas.
+        let sz = self.splash_frames[0].0.size_vec2();
+        if !self.splash_win_set {
+            self.splash_win_set = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(sz));
+        }
+        // Centraliza na tela (tenta a cada frame até conhecer o tamanho do monitor).
+        if !self.splash_centered {
+            if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
+                let pos = ((mon - sz) * 0.5).to_pos2();
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.splash_centered = true;
+            }
+        }
+        if !self.splash_done {
+            let start = self
+                .splash_frame_started
+                .get_or_insert_with(std::time::Instant::now);
+            let delay = self.splash_frames[self.splash_idx].1;
+            if start.elapsed().as_secs_f32() >= delay {
+                if self.splash_idx + 1 < self.splash_frames.len() {
+                    self.splash_idx += 1;
+                    self.splash_frame_started = Some(std::time::Instant::now());
+                } else {
+                    // Último frame: congela.
+                    self.splash_done = true;
+                    self.splash_done_at = Some(std::time::Instant::now());
+                }
+            }
+        } else {
+            // Congelado no último frame: segura ~0,6 s e vai para a tela inicial.
+            let held = self
+                .splash_done_at
+                .map(|t| t.elapsed().as_secs_f32())
+                .unwrap_or(1.0);
+            if held >= 0.6 {
+                self.restaurar_janela(ctx);
+                self.screen = Screen::Home;
+            }
+        }
+        ctx.request_repaint();
+
+        let tex_id = self.splash_frames[self.splash_idx].0.id();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(15, 15, 18)))
+            .show(ctx, |ui| {
+                // Janela == tamanho do GIF: preenche todo o painel.
+                let rect = ui.max_rect();
+                ui.painter().image(
+                    tex_id,
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            });
+    }
+
+    /// Restaura a janela ao tamanho/estado normal (com bordas), centralizada,
+    /// ao sair do splash e entrar na tela inicial.
+    fn restaurar_janela(&mut self, ctx: &egui::Context) {
+        let sz = egui::vec2(1120.0, 760.0);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(sz));
+        if let Some(mon) = ctx.input(|i| i.viewport().monitor_size) {
+            let pos = ((mon - sz) * 0.5).to_pos2();
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        }
+    }
+
     /// Tela inicial: escolher o tamanho do documento (presets ou personalizado),
     /// marcar se é pixel art, e então entrar no editor.
     fn tela_inicial(&mut self, ctx: &egui::Context) {
         let mut criar: Option<(u32, u32, bool)> = None;
         let mut abrir = false;
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                ui.heading("SketchMotion");
-                ui.label("Crie um novo documento ou abra um existente.");
-            });
-            ui.add_space(20.0);
+        // Carrega logo e ícone de página uma única vez (embutidos no binário).
+        if self.logo_tex.is_none() {
+            const LOGO: &[u8] = include_bytes!("../../../assets/logo_horizontal.png");
+            if let Ok(img) = image::load_from_memory(LOGO) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+                self.logo_tex = Some(ctx.load_texture("logo", ci, egui::TextureOptions::LINEAR));
+            }
+        }
+        if self.page_tex.is_none() {
+            const PAGE: &[u8] = include_bytes!("../../../assets/pagina_icone.png");
+            if let Ok(img) = image::load_from_memory(PAGE) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+                self.page_tex = Some(ctx.load_texture("page", ci, egui::TextureOptions::LINEAR));
+            }
+        }
+        if self.page_normal_tex.is_none() {
+            const PAGEN: &[u8] = include_bytes!("../../../assets/pagina_icone_normal.png");
+            if let Ok(img) = image::load_from_memory(PAGEN) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+                self.page_normal_tex =
+                    Some(ctx.load_texture("page_normal", ci, egui::TextureOptions::LINEAR));
+            }
+        }
+        let page_px = self.page_tex.as_ref().map(|t| (t.id(), t.size_vec2()));
+        let page_nm = self.page_normal_tex.as_ref().map(|t| (t.id(), t.size_vec2()));
 
-            ui.label("Criar um novo arquivo:");
-            ui.add_space(6.0);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(28.0);
+            ui.vertical_centered(|ui| {
+                if let Some(tex) = &self.logo_tex {
+                    let size = tex.size_vec2();
+                    let escala = (300.0_f32 / size.x).min(1.0);
+                    ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+                        tex.id(),
+                        size * escala,
+                    )));
+                }
+                ui.add_space(6.0);
+                ui.heading("Vamos começar algo novo.");
+                ui.add_space(2.0);
+                ui.colored_label(
+                    egui::Color32::from_gray(160),
+                    "Escolha uma predefinição ou defina o tamanho do seu documento.",
+                );
+            });
+            ui.add_space(22.0);
+
             let presets = [
                 ("Ilustração", 800u32, 520u32, false),
                 ("Quadrado", 1024, 1024, false),
-                ("HD 1920x1080", 1920, 1080, false),
+                ("HD 1920×1080", 1920, 1080, false),
                 ("Pixel art 32", 32, 32, true),
                 ("Pixel art 64", 64, 64, true),
                 ("Pixel art 128", 128, 128, true),
             ];
+            // Centraliza a grade de cartões.
+            let card = egui::vec2(150.0, 150.0);
+            let gap = 14.0;
+            let cols = ((ui.available_width() / (card.x + gap)).floor() as usize).clamp(1, 6);
+            let grid_w = cols as f32 * card.x + (cols as f32 - 1.0) * gap;
+            let indent = ((ui.available_width() - grid_w) * 0.5).max(0.0);
             ui.horizontal_wrapped(|ui| {
+                ui.add_space(indent);
+                ui.spacing_mut().item_spacing = egui::vec2(gap, gap);
                 for (nome, w, h, px) in presets {
-                    let texto = format!("{nome}\n{w} x {h} px");
-                    if ui.add_sized([150.0, 84.0], egui::Button::new(texto)).clicked() {
+                    let (rect, resp) = ui.allocate_exact_size(card, egui::Sense::click());
+                    let p = ui.painter_at(rect);
+                    let hov = resp.hovered();
+                    let bg = if hov {
+                        egui::Color32::from_gray(58)
+                    } else {
+                        egui::Color32::from_gray(40)
+                    };
+                    let borda = if hov {
+                        egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                    } else {
+                        egui::Color32::from_gray(72)
+                    };
+                    p.rect_filled(rect, 8.0, bg);
+                    p.rect_stroke(rect, 8.0, egui::Stroke::new(1.0, borda));
+                    let icone = if px { page_px } else { page_nm };
+                    if let Some((tid, tsz)) = icone {
+                        let alvo = 84.0_f32;
+                        let esc = (alvo / tsz.x.max(tsz.y)).min(1.0);
+                        let isz = tsz * esc;
+                        let center = egui::pos2(rect.center().x, rect.top() + 58.0);
+                        let ir = egui::Rect::from_center_size(center, isz);
+                        p.image(
+                            tid,
+                            ir,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    p.text(
+                        egui::pos2(rect.center().x, rect.bottom() - 34.0),
+                        egui::Align2::CENTER_CENTER,
+                        nome,
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::from_gray(235),
+                    );
+                    p.text(
+                        egui::pos2(rect.center().x, rect.bottom() - 16.0),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{w} × {h} px"),
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::from_gray(160),
+                    );
+                    if resp.clicked() {
                         criar = Some((w, h, px));
                     }
                 }
             });
 
-            ui.add_space(14.0);
+            ui.add_space(20.0);
             ui.separator();
-            ui.add_space(6.0);
-            ui.label("Tamanho personalizado:");
-            ui.horizontal(|ui| {
-                ui.label("Largura");
-                ui.add(egui::DragValue::new(&mut self.home_w).range(1..=8192));
-                ui.label("Altura");
-                ui.add(egui::DragValue::new(&mut self.home_h).range(1..=8192));
-                ui.checkbox(&mut self.home_pixel, "Pixel art");
-                if ui.button("Criar").clicked() {
-                    criar = Some((self.home_w, self.home_h, self.home_pixel));
-                }
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Tamanho personalizado:");
+                    ui.label("Largura");
+                    ui.add(egui::DragValue::new(&mut self.home_w).range(1..=8192).suffix(" px"));
+                    ui.label("Altura");
+                    ui.add(egui::DragValue::new(&mut self.home_h).range(1..=8192).suffix(" px"));
+                    ui.checkbox(&mut self.home_pixel, "Pixel art");
+                    if ui
+                        .add(egui::Button::new("Criar").min_size(egui::vec2(90.0, 0.0)))
+                        .clicked()
+                    {
+                        criar = Some((self.home_w, self.home_h, self.home_pixel));
+                    }
+                    ui.separator();
+                    if ui.button("Abrir arquivo existente…").clicked() {
+                        abrir = true;
+                    }
+                });
             });
-
-            ui.add_space(16.0);
-            if ui.button("Abrir arquivo existente...").clicked() {
-                abrir = true;
-            }
         });
 
         if let Some((w, h, px)) = criar {
             self.novo_documento(w, h, px);
+            self.modificado = false;
             self.screen = Screen::Editor;
         }
-        if abrir && self.abrir() {
-            self.screen = Screen::Editor;
+        if abrir {
+            // Inicia a abertura; a tela de carregamento cuida do resto e troca
+            // para o editor quando terminar (aplicar_documento_aberto).
+            self.abrir();
         }
     }
 }
 
 impl eframe::App for SketchMotionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Abrir/Exportar/Salvar em andamento: tela de progresso, bloqueia o resto
+        // (inclusive a tela inicial — a abertura pode começar a partir dela).
+        if self.open_job.is_some() || self.busy_job.is_some() {
+            self.busy_poll(ctx);
+            return;
+        }
+        // Splash de inicialização: roda antes de tudo, uma única vez.
+        if self.screen == Screen::Splash {
+            self.tela_splash(ctx);
+            return;
+        }
+        // Fechar com trabalho não salvo → pergunta antes de sair.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.modificado && !self.confirmado_fechar && self.screen == Screen::Editor {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.win_fechar = true;
+            }
+        }
+        if self.win_fechar {
+            let mut do_salvar = false;
+            let mut do_descartar = false;
+            let mut do_cancelar = false;
+            egui::Window::new("Salvar alterações?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label("O trabalho foi modificado. Deseja salvar antes de sair?");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Salvar e sair").clicked() {
+                            do_salvar = true;
+                        }
+                        if ui.button("Sair sem salvar").clicked() {
+                            do_descartar = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            do_cancelar = true;
+                        }
+                    });
+                });
+            if do_salvar {
+                if self.salvar_sync() {
+                    self.win_fechar = false;
+                    self.confirmado_fechar = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    self.win_fechar = false; // cancelou o salvar: permanece aberto
+                }
+            }
+            if do_descartar {
+                self.win_fechar = false;
+                self.confirmado_fechar = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if do_cancelar {
+                self.win_fechar = false;
+            }
+        }
         if self.screen == Screen::Home {
             self.tela_inicial(ctx);
             return;
@@ -7454,6 +8960,7 @@ impl eframe::App for SketchMotionApp {
         let mut a_exportar = false;
         let mut a_importar = false;
         let mut a_export_gif = false;
+        let mut a_export_mp4 = false;
         let mut a_export_seq = false;
         let mut a_export_sheet = false;
         let mut img_rccw = false;
@@ -7492,6 +8999,10 @@ impl eframe::App for SketchMotionApp {
                     }
                     if ui.button("Exportar animação (GIF)...").clicked() {
                         a_export_gif = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Exportar vídeo (MP4)...").clicked() {
+                        a_export_mp4 = true;
                         ui.close_menu();
                     }
                     if ui.button("Exportar sequência PNG...").clicked() {
@@ -7539,6 +9050,12 @@ impl eframe::App for SketchMotionApp {
                     .on_hover_text("Colunas do sprite sheet (0 = tudo numa linha)");
                 ui.add(egui::DragValue::new(&mut self.export_cols).range(0..=64));
                 nudge_u32(ui, &mut self.export_cols, 0, 64);
+                ui.separator();
+                ui.checkbox(&mut self.export_camera, "Exportar pela câmera")
+                    .on_hover_text(
+                        "Aplica o enquadramento da câmera (keyframes) no GIF/MP4/PNG. \
+                         Desligado exporta a composição inteira.",
+                    );
                 ui.separator();
                 if ui
                     .checkbox(&mut self.bg_white, "Fundo branco")
@@ -7591,13 +9108,16 @@ impl eframe::App for SketchMotionApp {
             self.importar();
         }
         if a_export_gif {
-            self.exportar_gif();
+            self.iniciar_export(ExportKind::Gif);
+        }
+        if a_export_mp4 {
+            self.iniciar_export(ExportKind::Mp4);
         }
         if a_export_seq {
-            self.exportar_sequencia();
+            self.iniciar_export(ExportKind::Seq);
         }
         if a_export_sheet {
-            self.exportar_spritesheet();
+            self.iniciar_export(ExportKind::Sheet);
         }
         if img_rccw || img_rcw || img_r180 || img_fh || img_fv {
             self.push_undo();
@@ -7627,6 +9147,20 @@ impl eframe::App for SketchMotionApp {
                     self.float_sel = None;
                     self.float_tex = None;
                     self.dirty = true;
+                } else if !self.sel_set.is_empty() {
+                    // Apaga TODOS os objetos selecionados (conjunto/grupo).
+                    self.push_undo();
+                    let mut idxs = self.sel_set.clone();
+                    idxs.sort_unstable();
+                    idxs.dedup();
+                    for &i in idxs.iter().rev() {
+                        if i < self.document.vectors.len() {
+                            self.document.vectors.remove(i);
+                        }
+                    }
+                    self.sel_set.clear();
+                    self.selected_obj = None;
+                    self.dirty = true;
                 } else if let Some(i) = self.selected_obj {
                     if i < self.document.vectors.len() {
                         self.push_undo();
@@ -7655,6 +9189,8 @@ impl eframe::App for SketchMotionApp {
         self.janela_editar_peca(ctx);
         self.janela_prancheta(ctx);
         self.janela_camera(ctx);
+        self.janela_trace(ctx);
+        self.trace_poll(ctx);
         self.ensure_piece_textures(ctx);
         self.ensure_part_textures(ctx);
         // Rodapé (fica no fundo, criado antes da timeline).
@@ -7874,6 +9410,14 @@ impl eframe::App for SketchMotionApp {
                     if self.win_camera || self.tool == Tool::Camera {
                         self.desenhar_camera(ui, rect, zoom);
                     }
+                    // Traçado de Imagem: prévia dos contornos vetorizados.
+                    if self.win_trace && self.trace_src.is_some() {
+                        self.desenhar_trace_preview(ui, rect, zoom);
+                    }
+                    // Seleção múltipla de vetores: contorno em cada objeto.
+                    if self.tool == Tool::Select {
+                        self.desenhar_sel_set(ui, rect, zoom);
+                    }
                     let pressed = pressed && !self.win_prancheta;
                     let down = down && !self.win_prancheta;
 
@@ -8031,13 +9575,45 @@ impl eframe::App for SketchMotionApp {
                                             }
                                         }
                                         if !did_rot {
+                                            let shift = ui.input(|i| i.modifiers.shift);
                                             match self.hit_test(dp, thr) {
                                                 Some(i) => {
-                                                    self.selected_obj = Some(i);
                                                     self.push_undo();
+                                                    if shift {
+                                                        // Shift-clique: alterna no conjunto.
+                                                        if let Some(p) =
+                                                            self.sel_set.iter().position(|&x| x == i)
+                                                        {
+                                                            self.sel_set.remove(p);
+                                                        } else {
+                                                            self.sel_set.push(i);
+                                                        }
+                                                    } else {
+                                                        // Clique: se o objeto tem grupo, seleciona o
+                                                        // grupo todo; senão, ele sozinho (a não ser
+                                                        // que já esteja no conjunto atual, p/ mover junto).
+                                                        let g = self.document.vectors[i].group;
+                                                        if let Some(g) = g {
+                                                            self.sel_set = (0..self
+                                                                .document
+                                                                .vectors
+                                                                .len())
+                                                                .filter(|&k| {
+                                                                    self.document.vectors[k].group
+                                                                        == Some(g)
+                                                                })
+                                                                .collect();
+                                                        } else if !self.sel_set.contains(&i) {
+                                                            self.sel_set = vec![i];
+                                                        }
+                                                    }
+                                                    self.selected_obj = Some(i);
                                                     self.dragging_obj = true;
                                                 }
                                                 None => {
+                                                    if !shift {
+                                                        self.sel_set.clear();
+                                                    }
                                                     self.selected_obj = None;
                                                     self.dragging_obj = false;
                                                     self.marquee_start = Some((
@@ -8118,12 +9694,14 @@ impl eframe::App for SketchMotionApp {
                                 }
                             }
                         } else if down && self.dragging_obj {
-                            if let Some(i) = self.selected_obj {
-                                if i < self.document.vectors.len()
-                                    && (pdelta.x != 0.0 || pdelta.y != 0.0)
-                                {
-                                    self.document.vectors[i]
-                                        .translate(pdelta.x / zoom, pdelta.y / zoom);
+                            if pdelta.x != 0.0 || pdelta.y != 0.0 {
+                                let (dx, dy) = (pdelta.x / zoom, pdelta.y / zoom);
+                                // Move TODOS os objetos do conjunto (grupo/seleção).
+                                for idx in 0..self.sel_set.len() {
+                                    let i = self.sel_set[idx];
+                                    if i < self.document.vectors.len() {
+                                        self.document.vectors[i].translate(dx, dy);
+                                    }
                                 }
                             }
                         }
@@ -8142,7 +9720,14 @@ impl eframe::App for SketchMotionApp {
                             self.rotating = false;
                             self.float_release();
                             if let Some(start) = self.marquee_start.take() {
-                                self.lift_selection(start, self.marquee_cur);
+                                // Marca sobre vetores = seleção múltipla; senão, lift raster.
+                                let picked = self.vetores_na_marca(start, self.marquee_cur);
+                                if !picked.is_empty() {
+                                    self.selected_obj = picked.first().copied();
+                                    self.sel_set = picked;
+                                } else {
+                                    self.lift_selection(start, self.marquee_cur);
+                                }
                             }
                         }
                         self.last_pos = None;

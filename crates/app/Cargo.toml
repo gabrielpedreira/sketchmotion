@@ -11,9 +11,10 @@ sketchmotion-render = { path = "../render" }
 sketchmotion-tools = { path = "../tools" }
 sketchmotion-color = { path = "../color" }
 sketchmotion-io = { path = "../io" }
+sketchmotion-trace = { path = "../trace" }
 eframe = "0.29"
 # Ícones prontos (estilo Lucide) como fonte para o egui.
 egui-phosphor = "0.7"
 rfd = "0.14"
-# Leitura do ícone .ico da janela.
-image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+# Leitura do ícone .ico da janela e imagens para traçar/importar.
+image = { version = "0.25", default-features = false, features = ["ico", "png", "jpeg", "bmp", "gif"] }
