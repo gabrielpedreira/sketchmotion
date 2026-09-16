@@ -35,6 +35,8 @@ pub enum Tool {
     Grupo,
     /// Câmera — enquadramento animado por keyframes (retângulo azul).
     Camera,
+    /// Pivô — eixo de transformação personalizado (ponto azul/laranja).
+    Pivot,
 }
 
 impl Tool {
@@ -66,6 +68,7 @@ impl Tool {
             Tool::Rig => "Rig",
             Tool::Grupo => "Objetos",
             Tool::Camera => "Câmera",
+            Tool::Pivot => "Pivô",
         }
     }
 }

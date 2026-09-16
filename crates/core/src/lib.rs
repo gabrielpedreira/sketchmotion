@@ -11,6 +11,7 @@ mod frame;
 mod image_object;
 mod layer;
 mod piece;
+mod pivot;
 mod skeleton;
 mod vector;
 
@@ -21,6 +22,7 @@ pub use frame::Frame;
 pub use image_object::ImageObject;
 pub use layer::Layer;
 pub use piece::{ObjectPiece, PieceLibrary};
+pub use pivot::{Pivot, PivotTarget};
 pub use skeleton::{Bone, BonePose, BoneShape, Skeleton, World};
 pub use vector::{Anchor, VectorObject};
 

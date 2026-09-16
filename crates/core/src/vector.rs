@@ -194,6 +194,16 @@ impl VectorObject {
         }
     }
 
+    /// Rotaciona o objeto em `ang` radianos ao redor de um pivô arbitrário
+    /// (cx, cy) — base da ferramenta Pivô. O pivô permanece fixo.
+    pub fn rotate_around(&mut self, cx: f32, cy: f32, ang: f32) {
+        let (sn, cs) = ang.sin_cos();
+        self.map_points(|x, y| {
+            let (dx, dy) = (x - cx, y - cy);
+            (cx + dx * cs - dy * sn, cy + dx * sn + dy * cs)
+        });
+    }
+
     /// Escala o objeto em torno do próprio centro por um fator.
     pub fn scale_self(&mut self, f: f32) {
         if let Some((cx, cy)) = self.center() {

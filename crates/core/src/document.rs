@@ -8,6 +8,7 @@ use crate::color::Color;
 use crate::frame::Frame;
 use crate::image_object::ImageObject;
 use crate::layer::Layer;
+use crate::pivot::Pivot;
 use crate::skeleton::Skeleton;
 use crate::vector::VectorObject;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,10 @@ pub struct Document {
     /// desenho). Enquadra a composição final; não transforma os objetos.
     #[serde(default)]
     pub camera: Camera,
+    /// Pivôs (eixos de transformação personalizados) associados a objetos/grupos.
+    /// Propriedade estrutural do documento; persiste entre frames.
+    #[serde(default)]
+    pub pivots: Vec<Pivot>,
 }
 
 /// Uma timeline (faixa) de animação: lista própria de frames, FPS e
@@ -98,6 +103,7 @@ impl Document {
             active_track: 0,
             onion_between: false,
             camera: Camera::new(width, height),
+            pivots: Vec::new(),
         };
         doc.add_layer("Camada 1");
         doc.frames = vec![Frame {

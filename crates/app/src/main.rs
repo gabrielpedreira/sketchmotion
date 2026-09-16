@@ -1216,6 +1216,15 @@ struct FloatSel {
     is_image: bool,
 }
 
+/// Área de transferência de OBJETOS (vetores e/ou imagens) para
+/// recortar/copiar/colar mantendo posição e tamanho, inclusive entre frames,
+/// camadas ou arquivos.
+#[derive(Clone, Default)]
+struct ObjClip {
+    vectors: Vec<VectorObject>,
+    images: Vec<ImageObject>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Screen {
     /// Splash de inicialização (GIF que roda uma vez e congela no último frame).
@@ -1403,6 +1412,10 @@ struct SketchMotionApp {
     // timelines (faixas)
     view_both: bool,
     play_both: bool,
+    /// Objetos recortados/copiados (vetores e imagens) — colar mantém posição.
+    obj_clip: ObjClip,
+    /// A última cópia foi de OBJETOS (true) ou de pixels/seleção raster (false)?
+    clip_objetos: bool,
     /// Frame copiado (Copiar/Colar frames, inclusive entre timelines/arquivos).
     /// Seleção de vários frames (na faixa ativa) para copiar em conjunto.
     frame_sel: Vec<usize>,
@@ -1443,6 +1456,24 @@ struct SketchMotionApp {
     page_tex: Option<egui::TextureHandle>,
     /// Ícone de página normal (tela inicial), carregado uma vez.
     page_normal_tex: Option<egui::TextureHandle>,
+    /// Ícone PNG da ferramenta Pivô (assets/pivo.png), carregado uma vez.
+    tex_pivo: Option<egui::TextureHandle>,
+    /// Ícone PNG do Traçado de Imagem (assets/vetor_trace.png), carregado uma vez.
+    tex_vetor_trace: Option<egui::TextureHandle>,
+    // Ferramenta Pivô (eixo de transformação personalizado).
+    win_pivot: bool,
+    /// Pivô atualmente selecionado na lista/edição.
+    pivot_sel: Option<usize>,
+    /// Fluxo de criação: 0 = ocioso, 1 = aguardando clique do EIXO (associa o
+    /// objeto), 2 = aguardando clique do ponto de MOVIMENTAÇÃO.
+    pivot_stage: u8,
+    /// Arraste em andamento: 0 = nenhum, 1 = eixo (azul), 2 = movimentação
+    /// (laranja), 3 = objeto.
+    pivot_drag: u8,
+    /// Janelinha de nome ao criar um pivô novo.
+    pivot_naming: bool,
+    /// Texto do nome sendo digitado.
+    pivot_name_buf: String,
     // Traçado de Imagem (raster → vetor).
     win_trace: bool,
     /// Imagem de origem para traçar (já reduzida): (w, h, rgba).
@@ -1665,6 +1696,8 @@ impl SketchMotionApp {
             play_both: false,
             frame_sel: Vec::new(),
             frame_sel_mode: false,
+            obj_clip: ObjClip::default(),
+            clip_objetos: false,
             frames_clip: Vec::new(),
             drag_frame: None,
             center_canvas: true,
@@ -1682,6 +1715,14 @@ impl SketchMotionApp {
             logo_tex: None,
             page_tex: None,
             page_normal_tex: None,
+            tex_pivo: None,
+            tex_vetor_trace: None,
+            win_pivot: false,
+            pivot_sel: None,
+            pivot_stage: 0,
+            pivot_drag: 0,
+            pivot_naming: false,
+            pivot_name_buf: String::new(),
             win_trace: false,
             trace_src: None,
             trace_tf: (0.0, 0.0, 0.0, 0.0, 0.0),
@@ -1756,7 +1797,14 @@ impl SketchMotionApp {
     }
 
     /// Dispara um aviso visível de que a camada `li` está bloqueada.
+    ///
+    /// Só NOTIFICA quando `li` é a camada ATIVA (você está nela). Se você está
+    /// em outra camada e tentou interagir com algo de uma camada bloqueada, a
+    /// interação é apenas recusada (pelo `return` de quem chamou), sem aviso.
     fn warn_locked_layer(&mut self, li: usize) {
+        if li != self.active_layer {
+            return;
+        }
         let nome = self
             .document
             .layer(li)
@@ -1770,6 +1818,31 @@ impl SketchMotionApp {
     fn warn_lock(&mut self) {
         let li = self.active_layer;
         self.warn_locked_layer(li);
+    }
+
+    /// True se a camada ATIVA não pode receber edição agora — bloqueada ou
+    /// oculta — já emitindo o aviso apropriado. As ferramentas de desenho e de
+    /// preenchimento checam isto antes de agir.
+    fn active_bloqueada_para_edicao(&mut self) -> bool {
+        let li = self.active_layer;
+        let (existe, locked, visible, nome) = match self.document.layer(li) {
+            Some(l) => (true, l.locked, l.visible, l.name.clone()),
+            None => (false, true, false, String::new()),
+        };
+        if !existe {
+            return true;
+        }
+        if locked {
+            self.warn_lock();
+            return true;
+        }
+        if !visible {
+            self.status =
+                format!("⚠ Camada \"{nome}\" oculta — mostre-a (ícone do olho) para editar");
+            self.warn_ticks = 150;
+            return true;
+        }
+        false
     }
 
     /// Salva o estado atual no histórico e limpa o refazer. O histórico é
@@ -2041,8 +2114,7 @@ impl SketchMotionApp {
     /// Carimba um dab conforme o tipo de pincel (ou quadrado no pixel art).
     fn stamp(&mut self, x: i32, y: i32, r: i32) {
         let li = self.active_layer;
-        if self.document.layer(li).map_or(true, |l| l.locked) {
-            self.warn_lock();
+        if self.active_bloqueada_para_edicao() {
             return;
         }
         if self.pixel_mode {
@@ -2795,6 +2867,100 @@ impl SketchMotionApp {
         self.status = "Desagrupado".into();
     }
 
+    /// Índices dos objetos vetoriais atualmente selecionados (conjunto/grupo,
+    /// ou o objeto único). Ordenados e sem repetição.
+    fn objetos_selecionados(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = if !self.sel_set.is_empty() {
+            self.sel_set
+                .iter()
+                .copied()
+                .filter(|&i| i < self.document.vectors.len())
+                .collect()
+        } else if let Some(i) = self.selected_obj {
+            if i < self.document.vectors.len() {
+                vec![i]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Copia (ou recorta, se `recortar`) os objetos vetoriais selecionados para
+    /// a área de transferência de objetos. Devolve true se havia algo.
+    fn copiar_objetos(&mut self, recortar: bool) -> bool {
+        let idxs = self.objetos_selecionados();
+        if idxs.is_empty() {
+            return false;
+        }
+        let vectors: Vec<VectorObject> =
+            idxs.iter().map(|&i| self.document.vectors[i].clone()).collect();
+        let n = vectors.len();
+        self.obj_clip = ObjClip { vectors, images: Vec::new() };
+        self.clip_objetos = true;
+        if recortar {
+            self.push_undo();
+            for &i in idxs.iter().rev() {
+                self.document.vectors.remove(i);
+            }
+            self.sel_set.clear();
+            self.selected_obj = None;
+            self.dirty = true;
+            self.status = format!("{n} objeto(s) recortado(s) — Ctrl+V para colar");
+        } else {
+            self.status = format!("{n} objeto(s) copiado(s) — Ctrl+V para colar");
+        }
+        true
+    }
+
+    /// Cola os objetos da área de transferência mantendo posição e tamanho.
+    /// Vetores entram no frame atual; imagens vão para a camada ativa (mesma
+    /// posição/escala/rotação). Devolve true se colou algo.
+    fn colar_objetos(&mut self) -> bool {
+        if self.obj_clip.vectors.is_empty() && self.obj_clip.images.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        // Vetores: remapeia ids de grupo para novos, preservando o agrupamento
+        // relativo sem colidir com grupos já existentes no documento.
+        let start = self.document.vectors.len();
+        let mut map: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let clip_vecs = self.obj_clip.vectors.clone();
+        for obj in clip_vecs {
+            let mut no = obj;
+            if let Some(g) = no.group {
+                let ng = *map.entry(g).or_insert_with(|| {
+                    let v = self.next_group;
+                    self.next_group += 1;
+                    v
+                });
+                no.group = Some(ng);
+            }
+            self.document.vectors.push(no);
+        }
+        // Imagens: mesma posição/tamanho, associadas à camada ativa.
+        let clip_imgs = self.obj_clip.images.clone();
+        for mut im in clip_imgs {
+            im.layer = self.active_layer;
+            self.document.images.push(im);
+        }
+        // Seleciona os vetores recém-colados (para mover/ajustar em seguida).
+        if self.document.vectors.len() > start {
+            self.sel_set = (start..self.document.vectors.len()).collect();
+            self.selected_obj = self.sel_set.first().copied();
+        }
+        self.tool = Tool::Select;
+        self.dirty = true;
+        let nv = self.document.vectors.len() - start;
+        let ni = self.obj_clip.images.len();
+        self.status = format!("Colado na mesma posição ({nv} vetor(es), {ni} imagem(ns))");
+        true
+    }
+
     /// Contorno azul ao redor de cada objeto do conjunto (seleção múltipla).
     fn desenhar_sel_set(&self, ui: &mut egui::Ui, rect: egui::Rect, zoom: f32) {
         if self.sel_set.len() < 2 {
@@ -3041,6 +3207,13 @@ impl SketchMotionApp {
         let Some(i) = hit else {
             return false;
         };
+        // Objeto em camada bloqueada não pode ser pego. Só notifica se essa
+        // camada for a ativa (você está nela); em outra camada, recusa em
+        // silêncio e o clique passa adiante (você continua podendo desenhar).
+        if self.layer_locked(self.document.images[i].layer) {
+            self.warn_locked_layer(self.document.images[i].layer);
+            return false;
+        }
         let o = self.document.images.remove(i);
         let layer = o.layer.min(self.document.layers.len().saturating_sub(1));
         self.float_sel = Some(FloatSel {
@@ -3759,11 +3932,10 @@ impl SketchMotionApp {
         if x0 < 0 || y0 < 0 || x0 >= w || y0 >= h {
             return;
         }
-        let li = self.active_layer;
-        if self.document.layer(li).map_or(true, |l| l.locked) {
-            self.warn_lock();
+        if self.active_bloqueada_para_edicao() {
             return;
         }
+        let li = self.active_layer;
         let target = match self
             .document
             .layer(li)
@@ -3898,11 +4070,10 @@ impl SketchMotionApp {
         if x0 < 0 || y0 < 0 || x0 >= w || y0 >= h {
             return;
         }
-        let li = self.active_layer;
-        if self.document.layer(li).map_or(true, |l| l.locked) {
-            self.warn_lock();
+        if self.active_bloqueada_para_edicao() {
             return;
         }
+        let li = self.active_layer;
         let PixelImage { width, height, mut rgba } =
             render_layers_alpha(self.document.width, self.document.height, &self.document.layers);
         self.rasterizar_vetores(&mut rgba, width as u32, height as u32);
@@ -5383,6 +5554,7 @@ impl SketchMotionApp {
                         Tool::Rig => self.opcoes_rig(ui),
                         Tool::Grupo => self.opcoes_objetos(ui),
                         Tool::Camera => self.opcoes_camera(ui),
+                        Tool::Pivot => self.opcoes_pivo(ui),
                     }
                 }
             });
@@ -5818,8 +5990,33 @@ impl SketchMotionApp {
         self.dirty = true;
     }
 
+    /// Carrega uma textura de ícone PNG embutido (uma vez).
+    fn carregar_icone_png(ctx: &egui::Context, nome: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+        let img = image::load_from_memory(bytes).ok()?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+        Some(ctx.load_texture(nome, ci, egui::TextureOptions::LINEAR))
+    }
+
+    /// Botão de ícone a partir de uma textura PNG (mesma pegada visual do
+    /// `icon_button` glífico: destaca quando ativo).
+    fn icon_img_button(ui: &mut egui::Ui, active: bool, tex: &egui::TextureHandle) -> egui::Response {
+        let size = egui::vec2(22.0, 22.0);
+        let img = egui::Image::new(egui::load::SizedTexture::new(tex.id(), size));
+        ui.add(egui::ImageButton::new(img).selected(active))
+    }
+
     fn barra_icones(&mut self, ctx: &egui::Context) {
         use egui_phosphor::regular as icon;
+        if self.tex_pivo.is_none() {
+            const B: &[u8] = include_bytes!("../../../assets/pivo.png");
+            self.tex_pivo = Self::carregar_icone_png(ctx, "ic_pivo", B);
+        }
+        if self.tex_vetor_trace.is_none() {
+            const B: &[u8] = include_bytes!("../../../assets/vetor_trace.png");
+            self.tex_vetor_trace = Self::carregar_icone_png(ctx, "ic_vetor_trace", B);
+        }
         egui::SidePanel::right("barra_icones")
             .exact_width(50.0)
             .resizable(false)
@@ -5907,10 +6104,27 @@ impl SketchMotionApp {
                     }
                     ui.add_space(6.0);
 
-                    let resp_tr = icon_button(ui, self.win_trace, icon::VECTOR_TWO)
-                        .on_hover_text("Traçado de Imagem — vetorizar (raster → vetor)");
+                    let resp_tr = match &self.tex_vetor_trace {
+                        Some(tex) => Self::icon_img_button(ui, self.win_trace, tex),
+                        None => icon_button(ui, self.win_trace, icon::VECTOR_TWO),
+                    }
+                    .on_hover_text("Traçado de Imagem — vetorizar (raster → vetor)");
                     if resp_tr.clicked() {
                         self.win_trace = !self.win_trace;
+                    }
+                    ui.add_space(6.0);
+
+                    let resp_pv = match &self.tex_pivo {
+                        Some(tex) => Self::icon_img_button(ui, self.win_pivot, tex),
+                        None => icon_button(ui, self.win_pivot, icon::CROSSHAIR),
+                    }
+                    .on_hover_text("Pivô — eixo de transformação personalizado");
+                    if resp_pv.clicked() {
+                        self.win_pivot = !self.win_pivot;
+                        if self.win_pivot {
+                            self.tool = Tool::Pivot;
+                            self.eyedropper = Eyedropper::Off;
+                        }
                     }
                 });
             });
@@ -6056,6 +6270,476 @@ impl SketchMotionApp {
         });
         self.dirty = true;
         self.status = format!("Keyframe de câmera criado no frame {}", cur + 1);
+    }
+
+    // =====================  Ferramenta Pivô  =====================
+
+    /// Descobre a que objeto/grupo o ponto (doc) pertence, para associar ao
+    /// pivô. Um vetor solto ganha um grupo próprio (para a associação sobreviver
+    /// a mudanças de índice/frames).
+    fn pivot_hit_target(&mut self, dp: (f32, f32)) -> sketchmotion_core::PivotTarget {
+        use sketchmotion_core::PivotTarget;
+        if let Some(i) = self.hit_test(dp, 6.0) {
+            let g = match self.document.vectors[i].group {
+                Some(g) => g,
+                None => {
+                    let ng = self.next_group;
+                    self.next_group += 1;
+                    self.document.vectors[i].group = Some(ng);
+                    ng
+                }
+            };
+            return PivotTarget::Group(g);
+        }
+        for i in (0..self.document.images.len()).rev() {
+            let o = &self.document.images[i];
+            if o.hw <= 0.0 || o.hh <= 0.0 {
+                continue;
+            }
+            let (s, c) = (-o.angle).sin_cos();
+            let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
+            let lx = rx * c - ry * s;
+            let ly = rx * s + ry * c;
+            if lx.abs() <= o.hw && ly.abs() <= o.hh {
+                return PivotTarget::Image(i);
+            }
+        }
+        PivotTarget::None
+    }
+
+    /// O ponto (doc) está sobre o objeto controlado pelo pivô `pi`?
+    fn pivot_point_on_object(&self, pi: usize, dp: (f32, f32)) -> bool {
+        use sketchmotion_core::PivotTarget;
+        let Some(pv) = self.document.pivots.get(pi) else {
+            return false;
+        };
+        match &pv.target {
+            PivotTarget::Group(g) => self.document.vectors.iter().any(|o| {
+                o.group == Some(*g)
+                    && o.bounds().map_or(false, |(a, b, c, d)| {
+                        dp.0 >= a && dp.0 <= c && dp.1 >= b && dp.1 <= d
+                    })
+            }),
+            PivotTarget::Image(i) => {
+                if let Some(o) = self.document.images.get(*i) {
+                    let (s, c) = (-o.angle).sin_cos();
+                    let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
+                    let lx = rx * c - ry * s;
+                    let ly = rx * s + ry * c;
+                    lx.abs() <= o.hw && ly.abs() <= o.hh
+                } else {
+                    false
+                }
+            }
+            PivotTarget::None => false,
+        }
+    }
+
+    /// Translada o objeto controlado e os dois pontos do pivô por (dx, dy).
+    fn pivot_translate(&mut self, pi: usize, dx: f32, dy: f32) {
+        use sketchmotion_core::PivotTarget;
+        let target = match self.document.pivots.get(pi) {
+            Some(p) => p.target.clone(),
+            None => return,
+        };
+        match target {
+            PivotTarget::Group(g) => {
+                for o in self.document.vectors.iter_mut() {
+                    if o.group == Some(g) {
+                        o.translate(dx, dy);
+                    }
+                }
+            }
+            PivotTarget::Image(i) => {
+                if let Some(o) = self.document.images.get_mut(i) {
+                    o.cx += dx;
+                    o.cy += dy;
+                }
+            }
+            PivotTarget::None => {}
+        }
+        if let Some(pv) = self.document.pivots.get_mut(pi) {
+            pv.axis.0 += dx;
+            pv.axis.1 += dy;
+            pv.mov.0 += dx;
+            pv.mov.1 += dy;
+        }
+        self.dirty = true;
+        self.modificado = true;
+    }
+
+    /// Rotaciona o objeto controlado (e o ponto laranja) por `ang` rad ao redor
+    /// do EIXO azul, que permanece fixo. É a transformação matemática real do
+    /// pivô: posição_relativa → rotação → nova posição.
+    fn pivot_rotate(&mut self, pi: usize, ang: f32) {
+        use sketchmotion_core::PivotTarget;
+        let (ax, target) = match self.document.pivots.get(pi) {
+            Some(p) => (p.axis, p.target.clone()),
+            None => return,
+        };
+        match target {
+            PivotTarget::Group(g) => {
+                for o in self.document.vectors.iter_mut() {
+                    if o.group == Some(g) {
+                        o.rotate_around(ax.0, ax.1, ang);
+                    }
+                }
+            }
+            PivotTarget::Image(i) => {
+                if let Some(o) = self.document.images.get_mut(i) {
+                    let (s, c) = ang.sin_cos();
+                    let (dx, dy) = (o.cx - ax.0, o.cy - ax.1);
+                    o.cx = ax.0 + dx * c - dy * s;
+                    o.cy = ax.1 + dx * s + dy * c;
+                    o.angle += ang;
+                }
+            }
+            PivotTarget::None => {}
+        }
+        if let Some(pv) = self.document.pivots.get_mut(pi) {
+            let (s, c) = ang.sin_cos();
+            let (dx, dy) = (pv.mov.0 - ax.0, pv.mov.1 - ax.1);
+            pv.mov.0 = ax.0 + dx * c - dy * s;
+            pv.mov.1 = ax.1 + dx * s + dy * c;
+        }
+        self.dirty = true;
+        self.modificado = true;
+    }
+
+    /// Interação da ferramenta Pivô no canvas (criação e arraste de pontos).
+    fn interacao_pivo(
+        &mut self,
+        pressed: bool,
+        down: bool,
+        hover: Option<egui::Pos2>,
+        ppos: Option<egui::Pos2>,
+        pdelta: egui::Vec2,
+        rect: egui::Rect,
+        zoom: f32,
+    ) {
+        let to_doc = |p: egui::Pos2| ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+        if pressed {
+            if let Some(p) = hover {
+                let dp = to_doc(p);
+                // Fluxo de criação: primeiro clique = objeto + EIXO; segundo = MOV.
+                if self.pivot_stage == 1 {
+                    if let Some(pi) = self.pivot_sel {
+                        let target = self.pivot_hit_target(dp);
+                        let achou = !matches!(target, sketchmotion_core::PivotTarget::None);
+                        if let Some(pv) = self.document.pivots.get_mut(pi) {
+                            pv.target = target;
+                            pv.axis = dp;
+                            pv.has_axis = true;
+                        }
+                        self.pivot_stage = 2;
+                        self.modificado = true;
+                        self.status = if achou {
+                            "Eixo definido. Agora clique no ponto de movimentação.".into()
+                        } else {
+                            "Eixo definido (nenhum objeto sob o clique). Defina o ponto de movimentação.".into()
+                        };
+                    }
+                    return;
+                }
+                if self.pivot_stage == 2 {
+                    if let Some(pi) = self.pivot_sel {
+                        if let Some(pv) = self.document.pivots.get_mut(pi) {
+                            pv.mov = dp;
+                            pv.has_mov = true;
+                        }
+                        self.pivot_stage = 0;
+                        self.modificado = true;
+                        self.status =
+                            "Pivô pronto — arraste o laranja para girar; o azul para mover.".into();
+                    }
+                    return;
+                }
+                // Ocioso: inicia arraste sobre azul / laranja / objeto.
+                if let Some(pi) = self.pivot_sel {
+                    let completo = self.document.pivots.get(pi).map_or(false, |p| p.completo());
+                    if completo {
+                        let (ax, mv) = {
+                            let pv = &self.document.pivots[pi];
+                            (pv.axis, pv.mov)
+                        };
+                        let r = 10.0 / zoom;
+                        let da = ((dp.0 - ax.0).powi(2) + (dp.1 - ax.1).powi(2)).sqrt();
+                        let dm = ((dp.0 - mv.0).powi(2) + (dp.1 - mv.1).powi(2)).sqrt();
+                        if dm <= r && dm <= da {
+                            self.pivot_drag = 2;
+                            self.push_undo();
+                        } else if da <= r {
+                            self.pivot_drag = 1;
+                            self.push_undo();
+                        } else if self.pivot_point_on_object(pi, dp) {
+                            self.pivot_drag = 3;
+                            self.push_undo();
+                        } else {
+                            self.pivot_drag = 0;
+                        }
+                    }
+                }
+            }
+        }
+        if down && self.pivot_drag != 0 {
+            if let (Some(pp), Some(pi)) = (ppos, self.pivot_sel) {
+                match self.pivot_drag {
+                    2 => {
+                        // Laranja: gira o objeto ao redor do eixo pelo ângulo que
+                        // o ponteiro varreu em torno do eixo.
+                        let cur = to_doc(pp);
+                        let ax = self.document.pivots[pi].axis;
+                        let prev = (cur.0 - pdelta.x / zoom, cur.1 - pdelta.y / zoom);
+                        let a0 = (prev.1 - ax.1).atan2(prev.0 - ax.0);
+                        let a1 = (cur.1 - ax.1).atan2(cur.0 - ax.0);
+                        let delta = a1 - a0;
+                        if delta.abs() > f32::EPSILON {
+                            self.pivot_rotate(pi, delta);
+                        }
+                    }
+                    _ => {
+                        // Azul ou objeto: translada tudo pelo deslocamento.
+                        let (dx, dy) = (pdelta.x / zoom, pdelta.y / zoom);
+                        if dx != 0.0 || dy != 0.0 {
+                            self.pivot_translate(pi, dx, dy);
+                        }
+                    }
+                }
+            }
+        }
+        if !down {
+            self.pivot_drag = 0;
+        }
+    }
+
+    /// Desenha os pontos do(s) pivô(s): eixo azul, movimentação laranja e a
+    /// linha que os liga. Apenas overlay de interface (não entra na exportação).
+    fn desenhar_pivos(&self, ui: &mut egui::Ui, rect: egui::Rect, zoom: f32) {
+        let painter = ui.painter_at(rect);
+        let scr = |p: (f32, f32)| egui::pos2(rect.min.x + p.0 * zoom, rect.min.y + p.1 * zoom);
+        let azul = egui::Color32::from_rgb(30, 120, 255);
+        let laranja = egui::Color32::from_rgb(255, 140, 0);
+        let branco = egui::Color32::WHITE;
+        for (idx, pv) in self.document.pivots.iter().enumerate() {
+            if !pv.has_axis {
+                continue;
+            }
+            let sel = Some(idx) == self.pivot_sel;
+            let ax = scr(pv.axis);
+            let ra = if sel { 6.0 } else { 4.0 };
+            if pv.has_mov {
+                let mv = scr(pv.mov);
+                painter.line_segment(
+                    [ax, mv],
+                    egui::Stroke::new(if sel { 2.0 } else { 1.0 }, egui::Color32::from_gray(180)),
+                );
+                painter.circle_filled(mv, ra, laranja);
+                painter.circle_stroke(mv, ra, egui::Stroke::new(1.5, branco));
+                if sel {
+                    let hr = egui::Rect::from_center_size(mv, egui::vec2(16.0, 16.0));
+                    ui.interact(hr, ui.id().with(("pv_mov", idx)), egui::Sense::hover())
+                        .on_hover_text("Ponto de Movimentação");
+                }
+            }
+            painter.circle_filled(ax, ra, azul);
+            painter.circle_stroke(ax, ra, egui::Stroke::new(1.5, branco));
+            if sel {
+                let hr = egui::Rect::from_center_size(ax, egui::vec2(16.0, 16.0));
+                ui.interact(hr, ui.id().with(("pv_ax", idx)), egui::Sense::hover())
+                    .on_hover_text("Eixo / Pivô");
+            }
+        }
+    }
+
+    /// Barra de opções da ferramenta Pivô (topo).
+    fn opcoes_pivo(&mut self, ui: &mut egui::Ui) {
+        match self.pivot_stage {
+            1 => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(30, 120, 255),
+                    "Clique no objeto para definir o EIXO (ponto azul).",
+                );
+            }
+            2 => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 140, 0),
+                    "Clique para definir o ponto de MOVIMENTAÇÃO (laranja).",
+                );
+            }
+            _ => {
+                if let Some(pi) = self.pivot_sel.and_then(|i| self.document.pivots.get(i)) {
+                    ui.label(format!("Pivô ativo: \"{}\"", pi.name));
+                    ui.separator();
+                    ui.weak("Arraste laranja = girar • azul/objeto = mover");
+                } else {
+                    ui.weak("Abra o painel Pivô (ícone à direita) para criar ou escolher um pivô.");
+                }
+            }
+        }
+    }
+
+    /// Painel de gerenciamento de pivôs (criar / listar / editar / excluir).
+    fn janela_pivo(&mut self, ctx: &egui::Context) {
+        if !self.win_pivot {
+            return;
+        }
+        let mut open = self.win_pivot;
+        let mut do_criar = false;
+        let mut do_add_ponto = false;
+        let mut do_excluir = false;
+        let mut do_renomear = false;
+        egui::Window::new("Pivô")
+            .open(&mut open)
+            .default_width(240.0)
+            .show(ctx, |ui| {
+                if self.pivot_naming {
+                    ui.label("Nome do pivô:");
+                    let resp = ui.text_edit_singleline(&mut self.pivot_name_buf);
+                    resp.request_focus();
+                    ui.horizontal(|ui| {
+                        let ok = ui.button("Confirmar").clicked()
+                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        if ok {
+                            do_criar = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            self.pivot_naming = false;
+                            self.pivot_name_buf.clear();
+                        }
+                    });
+                } else if ui.button("＋ Criar novo").clicked() {
+                    self.pivot_naming = true;
+                    self.pivot_name_buf = format!("Pivô {}", self.document.pivots.len() + 1);
+                }
+                ui.separator();
+                ui.label("Pivôs existentes:");
+                egui::ScrollArea::vertical()
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        if self.document.pivots.is_empty() {
+                            ui.weak("(nenhum ainda)");
+                        }
+                        for i in 0..self.document.pivots.len() {
+                            let (nome, on, completo) = {
+                                let p = &self.document.pivots[i];
+                                (p.name.clone(), p.enabled, p.completo())
+                            };
+                            ui.horizontal(|ui| {
+                                let sel = self.pivot_sel == Some(i);
+                                let rotulo = if completo {
+                                    format!("● {nome}")
+                                } else {
+                                    format!("○ {nome} (incompleto)")
+                                };
+                                if ui.selectable_label(sel, rotulo).clicked() {
+                                    self.pivot_sel = Some(i);
+                                    self.pivot_stage = 0;
+                                }
+                                let mut en = on;
+                                if ui.checkbox(&mut en, "").on_hover_text("Ativar/desativar").changed()
+                                {
+                                    self.document.pivots[i].enabled = en;
+                                }
+                            });
+                        }
+                    });
+                ui.separator();
+                let tem_sel = self.pivot_sel.is_some();
+                if self.pivot_sel.map_or(false, |i| i >= self.document.pivots.len()) {
+                    self.pivot_sel = None;
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(tem_sel, egui::Button::new("＋ Adicionar ponto"))
+                        .on_hover_text("Redefinir eixo e ponto de movimentação clicando no objeto")
+                        .clicked()
+                    {
+                        do_add_ponto = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(tem_sel, egui::Button::new("Editar")).clicked() {
+                        do_renomear = true;
+                    }
+                    if ui.add_enabled(tem_sel, egui::Button::new("Excluir")).clicked() {
+                        do_excluir = true;
+                    }
+                });
+                if self.pivot_stage != 0 {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 0),
+                        "Configurando: clique no canvas para posicionar os pontos.",
+                    );
+                }
+            });
+        // Ações fora do closure (evita conflito de empréstimo).
+        if do_criar {
+            let nome = if self.pivot_name_buf.trim().is_empty() {
+                format!("Pivô {}", self.document.pivots.len() + 1)
+            } else {
+                self.pivot_name_buf.trim().to_string()
+            };
+            if self.pivot_stage == 3 {
+                // "Editar": apenas renomeia o pivô selecionado (mantém pontos).
+                if let Some(pi) = self.pivot_sel {
+                    if let Some(pv) = self.document.pivots.get_mut(pi) {
+                        pv.name = nome;
+                    }
+                }
+                self.pivot_naming = false;
+                self.pivot_name_buf.clear();
+                self.pivot_stage = 0;
+                self.modificado = true;
+                self.status = "Nome do pivô atualizado.".into();
+            } else {
+                self.document.pivots.push(sketchmotion_core::Pivot::new(nome));
+                self.pivot_sel = Some(self.document.pivots.len() - 1);
+                self.pivot_naming = false;
+                self.pivot_name_buf.clear();
+                self.pivot_stage = 1;
+                self.tool = Tool::Pivot;
+                self.modificado = true;
+                self.status = "Clique no objeto para definir o eixo (ponto azul).".into();
+            }
+        }
+        if do_add_ponto {
+            if let Some(pi) = self.pivot_sel {
+                if let Some(pv) = self.document.pivots.get_mut(pi) {
+                    pv.has_axis = false;
+                    pv.has_mov = false;
+                }
+                self.pivot_stage = 1;
+                self.tool = Tool::Pivot;
+                self.status = "Clique no objeto para redefinir o eixo (ponto azul).".into();
+            }
+        }
+        if do_renomear {
+            if let Some(pi) = self.pivot_sel {
+                self.pivot_naming = true;
+                self.pivot_name_buf = self
+                    .document
+                    .pivots
+                    .get(pi)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                // "Editar" aqui reaproveita o campo de nome; renomeia ao confirmar.
+                // Para não criar um novo, sinalizamos via pivot_stage especial.
+                self.pivot_stage = 3;
+            }
+        }
+        if do_excluir {
+            if let Some(pi) = self.pivot_sel {
+                if pi < self.document.pivots.len() {
+                    self.document.pivots.remove(pi);
+                    self.pivot_sel = None;
+                    self.pivot_stage = 0;
+                    self.modificado = true;
+                    self.status = "Pivô excluído (o objeto foi mantido).".into();
+                }
+            }
+        }
+        self.win_pivot = open;
     }
 
     /// Janela de controle da câmera: campos numéricos, keyframes e Reset.
@@ -7368,12 +8052,14 @@ impl SketchMotionApp {
         });
 
         if let Some(i) = toggle_vis {
+            self.push_undo();
             if let Some(l) = self.document.layer_mut(i) {
                 l.visible = !l.visible;
             }
             self.dirty = true;
         }
         if let Some(i) = toggle_lock {
+            self.push_undo();
             if let Some(l) = self.document.layer_mut(i) {
                 l.locked = !l.locked;
             }
@@ -7383,6 +8069,7 @@ impl SketchMotionApp {
         }
         if let Some(i) = move_up {
             if i + 1 < self.document.layers.len() {
+                self.push_undo();
                 self.document.swap_layers(i, i + 1);
                 if self.active_layer == i {
                     self.active_layer = i + 1;
@@ -7394,6 +8081,7 @@ impl SketchMotionApp {
         }
         if let Some(i) = move_down {
             if i > 0 {
+                self.push_undo();
                 self.document.swap_layers(i, i - 1);
                 if self.active_layer == i {
                     self.active_layer = i - 1;
@@ -7404,17 +8092,24 @@ impl SketchMotionApp {
             }
         }
         if nova {
+            self.push_undo();
             let nome = format!("Camada {}", self.document.layers.len() + 1);
             let idx = self.document.add_layer_above(self.active_layer, nome);
             self.active_layer = idx;
             self.dirty = true;
         }
         if excluir {
-            self.document.remove_layer(self.active_layer);
-            if self.active_layer >= self.document.layers.len() {
-                self.active_layer = self.document.layers.len() - 1;
+            // remove_layer se recusa a apagar a última camada; nesse caso, avisa.
+            if self.document.layers.len() <= 1 {
+                self.status = "Não é possível excluir a única camada".into();
+            } else {
+                self.push_undo();
+                self.document.remove_layer(self.active_layer);
+                if self.active_layer >= self.document.layers.len() {
+                    self.active_layer = self.document.layers.len() - 1;
+                }
+                self.dirty = true;
             }
-            self.dirty = true;
         }
 
         self.reopen_layers = false;
@@ -8842,7 +9537,15 @@ impl eframe::App for SketchMotionApp {
         let mut k_esc = false;
         let mut k_del = false;
         let mut k_copy = false;
+        let mut k_cut = false;
         let mut k_paste = false;
+        // Ações do menu de contexto (botão direito) do canvas.
+        let mut m_copiar = false;
+        let mut m_recortar = false;
+        let mut m_colar = false;
+        let mut m_agrupar = false;
+        let mut m_desagrupar = false;
+        let mut m_integrar = false;
         ctx.input(|i| {
             if i.modifiers.command && i.key_pressed(egui::Key::Z) {
                 if i.modifiers.shift {
@@ -8863,9 +9566,13 @@ impl eframe::App for SketchMotionApp {
             if i.modifiers.command && i.key_pressed(egui::Key::V) {
                 k_paste = true;
             }
+            if i.modifiers.command && i.key_pressed(egui::Key::X) {
+                k_cut = true;
+            }
             for e in &i.events {
                 match e {
-                    egui::Event::Copy | egui::Event::Cut => k_copy = true,
+                    egui::Event::Copy => k_copy = true,
+                    egui::Event::Cut => k_cut = true,
                     egui::Event::Paste(_) => k_paste = true,
                     _ => {}
                 }
@@ -9190,6 +9897,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_prancheta(ctx);
         self.janela_camera(ctx);
         self.janela_trace(ctx);
+        self.janela_pivo(ctx);
         self.trace_poll(ctx);
         self.ensure_piece_textures(ctx);
         self.ensure_part_textures(ctx);
@@ -9239,6 +9947,54 @@ impl eframe::App for SketchMotionApp {
                         ui.id().with("canvas_area"),
                         egui::Sense::click_and_drag(),
                     );
+                    // Botão direito: seleciona o objeto sob o cursor (se houver) e
+                    // abre o menu de contexto com as ações à mão.
+                    if response.secondary_clicked() {
+                        if let Some(p) = response.interact_pointer_pos() {
+                            let dp = ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+                            let thr = 6.0 / zoom;
+                            if let Some(i) = self.hit_test(dp, thr) {
+                                let g = self.document.vectors[i].group;
+                                if let Some(g) = g {
+                                    self.sel_set = (0..self.document.vectors.len())
+                                        .filter(|&k| self.document.vectors[k].group == Some(g))
+                                        .collect();
+                                } else if !self.sel_set.contains(&i) {
+                                    self.sel_set = vec![i];
+                                }
+                                self.selected_obj = Some(i);
+                            }
+                        }
+                    }
+                    response.context_menu(|ui| {
+                        ui.set_min_width(150.0);
+                        if ui.button("Copiar").clicked() {
+                            m_copiar = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Recortar").clicked() {
+                            m_recortar = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Colar").clicked() {
+                            m_colar = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Agrupar").clicked() {
+                            m_agrupar = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Desagrupar").clicked() {
+                            m_desagrupar = true;
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("Integrar").clicked() {
+                            m_integrar = true;
+                            ui.close_menu();
+                        }
+                    });
                     // Fundo xadrez indica transparência; a imagem (com alfa) vai por cima.
                     {
                         let p = ui.painter_at(rect);
@@ -9417,6 +10173,10 @@ impl eframe::App for SketchMotionApp {
                     // Seleção múltipla de vetores: contorno em cada objeto.
                     if self.tool == Tool::Select {
                         self.desenhar_sel_set(ui, rect, zoom);
+                    }
+                    // Pivô: pontos azul (eixo) e laranja (movimentação).
+                    if self.tool == Tool::Pivot || self.win_pivot {
+                        self.desenhar_pivos(ui, rect, zoom);
                     }
                     let pressed = pressed && !self.win_prancheta;
                     let down = down && !self.win_prancheta;
@@ -9810,6 +10570,9 @@ impl eframe::App for SketchMotionApp {
                         self.last_pos = None;
                     } else if self.tool == Tool::Camera {
                         self.interacao_camera(pressed, down, hover, ppos, rect, zoom);
+                        self.last_pos = None;
+                    } else if self.tool == Tool::Pivot {
+                        self.interacao_pivo(pressed, down, hover, ppos, pdelta, rect, zoom);
                         self.last_pos = None;
                     } else if self.tool == Tool::Rig {
                         if let Some(si) = self.rig_active_index() {
@@ -10325,25 +11088,87 @@ impl eframe::App for SketchMotionApp {
         if do_redo {
             self.redo();
         }
-        // Copiar (Ctrl+C): guarda os pixels da seleção flutuante e a devolve ao
-        // lugar (cópia não destrutiva — o frame de origem fica intacto). Fica
-        // aqui, fora do gate de teclado, igual ao undo/redo, para sempre rodar.
-        if k_copy {
-            let data = self
-                .float_sel
-                .as_ref()
-                .map(|fs| (fs.ow, fs.oh, fs.pixels.clone()));
-            if let Some(d) = data {
-                self.clip = Some(d);
-                self.drop_float();
-                self.status = "Seleção copiada — Ctrl+V para colar (inclusive em outro frame)".into();
+        // Ações do menu de contexto (botão direito) — reaproveitam os mesmos
+        // caminhos do teclado.
+        if m_copiar {
+            k_copy = true;
+        }
+        if m_recortar {
+            k_cut = true;
+        }
+        if m_colar {
+            k_paste = true;
+        }
+        if m_agrupar {
+            self.agrupar_selecao();
+        }
+        if m_desagrupar {
+            self.desagrupar_selecao();
+        }
+        if m_integrar {
+            if self.float_sel.is_some() {
+                self.push_undo();
+                self.commit_float();
+                self.status = "Imagem integrada aos pixels".into();
             } else {
-                self.status = "Nada selecionado para copiar (use Seleção/Laço primeiro)".into();
+                self.integrar_todas_imagens();
             }
         }
-        // Colar (Ctrl+V): cria uma nova seleção flutuante a partir do que foi
-        // copiado, no centro do canvas (funciona inclusive em outro frame).
-        if k_paste {
+        // Copiar/Recortar (Ctrl+C / Ctrl+X). Prioridade: objetos vetoriais
+        // selecionados → objeto de imagem em edição → seleção raster (pixels).
+        // Fica aqui, fora do gate de teclado, igual ao undo/redo.
+        if k_copy || k_cut {
+            let recortar = k_cut;
+            if !self.objetos_selecionados().is_empty() {
+                self.copiar_objetos(recortar);
+            } else if matches!(&self.float_sel, Some(f) if f.is_image) {
+                if let Some(f) = &self.float_sel {
+                    let im = ImageObject::new(
+                        f.pixels.clone(), f.ow, f.oh, f.cx, f.cy, f.hw, f.hh, f.angle, f.opacity,
+                        f.layer,
+                    );
+                    self.obj_clip = ObjClip { vectors: Vec::new(), images: vec![im] };
+                    self.clip_objetos = true;
+                }
+                if recortar {
+                    self.float_sel = None;
+                    self.float_tex = None;
+                    self.dirty = true;
+                    self.status = "Objeto recortado — Ctrl+V para colar".into();
+                } else {
+                    self.status = "Objeto copiado — Ctrl+V para colar".into();
+                }
+            } else if self.float_sel.is_some() {
+                let data = self
+                    .float_sel
+                    .as_ref()
+                    .map(|fs| (fs.ow, fs.oh, fs.pixels.clone()));
+                if let Some(d) = data {
+                    self.clip = Some(d);
+                    self.clip_objetos = false;
+                    if recortar {
+                        self.float_sel = None;
+                        self.float_tex = None;
+                        self.dirty = true;
+                        self.status = "Seleção recortada — Ctrl+V para colar".into();
+                    } else {
+                        self.drop_float();
+                        self.status =
+                            "Seleção copiada — Ctrl+V para colar (inclusive em outro frame)".into();
+                    }
+                }
+            } else {
+                self.status = "Nada selecionado para copiar/recortar".into();
+            }
+        }
+        // Colar (Ctrl+V). Objetos → mesma posição/tamanho; seleção raster → nova
+        // flutuante no centro do canvas.
+        if k_paste
+            && self.clip_objetos
+            && (!self.obj_clip.vectors.is_empty() || !self.obj_clip.images.is_empty())
+        {
+            self.colar_objetos();
+        } else if k_paste {
             if let Some((ow, oh, px)) = self.clip.clone() {
                 // Finaliza a colagem anterior ANTES de registrar o histórico, para
                 // que cada colar seja uma ação de undo/redo separada (não uma só).
