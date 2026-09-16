@@ -210,4 +210,10 @@ impl VectorObject {
             self.map_points(|x, y| (cx + (x - cx) * f, cy + (y - cy) * f));
         }
     }
+
+    /// Escala o objeto por um fator ao redor de um ponto arbitrário (cx, cy) —
+    /// usado pelo Vetor de Direção (escala em relação ao eixo/centro do grupo).
+    pub fn scale_around(&mut self, cx: f32, cy: f32, f: f32) {
+        self.map_points(|x, y| (cx + (x - cx) * f, cy + (y - cy) * f));
+    }
 }

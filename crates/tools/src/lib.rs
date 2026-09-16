@@ -37,6 +37,8 @@ pub enum Tool {
     Camera,
     /// Pivô — eixo de transformação personalizado (ponto azul/laranja).
     Pivot,
+    /// Vetor de Direção — animação automática por interpolação entre frames.
+    DirVector,
 }
 
 impl Tool {
@@ -69,6 +71,7 @@ impl Tool {
             Tool::Grupo => "Objetos",
             Tool::Camera => "Câmera",
             Tool::Pivot => "Pivô",
+            Tool::DirVector => "Vetor de Direção",
         }
     }
 }

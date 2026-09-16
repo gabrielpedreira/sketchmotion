@@ -1474,6 +1474,35 @@ struct SketchMotionApp {
     pivot_naming: bool,
     /// Texto do nome sendo digitado.
     pivot_name_buf: String,
+    /// Ícone PNG do Vetor de Direção (assets/vetor_direcao.png).
+    tex_dirvec: Option<egui::TextureHandle>,
+    // Ferramenta Vetor de Direção (animação automática por interpolação).
+    win_dirvec: bool,
+    /// Vetor de direção selecionado na lista.
+    dirvec_sel: Option<usize>,
+    /// Fluxo de criação: 0 = ocioso, 1 = aguardando clique no objeto (associar).
+    dirvec_stage: u8,
+    /// Arrastando o objeto para definir a posição final?
+    dirvec_dragging: bool,
+    /// Rotação acumulada no arraste (rad), quando o objeto tem pivô.
+    dirvec_drag_angle: f32,
+    /// Posição (centro) do "fantasma" — o objeto em suspensão num frame onde
+    /// ele ainda não existe, à espera de ser arrastado para a posição final.
+    dirvec_ghost_pos: (f32, f32),
+    /// Rotação do fantasma (rad), quando há pivô.
+    dirvec_ghost_ang: f32,
+    /// Frame para o qual o fantasma está preparado (None = sem fantasma).
+    dirvec_ghost_frame: Option<usize>,
+    /// Arrastando o fantasma?
+    dirvec_ghost_drag: bool,
+    /// Textura do fantasma da imagem (pré-visualização da própria peça).
+    dirvec_ghost_tex: Option<egui::TextureHandle>,
+    /// Índice do vetor para o qual a textura do fantasma foi montada.
+    dirvec_ghost_tex_for: Option<usize>,
+    /// Janelinha de nome ao criar um vetor novo.
+    dirvec_naming: bool,
+    /// Texto do nome sendo digitado.
+    dirvec_name_buf: String,
     // Traçado de Imagem (raster → vetor).
     win_trace: bool,
     /// Imagem de origem para traçar (já reduzida): (w, h, rgba).
@@ -1723,6 +1752,20 @@ impl SketchMotionApp {
             pivot_drag: 0,
             pivot_naming: false,
             pivot_name_buf: String::new(),
+            tex_dirvec: None,
+            win_dirvec: false,
+            dirvec_sel: None,
+            dirvec_stage: 0,
+            dirvec_dragging: false,
+            dirvec_drag_angle: 0.0,
+            dirvec_ghost_pos: (0.0, 0.0),
+            dirvec_ghost_ang: 0.0,
+            dirvec_ghost_frame: None,
+            dirvec_ghost_drag: false,
+            dirvec_ghost_tex: None,
+            dirvec_ghost_tex_for: None,
+            dirvec_naming: false,
+            dirvec_name_buf: String::new(),
             win_trace: false,
             trace_src: None,
             trace_tf: (0.0, 0.0, 0.0, 0.0, 0.0),
@@ -5555,6 +5598,7 @@ impl SketchMotionApp {
                         Tool::Grupo => self.opcoes_objetos(ui),
                         Tool::Camera => self.opcoes_camera(ui),
                         Tool::Pivot => self.opcoes_pivo(ui),
+                        Tool::DirVector => self.opcoes_dirvec(ui),
                     }
                 }
             });
@@ -6017,6 +6061,10 @@ impl SketchMotionApp {
             const B: &[u8] = include_bytes!("../../../assets/vetor_trace.png");
             self.tex_vetor_trace = Self::carregar_icone_png(ctx, "ic_vetor_trace", B);
         }
+        if self.tex_dirvec.is_none() {
+            const B: &[u8] = include_bytes!("../../../assets/vetor_direcao.png");
+            self.tex_dirvec = Self::carregar_icone_png(ctx, "ic_dirvec", B);
+        }
         egui::SidePanel::right("barra_icones")
             .exact_width(50.0)
             .resizable(false)
@@ -6123,6 +6171,20 @@ impl SketchMotionApp {
                         self.win_pivot = !self.win_pivot;
                         if self.win_pivot {
                             self.tool = Tool::Pivot;
+                            self.eyedropper = Eyedropper::Off;
+                        }
+                    }
+                    ui.add_space(6.0);
+
+                    let resp_dv = match &self.tex_dirvec {
+                        Some(tex) => Self::icon_img_button(ui, self.win_dirvec, tex),
+                        None => icon_button(ui, self.win_dirvec, icon::ARROW_RIGHT),
+                    }
+                    .on_hover_text("Vetor de Direção — animar objeto entre dois frames");
+                    if resp_dv.clicked() {
+                        self.win_dirvec = !self.win_dirvec;
+                        if self.win_dirvec {
+                            self.tool = Tool::DirVector;
                             self.eyedropper = Eyedropper::Off;
                         }
                     }
@@ -6740,6 +6802,880 @@ impl SketchMotionApp {
             }
         }
         self.win_pivot = open;
+    }
+
+    // ==================  Ferramenta Vetor de Direção  ==================
+
+    /// Centro (bounds) dos vetores da cópia de trabalho que pertencem ao grupo.
+    fn dirvec_group_centroid(&self, g: u32) -> Option<(f32, f32)> {
+        let mut bb: Option<(f32, f32, f32, f32)> = None;
+        for o in self.document.vectors.iter().filter(|o| o.group == Some(g)) {
+            if let Some((a, b, c, d)) = o.bounds() {
+                bb = Some(match bb {
+                    Some((x0, y0, x1, y1)) => (x0.min(a), y0.min(b), x1.max(c), y1.max(d)),
+                    None => (a, b, c, d),
+                });
+            }
+        }
+        bb.map(|(a, b, c, d)| ((a + c) / 2.0, (b + d) / 2.0))
+    }
+
+    /// Índice de um pivô completo cujo alvo casa com `target` (integração Pivô).
+    fn dirvec_find_pivot(&self, target: &sketchmotion_core::PivotTarget) -> Option<usize> {
+        self.document
+            .pivots
+            .iter()
+            .position(|p| p.completo() && &p.target == target)
+    }
+
+    /// Captura o ESTADO INICIAL do vetor `vi` no frame atual: geometria-base,
+    /// centro, e (se houver pivô associado) o eixo e o ângulo inicial.
+    fn dirvec_definir_inicio(&mut self, vi: usize) {
+        use sketchmotion_core::PivotTarget;
+        let target = match self.document.dir_vectors.get(vi) {
+            Some(v) => v.target.clone(),
+            None => return,
+        };
+        let pivot = self.dirvec_find_pivot(&target);
+        // start_angle é sempre 0 (base = geometria inicial); a rotação vem do
+        // arraste (acumulada em end_angle). O eixo, se houver pivô, é o centro.
+        let (has_p, axis) = match pivot {
+            Some(pi) => {
+                let p = &self.document.pivots[pi];
+                (true, p.axis)
+            }
+            None => (false, (0.0, 0.0)),
+        };
+        let cur = self.document.current;
+        match target {
+            PivotTarget::Group(g) => {
+                let base: Vec<_> = self
+                    .document
+                    .vectors
+                    .iter()
+                    .filter(|o| o.group == Some(g))
+                    .cloned()
+                    .collect();
+                if base.is_empty() {
+                    self.status = "Objeto do vetor não está neste frame.".into();
+                    return;
+                }
+                let centroid = self.dirvec_group_centroid(g).unwrap_or((0.0, 0.0));
+                // Seleciona a peça (feedback: o usuário vê com o que trabalha).
+                self.sel_set = (0..self.document.vectors.len())
+                    .filter(|&k| self.document.vectors[k].group == Some(g))
+                    .collect();
+                self.selected_obj = self.sel_set.first().copied();
+                let v = &mut self.document.dir_vectors[vi];
+                v.base_vectors = base;
+                v.base_image = None;
+                v.start_centroid = centroid;
+                v.start_angle = 0.0;
+                v.end_angle = 0.0;
+                v.has_pivot = has_p;
+                v.pivot_axis = axis;
+                v.start_frame = cur;
+                v.has_start = true;
+                v.has_end = false;
+            }
+            PivotTarget::Image(i) => {
+                let Some(o) = self.document.images.get(i).cloned() else {
+                    self.status = "Imagem do vetor não está neste frame.".into();
+                    return;
+                };
+                self.sel_set.clear();
+                self.selected_obj = None;
+                let v = &mut self.document.dir_vectors[vi];
+                v.start_centroid = (o.cx, o.cy);
+                v.base_image = Some(o);
+                v.base_image_index = i;
+                v.base_vectors = Vec::new();
+                v.start_angle = 0.0;
+                v.end_angle = 0.0;
+                v.has_pivot = has_p;
+                v.pivot_axis = axis;
+                v.start_frame = cur;
+                v.has_start = true;
+                v.has_end = false;
+            }
+            PivotTarget::None => {
+                self.status = "Vincule um objeto ao vetor primeiro.".into();
+                return;
+            }
+        }
+        // Força remontar a textura do fantasma (a base pode ter mudado).
+        self.dirvec_ghost_tex = None;
+        self.dirvec_ghost_tex_for = None;
+        self.modificado = true;
+        self.status = format!("Estado inicial fixado no frame {}.", cur + 1);
+    }
+
+    /// Captura o ESTADO FINAL do vetor `vi` no frame atual (posição/ângulo já
+    /// alterados pelo usuário).
+    fn dirvec_definir_fim(&mut self, vi: usize) {
+        use sketchmotion_core::PivotTarget;
+        let target = match self.document.dir_vectors.get(vi) {
+            Some(v) => v.target.clone(),
+            None => return,
+        };
+        let ang1 = match self.dirvec_find_pivot(&target) {
+            Some(pi) => self.document.pivots[pi].angulo(),
+            None => self
+                .document
+                .dir_vectors
+                .get(vi)
+                .map(|v| v.start_angle)
+                .unwrap_or(0.0),
+        };
+        let cur = self.document.current;
+        let centroid = match &target {
+            PivotTarget::Group(g) => self.dirvec_group_centroid(*g),
+            PivotTarget::Image(i) => self.document.images.get(*i).map(|o| (o.cx, o.cy)),
+            PivotTarget::None => None,
+        };
+        let Some(centroid) = centroid else {
+            self.status = "Objeto do vetor não está neste frame.".into();
+            return;
+        };
+        let v = &mut self.document.dir_vectors[vi];
+        v.end_centroid = centroid;
+        v.end_angle = ang1;
+        v.end_frame = cur;
+        v.has_end = true;
+        self.modificado = true;
+        self.status = format!("Estado final fixado no frame {}.", cur + 1);
+    }
+
+    /// Aplica a transformação interpolada de `dv` à geometria-base para o
+    /// parâmetro `t` (vetores).
+    fn dirvec_transformar_vetores(
+        base: &mut [sketchmotion_core::VectorObject],
+        dv: &sketchmotion_core::DirVector,
+        t: f32,
+    ) {
+        let s = dv.scale_start + (dv.scale_end - dv.scale_start) * t;
+        if dv.has_pivot {
+            let ang = (dv.end_angle - dv.start_angle) * t;
+            for o in base.iter_mut() {
+                o.rotate_around(dv.pivot_axis.0, dv.pivot_axis.1, ang);
+                if (s - 1.0).abs() > 1e-4 {
+                    o.scale_around(dv.pivot_axis.0, dv.pivot_axis.1, s);
+                }
+            }
+        } else {
+            let ang = (dv.end_angle - dv.start_angle) * t;
+            let (cx, cy) = dv.start_centroid;
+            let dx = (dv.end_centroid.0 - dv.start_centroid.0) * t;
+            let dy = (dv.end_centroid.1 - dv.start_centroid.1) * t;
+            for o in base.iter_mut() {
+                if ang.abs() > 1e-6 {
+                    o.rotate_around(cx, cy, ang);
+                }
+                if (s - 1.0).abs() > 1e-4 {
+                    o.scale_around(cx, cy, s);
+                }
+                o.translate(dx, dy);
+            }
+        }
+    }
+
+    /// Idem para um objeto de imagem.
+    fn dirvec_transformar_imagem(
+        base: &mut sketchmotion_core::ImageObject,
+        dv: &sketchmotion_core::DirVector,
+        t: f32,
+    ) {
+        let s = dv.scale_start + (dv.scale_end - dv.scale_start) * t;
+        if dv.has_pivot {
+            let ang = (dv.end_angle - dv.start_angle) * t;
+            let (sn, c) = ang.sin_cos();
+            let (dx, dy) = (base.cx - dv.pivot_axis.0, base.cy - dv.pivot_axis.1);
+            base.cx = dv.pivot_axis.0 + dx * c - dy * sn;
+            base.cy = dv.pivot_axis.1 + dx * sn + dy * c;
+            base.angle += ang;
+        } else {
+            let ang = (dv.end_angle - dv.start_angle) * t;
+            base.angle += ang;
+            base.cx += (dv.end_centroid.0 - dv.start_centroid.0) * t;
+            base.cy += (dv.end_centroid.1 - dv.start_centroid.1) * t;
+        }
+        if (s - 1.0).abs() > 1e-4 {
+            base.hw *= s;
+            base.hh *= s;
+        }
+    }
+
+    /// Gera (bake) os frames intermediários do vetor `vi` a partir do estado
+    /// inicial + final + interpolação. Não destrutivo na origem: regenera sempre
+    /// a partir da geometria-base guardada.
+    fn dirvec_aplicar(&mut self, vi: usize) {
+        use sketchmotion_core::PivotTarget;
+        let dv = match self.document.dir_vectors.get(vi) {
+            Some(v) if v.completo() => v.clone(),
+            _ => {
+                self.status = "Defina o estado inicial e o final (em frames diferentes).".into();
+                return;
+            }
+        };
+        self.push_undo();
+        self.document.sync_to_frames();
+        let (a, b) = dv.faixa();
+        let b = b.min(self.document.frames.len().saturating_sub(1));
+        for f in a..=b {
+            let t = dv.t_para_frame(f);
+            match &dv.target {
+                PivotTarget::Group(g) => {
+                    let mut base = dv.base_vectors.clone();
+                    Self::dirvec_transformar_vetores(&mut base, &dv, t);
+                    let mut fv = self.document.frame_vectors(f);
+                    fv.retain(|o| o.group != Some(*g));
+                    fv.extend(base);
+                    self.document.set_frame_vectors(f, fv);
+                }
+                PivotTarget::Image(_) => {
+                    if let Some(mut base) = dv.base_image.clone() {
+                        Self::dirvec_transformar_imagem(&mut base, &dv, t);
+                        let mut fi = self
+                            .document
+                            .frames
+                            .get(f)
+                            .map(|fr| fr.images.clone())
+                            .unwrap_or_default();
+                        let idx = dv.base_image_index;
+                        if idx < fi.len() {
+                            fi[idx] = base;
+                        } else {
+                            fi.push(base);
+                        }
+                        self.document.set_frame_images(f, fi);
+                    }
+                }
+                PivotTarget::None => {}
+            }
+        }
+        self.document.reload_working();
+        self.dirty = true;
+        self.modificado = true;
+        self.status = format!("Animação gerada nos frames {}–{}.", a + 1, b + 1);
+    }
+
+    /// Interação da ferramenta no canvas: durante a criação, clicar vincula o
+    /// objeto sob o cursor e fixa o estado inicial.
+    /// O alvo existe na cópia de trabalho (frame) atual?
+    fn dirvec_target_in_frame(&self, target: &sketchmotion_core::PivotTarget) -> bool {
+        use sketchmotion_core::PivotTarget;
+        match target {
+            PivotTarget::Group(g) => self.document.vectors.iter().any(|o| o.group == Some(*g)),
+            PivotTarget::Image(i) => *i < self.document.images.len(),
+            PivotTarget::None => false,
+        }
+    }
+
+    /// Mantém o estado do "fantasma": quando a ferramenta está ativa, há um vetor
+    /// com início definido, e o frame atual NÃO é o do início E o objeto não está
+    /// neste frame, prepara um fantasma (na posição inicial) para ser arrastado.
+    fn dirvec_tick_ghost(&mut self) {
+        if self.tool != Tool::DirVector {
+            self.dirvec_ghost_frame = None;
+            return;
+        }
+        let Some(vi) = self.dirvec_sel else {
+            self.dirvec_ghost_frame = None;
+            return;
+        };
+        let (has_start, start_frame, start_centroid, target) = {
+            match self.document.dir_vectors.get(vi) {
+                Some(v) => (v.has_start, v.start_frame, v.start_centroid, v.target.clone()),
+                None => {
+                    self.dirvec_ghost_frame = None;
+                    return;
+                }
+            }
+        };
+        let cur = self.document.current;
+        let present = self.dirvec_target_in_frame(&target);
+        if !has_start || cur == start_frame || present {
+            self.dirvec_ghost_frame = None;
+            return;
+        }
+        // Precisa de fantasma. Se acabou de mudar de frame (e não está no meio de
+        // um arraste), (re)posiciona-o no estado inicial.
+        if self.dirvec_ghost_frame != Some(cur) && !self.dirvec_ghost_drag {
+            self.dirvec_ghost_pos = start_centroid;
+            self.dirvec_ghost_ang = 0.0;
+            self.dirvec_ghost_frame = Some(cur);
+        }
+    }
+
+    /// Monta (uma vez) a textura do fantasma a partir da imagem-base do vetor,
+    /// para desenhar a própria peça em suspensão.
+    fn dirvec_prepara_ghost_tex(&mut self, ctx: &egui::Context) {
+        if self.dirvec_ghost_frame.is_none() {
+            return;
+        }
+        let Some(vi) = self.dirvec_sel else { return };
+        if self.dirvec_ghost_tex.is_some() && self.dirvec_ghost_tex_for == Some(vi) {
+            return;
+        }
+        let Some(v) = self.document.dir_vectors.get(vi) else {
+            return;
+        };
+        if let Some(im) = &v.base_image {
+            if im.ow > 0 && im.oh > 0 && im.pixels.len() == (im.ow * im.oh * 4) as usize {
+                let ci = egui::ColorImage::from_rgba_unmultiplied(
+                    [im.ow as usize, im.oh as usize],
+                    &im.pixels,
+                );
+                self.dirvec_ghost_tex =
+                    Some(ctx.load_texture(format!("dv_ghost_{vi}"), ci, egui::TextureOptions::LINEAR));
+                self.dirvec_ghost_tex_for = Some(vi);
+            }
+        } else {
+            self.dirvec_ghost_tex = None;
+            self.dirvec_ghost_tex_for = None;
+        }
+    }
+
+    /// O ponto (doc) está sobre o objeto do alvo, na cópia de trabalho atual?
+    fn dirvec_target_under_point(&self, target: &sketchmotion_core::PivotTarget, dp: (f32, f32)) -> bool {
+        use sketchmotion_core::PivotTarget;
+        match target {
+            PivotTarget::Group(g) => self.document.vectors.iter().any(|o| {
+                o.group == Some(*g)
+                    && o.bounds().map_or(false, |(a, b, c, d)| {
+                        dp.0 >= a - 2.0 && dp.0 <= c + 2.0 && dp.1 >= b - 2.0 && dp.1 <= d + 2.0
+                    })
+            }),
+            PivotTarget::Image(i) => {
+                if let Some(o) = self.document.images.get(*i) {
+                    let (s, c) = (-o.angle).sin_cos();
+                    let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
+                    let lx = rx * c - ry * s;
+                    let ly = rx * s + ry * c;
+                    lx.abs() <= o.hw && ly.abs() <= o.hh
+                } else {
+                    false
+                }
+            }
+            PivotTarget::None => false,
+        }
+    }
+
+    /// Translada o alvo na cópia de trabalho atual (arraste do Vetor de Direção).
+    fn dirvec_target_translate(&mut self, target: &sketchmotion_core::PivotTarget, dx: f32, dy: f32) {
+        use sketchmotion_core::PivotTarget;
+        match target {
+            PivotTarget::Group(g) => {
+                for o in self.document.vectors.iter_mut() {
+                    if o.group == Some(*g) {
+                        o.translate(dx, dy);
+                    }
+                }
+            }
+            PivotTarget::Image(i) => {
+                if let Some(o) = self.document.images.get_mut(*i) {
+                    o.cx += dx;
+                    o.cy += dy;
+                }
+            }
+            PivotTarget::None => {}
+        }
+    }
+
+    /// Rotaciona o alvo ao redor de um centro (arraste orbital com pivô).
+    fn dirvec_target_rotate(&mut self, target: &sketchmotion_core::PivotTarget, cx: f32, cy: f32, ang: f32) {
+        use sketchmotion_core::PivotTarget;
+        match target {
+            PivotTarget::Group(g) => {
+                for o in self.document.vectors.iter_mut() {
+                    if o.group == Some(*g) {
+                        o.rotate_around(cx, cy, ang);
+                    }
+                }
+            }
+            PivotTarget::Image(i) => {
+                if let Some(o) = self.document.images.get_mut(*i) {
+                    let (s, c) = ang.sin_cos();
+                    let (dx, dy) = (o.cx - cx, o.cy - cy);
+                    o.cx = cx + dx * c - dy * s;
+                    o.cy = cy + dx * s + dy * c;
+                    o.angle += ang;
+                }
+            }
+            PivotTarget::None => {}
+        }
+    }
+
+    /// Interação da ferramenta: manual e direta.
+    /// - Modo "vincular" (após criar/Selecionar objeto): o clique escolhe a peça,
+    ///   fixa o início no frame atual e a deixa selecionada.
+    /// - Depois: basta ARRASTAR o objeto (neste frame ou em outro). Ao soltar num
+    ///   frame diferente do início, o fim é gravado e a animação é gerada sozinha.
+    fn interacao_dirvec(
+        &mut self,
+        pressed: bool,
+        down: bool,
+        hover: Option<egui::Pos2>,
+        ppos: Option<egui::Pos2>,
+        pdelta: egui::Vec2,
+        rect: egui::Rect,
+        zoom: f32,
+    ) {
+        let to_doc = |p: egui::Pos2| ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+
+        // --- Modo FANTASMA: o objeto está "em suspensão" neste frame (ainda não
+        // existe aqui). Arrastar em qualquer ponto move o fantasma; ao soltar,
+        // grava o fim e gera a animação. ---
+        let ghost_ativo =
+            self.dirvec_stage == 0 && self.dirvec_ghost_frame == Some(self.document.current);
+        if ghost_ativo {
+            if pressed {
+                self.dirvec_ghost_drag = true;
+            }
+            if down && self.dirvec_ghost_drag {
+                if let Some(vi) = self.dirvec_sel {
+                    let (has_pivot, axis) = {
+                        let v = &self.document.dir_vectors[vi];
+                        (v.has_pivot, v.pivot_axis)
+                    };
+                    if has_pivot {
+                        if let Some(pp) = ppos {
+                            let cur = to_doc(pp);
+                            let prev = (cur.0 - pdelta.x / zoom, cur.1 - pdelta.y / zoom);
+                            let a0 = (prev.1 - axis.1).atan2(prev.0 - axis.0);
+                            let a1 = (cur.1 - axis.1).atan2(cur.0 - axis.0);
+                            let d = a1 - a0;
+                            if d.abs() > f32::EPSILON {
+                                self.dirvec_ghost_ang += d;
+                                self.dirty = true;
+                            }
+                        }
+                    } else {
+                        let (dx, dy) = (pdelta.x / zoom, pdelta.y / zoom);
+                        if dx != 0.0 || dy != 0.0 {
+                            self.dirvec_ghost_pos.0 += dx;
+                            self.dirvec_ghost_pos.1 += dy;
+                            self.dirty = true;
+                        }
+                    }
+                }
+            }
+            if !down && self.dirvec_ghost_drag {
+                self.dirvec_ghost_drag = false;
+                if let Some(vi) = self.dirvec_sel {
+                    let hp = self.document.dir_vectors[vi].has_pivot;
+                    let cur = self.document.current;
+                    {
+                        let v = &mut self.document.dir_vectors[vi];
+                        if hp {
+                            v.end_angle = self.dirvec_ghost_ang;
+                        } else {
+                            v.end_centroid = self.dirvec_ghost_pos;
+                        }
+                        v.end_frame = cur;
+                        v.has_end = true;
+                    }
+                    self.dirvec_aplicar(vi);
+                    self.dirvec_ghost_frame = None; // objeto agora existe aqui
+                }
+            }
+            return;
+        }
+
+        if pressed {
+            if let Some(p) = hover {
+                let dp = to_doc(p);
+                // Vincular o objeto (modo criação/Selecionar).
+                if self.dirvec_stage == 1 {
+                    if let Some(vi) = self.dirvec_sel {
+                        let target = self.pivot_hit_target(dp);
+                        if matches!(target, sketchmotion_core::PivotTarget::None) {
+                            self.status = "Clique sobre uma forma, imagem ou objeto vetorial (traço a lápis é pixel — use Formas ou importe imagem).".into();
+                        } else {
+                            self.document.dir_vectors[vi].target = target;
+                            self.dirvec_stage = 0;
+                            self.dirvec_definir_inicio(vi);
+                            self.status = "Objeto selecionado e início fixado aqui. Vá ao frame final e ARRASTE o objeto para a posição desejada.".into();
+                        }
+                    }
+                    return;
+                }
+                // Ocioso: começa a arrastar se clicou sobre o objeto do vetor.
+                if let Some(vi) = self.dirvec_sel {
+                    let target = self.document.dir_vectors[vi].target.clone();
+                    if self.document.dir_vectors[vi].has_start
+                        && self.dirvec_target_under_point(&target, dp)
+                    {
+                        self.dirvec_dragging = true;
+                        self.dirvec_drag_angle = 0.0;
+                        self.push_undo();
+                    }
+                }
+            }
+        }
+        if down && self.dirvec_dragging {
+            if let (Some(pp), Some(vi)) = (ppos, self.dirvec_sel) {
+                let (target, has_pivot, axis) = {
+                    let v = &self.document.dir_vectors[vi];
+                    (v.target.clone(), v.has_pivot, v.pivot_axis)
+                };
+                if has_pivot {
+                    // Arraste orbital: gira ao redor do eixo pelo ângulo varrido.
+                    let cur = to_doc(pp);
+                    let prev = (cur.0 - pdelta.x / zoom, cur.1 - pdelta.y / zoom);
+                    let a0 = (prev.1 - axis.1).atan2(prev.0 - axis.0);
+                    let a1 = (cur.1 - axis.1).atan2(cur.0 - axis.0);
+                    let delta = a1 - a0;
+                    if delta.abs() > f32::EPSILON {
+                        self.dirvec_target_rotate(&target, axis.0, axis.1, delta);
+                        self.dirvec_drag_angle += delta;
+                        self.dirty = true;
+                    }
+                } else {
+                    let (dx, dy) = (pdelta.x / zoom, pdelta.y / zoom);
+                    if dx != 0.0 || dy != 0.0 {
+                        self.dirvec_target_translate(&target, dx, dy);
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
+        if !down && self.dirvec_dragging {
+            self.dirvec_dragging = false;
+            if let Some(vi) = self.dirvec_sel {
+                let (sf, hp) = {
+                    let v = &self.document.dir_vectors[vi];
+                    (v.start_frame, v.has_pivot)
+                };
+                let cur = self.document.current;
+                if cur != sf {
+                    // Frame diferente do início = estado FINAL. Grava e gera tudo.
+                    if hp {
+                        let v = &mut self.document.dir_vectors[vi];
+                        v.end_angle = self.dirvec_drag_angle;
+                        v.end_frame = cur;
+                        v.has_end = true;
+                    } else {
+                        self.dirvec_definir_fim(vi);
+                    }
+                    self.dirvec_aplicar(vi);
+                } else {
+                    // Mesmo frame do início: apenas reposiciona o início.
+                    self.dirvec_definir_inicio(vi);
+                    self.status =
+                        "Início reposicionado. Vá a outro frame e arraste o objeto para o fim.".into();
+                }
+            }
+        }
+    }
+
+    /// Desenha a trajetória do vetor selecionado (linha reta ou arco orbital).
+    /// Apenas overlay de interface (não entra na exportação).
+    fn desenhar_dirvec(&self, ui: &mut egui::Ui, rect: egui::Rect, zoom: f32) {
+        let Some(vi) = self.dirvec_sel else { return };
+        let Some(dv) = self.document.dir_vectors.get(vi) else {
+            return;
+        };
+        if !dv.has_start {
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        let scr = |p: (f32, f32)| egui::pos2(rect.min.x + p.0 * zoom, rect.min.y + p.1 * zoom);
+        let verde = egui::Color32::from_rgb(0x3A, 0xC0, 0x50);
+        let ini = scr(dv.start_centroid);
+        if dv.has_pivot {
+            // Arco orbital ao redor do eixo, do ângulo inicial ao final.
+            let ax = scr(dv.pivot_axis);
+            let r = ((dv.start_centroid.0 - dv.pivot_axis.0).powi(2)
+                + (dv.start_centroid.1 - dv.pivot_axis.1).powi(2))
+            .sqrt();
+            painter.circle_stroke(ax, 4.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(30, 120, 255)));
+            if dv.has_end && r > 0.5 {
+                let steps = 32;
+                let mut prev = None;
+                for k in 0..=steps {
+                    let t = k as f32 / steps as f32;
+                    let ang = dv.start_angle + (dv.end_angle - dv.start_angle) * t;
+                    let pt = (
+                        dv.pivot_axis.0 + r * ang.cos(),
+                        dv.pivot_axis.1 + r * ang.sin(),
+                    );
+                    let sp = scr(pt);
+                    if let Some(pp) = prev {
+                        painter.line_segment([pp, sp], egui::Stroke::new(2.0, verde));
+                    }
+                    prev = Some(sp);
+                }
+            }
+        } else if dv.has_end {
+            let fim = scr(dv.end_centroid);
+            painter.line_segment([ini, fim], egui::Stroke::new(2.0, verde));
+            // Setinha no fim.
+            let dir = fim - ini;
+            let len = dir.length().max(1.0);
+            let d = dir / len;
+            let n = egui::vec2(-d.y, d.x);
+            painter.line_segment([fim, fim - d * 10.0 + n * 5.0], egui::Stroke::new(2.0, verde));
+            painter.line_segment([fim, fim - d * 10.0 - n * 5.0], egui::Stroke::new(2.0, verde));
+            painter.circle_filled(fim, 4.0, verde);
+        }
+        painter.circle_filled(ini, 4.0, egui::Color32::from_rgb(30, 120, 255));
+
+        // Fantasma: o objeto em suspensão neste frame, à espera do arraste.
+        if self.dirvec_ghost_frame == Some(self.document.current) {
+            let laranja = egui::Color32::from_rgb(255, 150, 40);
+            // Transforma a geometria-base para a posição/ângulo atuais do fantasma.
+            let (dx, dy) = (
+                self.dirvec_ghost_pos.0 - dv.start_centroid.0,
+                self.dirvec_ghost_pos.1 - dv.start_centroid.1,
+            );
+            let (sn, cs) = self.dirvec_ghost_ang.sin_cos();
+            let (ax, ay) = dv.pivot_axis;
+            let transf = |x: f32, y: f32| -> (f32, f32) {
+                if dv.has_pivot {
+                    let (rx, ry) = (x - ax, y - ay);
+                    (ax + rx * cs - ry * sn, ay + rx * sn + ry * cs)
+                } else {
+                    (x + dx, y + dy)
+                }
+            };
+            if !dv.base_vectors.is_empty() {
+                for o in &dv.base_vectors {
+                    let flat = o.flatten(20);
+                    if flat.len() >= 2 {
+                        let pts: Vec<egui::Pos2> =
+                            flat.iter().map(|&(x, y)| scr(transf(x, y))).collect();
+                        painter.add(egui::Shape::line(
+                            pts,
+                            egui::Stroke::new(2.0, laranja),
+                        ));
+                    }
+                }
+            } else if let Some(im) = &dv.base_image {
+                // Cantos da imagem no espaço do documento (respeitando o ângulo
+                // próprio da imagem) e depois a transformação do fantasma.
+                let (isn, ics) = im.angle.sin_cos();
+                let canto = |sx: f32, sy: f32| -> egui::Pos2 {
+                    let (lx, ly) = (sx * im.hw, sy * im.hh);
+                    let (wx, wy) = (im.cx + lx * ics - ly * isn, im.cy + lx * isn + ly * ics);
+                    scr(transf(wx, wy))
+                };
+                let c = [
+                    canto(-1.0, -1.0),
+                    canto(1.0, -1.0),
+                    canto(1.0, 1.0),
+                    canto(-1.0, 1.0),
+                ];
+                // Fantasma = a PRÓPRIA imagem, semitransparente (melhor base).
+                if let Some(tex) = &self.dirvec_ghost_tex {
+                    let tint = egui::Color32::from_white_alpha(160);
+                    let uv = [
+                        egui::pos2(0.0, 0.0),
+                        egui::pos2(1.0, 0.0),
+                        egui::pos2(1.0, 1.0),
+                        egui::pos2(0.0, 1.0),
+                    ];
+                    let mut mesh = egui::Mesh::with_texture(tex.id());
+                    for i in 0..4 {
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos: c[i],
+                            uv: uv[i],
+                            color: tint,
+                        });
+                    }
+                    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    painter.add(egui::Shape::mesh(mesh));
+                }
+                // Contorno laranja por cima (destaque de que é editável).
+                painter.add(egui::Shape::closed_line(
+                    c.to_vec(),
+                    egui::Stroke::new(1.5, laranja),
+                ));
+            }
+            let gc = scr(self.dirvec_ghost_pos);
+            painter.circle_filled(gc, 4.0, laranja);
+        }
+    }
+
+    /// Barra de opções (topo) da ferramenta Vetor de Direção.
+    fn opcoes_dirvec(&mut self, ui: &mut egui::Ui) {
+        if self.dirvec_stage == 1 {
+            ui.colored_label(
+                egui::Color32::from_rgb(0x3A, 0xC0, 0x50),
+                "Clique no objeto para vinculá-lo ao vetor.",
+            );
+        } else if let Some(v) = self.dirvec_sel.and_then(|i| self.document.dir_vectors.get(i)) {
+            ui.label(format!("Vetor ativo: \"{}\"", v.name));
+            ui.separator();
+            ui.weak("Use o painel para definir início/fim e aplicar.");
+        } else {
+            ui.weak("Abra o painel Vetor de Direção (ícone à direita) para criar um vetor.");
+        }
+    }
+
+    /// Painel de gerenciamento dos vetores de direção.
+    fn janela_dirvec(&mut self, ctx: &egui::Context) {
+        if !self.win_dirvec {
+            return;
+        }
+        let mut open = self.win_dirvec;
+        let mut do_criar = false;
+        let mut do_vincular = false;
+        let mut do_aplicar = false;
+        let mut do_excluir = false;
+        egui::Window::new("Vetor de Direção")
+            .open(&mut open)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                if self.dirvec_naming {
+                    ui.label("Nome do vetor:");
+                    let resp = ui.text_edit_singleline(&mut self.dirvec_name_buf);
+                    resp.request_focus();
+                    ui.horizontal(|ui| {
+                        let ok = ui.button("Confirmar").clicked()
+                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        if ok {
+                            do_criar = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            self.dirvec_naming = false;
+                            self.dirvec_name_buf.clear();
+                        }
+                    });
+                } else if ui.button("＋ Adicionar novo vetor").clicked() {
+                    self.dirvec_naming = true;
+                    self.dirvec_name_buf =
+                        format!("Vetor {}", self.document.dir_vectors.len() + 1);
+                }
+                ui.separator();
+                ui.label("Vetores existentes:");
+                egui::ScrollArea::vertical()
+                    .max_height(140.0)
+                    .show(ui, |ui| {
+                        if self.document.dir_vectors.is_empty() {
+                            ui.weak("(nenhum ainda)");
+                        }
+                        for i in 0..self.document.dir_vectors.len() {
+                            let (nome, on, completo) = {
+                                let v = &self.document.dir_vectors[i];
+                                (v.name.clone(), v.enabled, v.completo())
+                            };
+                            ui.horizontal(|ui| {
+                                let sel = self.dirvec_sel == Some(i);
+                                let rot = if completo {
+                                    format!("● {nome}")
+                                } else {
+                                    format!("○ {nome}")
+                                };
+                                if ui.selectable_label(sel, rot).clicked() {
+                                    self.dirvec_sel = Some(i);
+                                }
+                                let mut en = on;
+                                if ui.checkbox(&mut en, "").changed() {
+                                    self.document.dir_vectors[i].enabled = en;
+                                }
+                            });
+                        }
+                    });
+                ui.separator();
+                if self.dirvec_sel.map_or(false, |i| i >= self.document.dir_vectors.len()) {
+                    self.dirvec_sel = None;
+                }
+                if let Some(vi) = self.dirvec_sel {
+                    let (sf, ef, hs, he, hp) = {
+                        let v = &self.document.dir_vectors[vi];
+                        (v.start_frame, v.end_frame, v.has_start, v.has_end, v.has_pivot)
+                    };
+                    // Passo a passo, manual e direto.
+                    if !hs {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x3A, 0xC0, 0x50),
+                            "1) Clique em \"Selecionar objeto\" e clique na peça.",
+                        );
+                    } else if !he {
+                        ui.label(format!("Início: frame {} ✓", sf + 1));
+                        ui.weak("2) Vá a outro frame e ARRASTE o objeto para o fim.");
+                    } else {
+                        ui.label(format!("Início: frame {}  →  Fim: frame {} ✓", sf + 1, ef + 1));
+                        ui.weak("Animação gerada. Arraste de novo para ajustar o fim.");
+                    }
+                    if hp {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(30, 120, 255),
+                            "Tem pivô: o arraste gira ao redor do eixo.",
+                        );
+                    }
+                    ui.add_space(4.0);
+                    if ui.button("🎯 Selecionar objeto").clicked() {
+                        do_vincular = true;
+                    }
+                    ui.separator();
+                    {
+                        let v = &mut self.document.dir_vectors[vi];
+                        egui::ComboBox::from_label("Suavização")
+                            .selected_text(v.interp.label())
+                            .show_ui(ui, |ui| {
+                                for it in sketchmotion_core::Interp::all() {
+                                    ui.selectable_value(&mut v.interp, it, it.label());
+                                }
+                            });
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(hs && he, egui::Button::new("Recalcular"))
+                            .clicked()
+                        {
+                            do_aplicar = true;
+                        }
+                        if ui.button("Excluir").clicked() {
+                            do_excluir = true;
+                        }
+                    });
+                } else {
+                    ui.weak("Crie um vetor com \"＋ Adicionar novo vetor\".");
+                }
+            });
+        // Ações fora do closure.
+        if do_criar {
+            let nome = if self.dirvec_name_buf.trim().is_empty() {
+                format!("Vetor {}", self.document.dir_vectors.len() + 1)
+            } else {
+                self.dirvec_name_buf.trim().to_string()
+            };
+            self.document
+                .dir_vectors
+                .push(sketchmotion_core::DirVector::new(nome));
+            self.dirvec_sel = Some(self.document.dir_vectors.len() - 1);
+            self.dirvec_naming = false;
+            self.dirvec_name_buf.clear();
+            self.dirvec_stage = 1;
+            self.tool = Tool::DirVector;
+            self.modificado = true;
+            self.status = "Clique no objeto para vinculá-lo ao vetor.".into();
+        }
+        if do_vincular {
+            self.dirvec_stage = 1;
+            self.tool = Tool::DirVector;
+            self.status = "Clique na peça que você quer animar.".into();
+        }
+        if do_aplicar {
+            if let Some(vi) = self.dirvec_sel {
+                self.dirvec_aplicar(vi);
+            }
+        }
+        if do_excluir {
+            if let Some(vi) = self.dirvec_sel {
+                if vi < self.document.dir_vectors.len() {
+                    self.document.dir_vectors.remove(vi);
+                    self.dirvec_sel = None;
+                    self.dirvec_stage = 0;
+                    self.modificado = true;
+                    self.status = "Vetor de direção excluído (o objeto foi mantido).".into();
+                }
+            }
+        }
+        self.win_dirvec = open;
     }
 
     /// Janela de controle da câmera: campos numéricos, keyframes e Reset.
@@ -9898,6 +10834,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_camera(ctx);
         self.janela_trace(ctx);
         self.janela_pivo(ctx);
+        self.janela_dirvec(ctx);
         self.trace_poll(ctx);
         self.ensure_piece_textures(ctx);
         self.ensure_part_textures(ctx);
@@ -10177,6 +11114,12 @@ impl eframe::App for SketchMotionApp {
                     // Pivô: pontos azul (eixo) e laranja (movimentação).
                     if self.tool == Tool::Pivot || self.win_pivot {
                         self.desenhar_pivos(ui, rect, zoom);
+                    }
+                    // Vetor de Direção: trajetória (linha reta ou arco orbital).
+                    if self.tool == Tool::DirVector || self.win_dirvec {
+                        self.dirvec_tick_ghost();
+                        self.dirvec_prepara_ghost_tex(ui.ctx());
+                        self.desenhar_dirvec(ui, rect, zoom);
                     }
                     let pressed = pressed && !self.win_prancheta;
                     let down = down && !self.win_prancheta;
@@ -10573,6 +11516,9 @@ impl eframe::App for SketchMotionApp {
                         self.last_pos = None;
                     } else if self.tool == Tool::Pivot {
                         self.interacao_pivo(pressed, down, hover, ppos, pdelta, rect, zoom);
+                        self.last_pos = None;
+                    } else if self.tool == Tool::DirVector {
+                        self.interacao_dirvec(pressed, down, hover, ppos, pdelta, rect, zoom);
                         self.last_pos = None;
                     } else if self.tool == Tool::Rig {
                         if let Some(si) = self.rig_active_index() {
@@ -11209,6 +12155,13 @@ impl eframe::App for SketchMotionApp {
         if self.pieces_dirty {
             self.salvar_pecas();
             self.pieces_dirty = false;
+        }
+        // Se algo mudou o desenho neste frame (ex.: mover/soltar um objeto), a
+        // textura do canvas só é refeita no topo do PRÓXIMO update(). Sem um
+        // novo frame, a posição antiga fica "presa" na tela até o próximo evento
+        // (aquele fantasma/delay). Pedir repaint garante a atualização imediata.
+        if self.dirty {
+            ctx.request_repaint();
         }
     }
 }

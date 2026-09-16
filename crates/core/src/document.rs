@@ -7,6 +7,7 @@ use crate::camera::Camera;
 use crate::color::Color;
 use crate::frame::Frame;
 use crate::image_object::ImageObject;
+use crate::dirvector::DirVector;
 use crate::layer::Layer;
 use crate::pivot::Pivot;
 use crate::skeleton::Skeleton;
@@ -60,6 +61,9 @@ pub struct Document {
     /// Propriedade estrutural do documento; persiste entre frames.
     #[serde(default)]
     pub pivots: Vec<Pivot>,
+    /// Vetores de direção (animação automática por interpolação entre frames).
+    #[serde(default)]
+    pub dir_vectors: Vec<DirVector>,
 }
 
 /// Uma timeline (faixa) de animação: lista própria de frames, FPS e
@@ -104,6 +108,7 @@ impl Document {
             onion_between: false,
             camera: Camera::new(width, height),
             pivots: Vec::new(),
+            dir_vectors: Vec::new(),
         };
         doc.add_layer("Camada 1");
         doc.frames = vec![Frame {
@@ -192,6 +197,38 @@ impl Document {
             self.tracks[self.active_track].current = self.current;
             self.tracks[self.active_track].fps = self.fps;
         }
+    }
+
+    /// Substitui os vetores de um frame específico (usado pelo bake do Vetor de
+    /// Direção). Não mexe na cópia de trabalho.
+    pub fn set_frame_vectors(&mut self, f: usize, vectors: Vec<VectorObject>) {
+        if f < self.frames.len() {
+            self.frames[f].vectors = vectors;
+        }
+    }
+
+    /// Substitui as imagens de um frame específico.
+    pub fn set_frame_images(&mut self, f: usize, images: Vec<ImageObject>) {
+        if f < self.frames.len() {
+            self.frames[f].images = images;
+        }
+    }
+
+    /// Clona os vetores de um frame específico (para ler o estado sem alterá-lo).
+    pub fn frame_vectors(&self, f: usize) -> Vec<VectorObject> {
+        self.frames.get(f).map(|fr| fr.vectors.clone()).unwrap_or_default()
+    }
+
+    /// Recarrega a cópia de trabalho a partir do frame atual e espelha na faixa.
+    /// Chamar após editar `frames[..]` diretamente (ex.: bake).
+    pub fn reload_working(&mut self) {
+        let c = self.current;
+        if c < self.frames.len() {
+            self.layers = self.frames[c].layers.clone();
+            self.vectors = self.frames[c].vectors.clone();
+            self.images = self.frames[c].images.clone();
+        }
+        self.mirror_to_track();
     }
 
     /// Grava a cópia de trabalho no frame atual.

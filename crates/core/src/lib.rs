@@ -6,6 +6,7 @@
 
 mod camera;
 mod color;
+mod dirvector;
 mod document;
 mod frame;
 mod image_object;
@@ -17,6 +18,7 @@ mod vector;
 
 pub use camera::{Camera, CameraKeyframe, CameraState, Interp};
 pub use color::Color;
+pub use dirvector::DirVector;
 pub use document::Document;
 pub use frame::Frame;
 pub use image_object::ImageObject;
