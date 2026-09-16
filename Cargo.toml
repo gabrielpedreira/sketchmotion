@@ -14,6 +14,7 @@ members = [
     "crates/color",
     "crates/brush",
     "crates/io",
+    "crates/trace",
     "crates/app",
 ]
 

@@ -3117,6 +3117,7 @@ dependencies = [
  "sketchmotion-io",
  "sketchmotion-render",
  "sketchmotion-tools",
+ "sketchmotion-trace",
 ]
 
 [[package]]
@@ -3175,6 +3176,10 @@ version = "0.1.0"
 dependencies = [
  "sketchmotion-core",
 ]
+
+[[package]]
+name = "sketchmotion-trace"
+version = "0.1.0"
 
 [[package]]
 name = "skia-bindings"
