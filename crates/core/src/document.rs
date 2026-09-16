@@ -3,6 +3,7 @@
 //! É a raiz do modelo — a "fonte única da verdade" da arquitetura. Toda
 //! alteração no desenho acontece aqui; render e io apenas leem este estado.
 
+use crate::camera::Camera;
 use crate::color::Color;
 use crate::frame::Frame;
 use crate::image_object::ImageObject;
@@ -50,6 +51,10 @@ pub struct Document {
     /// translúcida (para usar uma como rascunho e outra como arte final).
     #[serde(default)]
     pub onion_between: bool,
+    /// Câmera animada por keyframes (entidade independente da timeline de
+    /// desenho). Enquadra a composição final; não transforma os objetos.
+    #[serde(default)]
+    pub camera: Camera,
 }
 
 /// Uma timeline (faixa) de animação: lista própria de frames, FPS e
@@ -92,6 +97,7 @@ impl Document {
             tracks: Vec::new(),
             active_track: 0,
             onion_between: false,
+            camera: Camera::new(width, height),
         };
         doc.add_layer("Camada 1");
         doc.frames = vec![Frame {
@@ -148,6 +154,7 @@ impl Document {
         if self.active_track >= self.tracks.len() {
             self.active_track = 0;
         }
+        self.camera.ensure(self.width, self.height);
         self.load_active_track_mirror();
     }
 
@@ -245,6 +252,9 @@ impl Document {
         }
         self.width = w;
         self.height = h;
+        // Atualiza a base da câmera (para o Reset/zoom 100% seguir o novo papel).
+        self.camera.base_w = w as f32;
+        self.camera.base_h = h as f32;
         self.load_active_track_mirror();
     }
 

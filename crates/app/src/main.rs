@@ -10,7 +10,8 @@
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{
-    Anchor, Color, Document, Frame, ImageObject, Layer, PieceLibrary, VectorObject,
+    Anchor, CameraKeyframe, Color, Document, Frame, ImageObject, Interp, Layer, PieceLibrary,
+    VectorObject,
 };
 use sketchmotion_render::{rasterize_images, render_frame_alpha, render_layers_alpha, PixelImage};
 use sketchmotion_tools::Tool;
@@ -1182,6 +1183,10 @@ struct SketchMotionApp {
     timeline_hidden: bool,
     /// Altura (px) da área de timeline; arrastável pela alça superior.
     timeline_h: f32,
+    // Câmera: janela de controle do enquadramento animado por keyframes.
+    win_camera: bool,
+    /// Interpolação padrão ao criar novos keyframes de câmera.
+    cam_interp: Interp,
     // Prancheta: redimensionar o papel (canvas) sem mexer no desenho.
     win_prancheta: bool,
     pr_w: u32,
@@ -1206,6 +1211,8 @@ struct SketchMotionApp {
     play_accum: f32,
     play_loop: bool,
     play_done: bool,
+    /// Na reprodução, mostrar já enquadrado pela câmera (keyframes animados).
+    play_camera: bool,
     play_tex: Option<egui::TextureHandle>,
 }
 
@@ -1355,6 +1362,8 @@ impl SketchMotionApp {
             workspace_pad: 0.9,
             timeline_hidden: false,
             timeline_h: 260.0,
+            win_camera: false,
+            cam_interp: Interp::Linear,
             win_prancheta: false,
             pr_w: CANVAS_W,
             pr_h: CANVAS_H,
@@ -1372,6 +1381,7 @@ impl SketchMotionApp {
             play_accum: 0.0,
             play_loop: true,
             play_done: false,
+            play_camera: true,
             play_tex: None,
         }
     }
@@ -3619,25 +3629,31 @@ impl SketchMotionApp {
         }
         ctx.request_repaint();
         let pf = self.play_frame.min(n.saturating_sub(1));
-        let ci = if both {
-            let rgba = self.compose_tracks_at(pf);
-            egui::ColorImage::from_rgba_unmultiplied(
-                [self.document.width as usize, self.document.height as usize],
-                &rgba,
-            )
+        let dw = self.document.width;
+        let dh = self.document.height;
+        // Composição do frame (todas as camadas/vetores/imagens).
+        let base_rgba = if both {
+            self.compose_tracks_at(pf)
         } else {
-            let img = render_frame_alpha(
-                self.document.width,
-                self.document.height,
+            render_frame_alpha(
+                dw,
+                dh,
                 &self.document.frames[pf].layers,
                 &self.document.frames[pf].vectors,
                 &self.document.frames[pf].images,
-            );
-            egui::ColorImage::from_rgba_unmultiplied(
-                [img.width as usize, img.height as usize],
-                &img.rgba,
             )
+            .rgba
         };
+        // Enquadramento da câmera (keyframes animados): aplica na reprodução.
+        let final_rgba = if self.play_camera {
+            self.aplicar_camera_rgba(&base_rgba, dw, dh, pf)
+        } else {
+            base_rgba
+        };
+        let ci = egui::ColorImage::from_rgba_unmultiplied(
+            [dw as usize, dh as usize],
+            &final_rgba,
+        );
         match &mut self.play_tex {
             Some(t) => t.set(ci, egui::TextureOptions::NEAREST),
             None => {
@@ -3652,6 +3668,9 @@ impl SketchMotionApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.play_loop, "Em loop")
                         .on_hover_text("Ligado: repete ao terminar. Desligado: roda uma vez e para.");
+                    ui.separator();
+                    ui.checkbox(&mut self.play_camera, "Ver pela câmera")
+                        .on_hover_text("Mostra a animação já enquadrada pela câmera (keyframes).");
                     ui.separator();
                     if ui.button("Reiniciar").clicked() {
                         self.play_frame = 0;
@@ -4552,6 +4571,7 @@ impl SketchMotionApp {
                         Tool::Fill => self.opcoes_balde(ui),
                         Tool::Rig => self.opcoes_rig(ui),
                         Tool::Grupo => self.opcoes_objetos(ui),
+                        Tool::Camera => self.opcoes_camera(ui),
                     }
                 }
             });
@@ -5063,6 +5083,17 @@ impl SketchMotionApp {
                             self.prancheta_preview = None;
                         }
                     }
+                    ui.add_space(6.0);
+
+                    let resp_cam = icon_button(ui, self.win_camera, icon::SELECTION)
+                        .on_hover_text("Câmera — enquadramento animado por keyframes");
+                    if resp_cam.clicked() {
+                        self.win_camera = !self.win_camera;
+                        if self.win_camera {
+                            self.tool = Tool::Camera;
+                            self.eyedropper = Eyedropper::Off;
+                        }
+                    }
                 });
             });
     }
@@ -5165,6 +5196,309 @@ impl SketchMotionApp {
             self.prancheta_drag = None;
             self.prancheta_preview = None;
         }
+    }
+
+    /// Painel da ferramenta Câmera na barra de opções do topo (atalhos rápidos).
+    fn opcoes_camera(&mut self, ui: &mut egui::Ui) {
+        ui.weak("Enquadramento animado por keyframes (retângulo azul).");
+        ui.separator();
+        if ui.button("Abrir controles da câmera").clicked() {
+            self.win_camera = true;
+        }
+        ui.separator();
+        let cur = self.document.current;
+        let has = self.document.camera.keyframe_index(cur).is_some();
+        if ui
+            .button(if has {
+                "Atualizar keyframe aqui"
+            } else {
+                "Criar keyframe aqui"
+            })
+            .on_hover_text("Fixa o enquadramento atual como keyframe no frame corrente")
+            .clicked()
+        {
+            self.camera_keyframe_atual();
+        }
+    }
+
+    /// Cria/atualiza um keyframe de câmera no frame atual com o estado amostrado.
+    fn camera_keyframe_atual(&mut self) {
+        let cur = self.document.current;
+        let s = self.document.camera.sample(cur);
+        self.document.camera.set_keyframe(CameraKeyframe {
+            frame: cur,
+            x: s.x,
+            y: s.y,
+            w: s.w,
+            h: s.h,
+            rotation: s.rotation,
+            anchor_x: s.anchor_x,
+            anchor_y: s.anchor_y,
+            interp: self.cam_interp,
+        });
+        self.dirty = true;
+        self.status = format!("Keyframe de câmera criado no frame {}", cur + 1);
+    }
+
+    /// Janela de controle da câmera: campos numéricos, keyframes e Reset.
+    fn janela_camera(&mut self, ctx: &egui::Context) {
+        let mut open = self.win_camera;
+        let cur = self.document.current;
+        let bw = self.document.camera.base_w.max(1.0);
+        let bh = self.document.camera.base_h.max(1.0);
+        let mut do_remove = false;
+        let mut do_reset = false;
+        let mut do_add = false;
+        let mut goto: Option<usize> = None;
+        let verde = egui::Color32::from_rgb(0x3A, 0xC0, 0x50);
+        egui::Window::new("Câmera — enquadramento")
+            .open(&mut open)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.label(format!("Frame atual: {}", cur + 1));
+                let has_idx = self.document.camera.keyframe_index(cur);
+                if has_idx.is_some() {
+                    ui.colored_label(verde, "● keyframe neste frame");
+                } else {
+                    ui.weak("mexa em qualquer valor para criar um keyframe aqui");
+                }
+                ui.separator();
+
+                {
+                    // Auto-keyframe: mexer em QUALQUER valor cria/atualiza o
+                    // keyframe deste frame (sem botão extra). Sem keyframe aqui,
+                    // parte do valor interpolado atual.
+                    let mut k = match has_idx {
+                        Some(i) => self.document.camera.keyframes[i],
+                        None => {
+                            let s = self.document.camera.sample(cur);
+                            CameraKeyframe {
+                                frame: cur,
+                                x: s.x,
+                                y: s.y,
+                                w: s.w,
+                                h: s.h,
+                                rotation: s.rotation,
+                                anchor_x: s.anchor_x,
+                                anchor_y: s.anchor_y,
+                                interp: self.cam_interp,
+                            }
+                        }
+                    };
+                    let mut changed = false;
+                    egui::Grid::new("cam_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("Position X");
+                            changed |= ui.add(egui::DragValue::new(&mut k.x).speed(1.0)).changed();
+                            ui.end_row();
+                            ui.label("Position Y");
+                            changed |= ui.add(egui::DragValue::new(&mut k.y).speed(1.0)).changed();
+                            ui.end_row();
+                            ui.label("Zoom");
+                            let mut zoom = (bw / k.w.max(1.0)) * 100.0;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut zoom)
+                                        .speed(1.0)
+                                        .range(5.0..=2000.0)
+                                        .suffix(" %"),
+                                )
+                                .changed()
+                            {
+                                let z = (zoom / 100.0).max(0.01);
+                                k.w = bw / z;
+                                k.h = bh / z;
+                                changed = true;
+                            }
+                            ui.end_row();
+                            ui.label("Rotation");
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut k.rotation).speed(1.0).suffix(" °"))
+                                .changed();
+                            ui.end_row();
+                            ui.label("Largura");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut k.w)
+                                        .speed(1.0)
+                                        .range(1.0..=20000.0),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.label("Altura");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut k.h)
+                                        .speed(1.0)
+                                        .range(1.0..=20000.0),
+                                )
+                                .changed();
+                            ui.end_row();
+                            ui.label("Âncora X");
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut k.anchor_x).speed(1.0))
+                                .changed();
+                            ui.end_row();
+                            ui.label("Âncora Y");
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut k.anchor_y).speed(1.0))
+                                .changed();
+                            ui.end_row();
+                            ui.label("Interpolação");
+                            egui::ComboBox::from_id_salt("cam_interp")
+                                .selected_text(k.interp.label())
+                                .show_ui(ui, |ui| {
+                                    for it in Interp::all() {
+                                        if ui
+                                            .selectable_value(&mut k.interp, it, it.label())
+                                            .clicked()
+                                        {
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+                        });
+                    if changed {
+                        k.frame = cur;
+                        self.cam_interp = k.interp;
+                        self.document.camera.set_keyframe(k);
+                        self.dirty = true;
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if has_idx.is_some() {
+                        if ui.button("Remover keyframe").clicked() {
+                            do_remove = true;
+                        }
+                    } else if ui
+                        .button("Fixar keyframe aqui")
+                        .on_hover_text("Cria um keyframe com o enquadramento atual, sem alterar valores")
+                        .clicked()
+                    {
+                        do_add = true;
+                    }
+                    if ui.button("Reset Camera").clicked() {
+                        do_reset = true;
+                    }
+                });
+
+                ui.separator();
+                let n = self.document.camera.keyframes.len();
+                ui.label(format!("Keyframes ({n}) — clique para ir ao frame:"));
+                let frames: Vec<usize> =
+                    self.document.camera.keyframes.iter().map(|k| k.frame + 1).collect();
+                ui.horizontal_wrapped(|ui| {
+                    for f in frames {
+                        let atual = f == cur + 1;
+                        if ui.selectable_label(atual, format!("f{f}")).clicked() {
+                            goto = Some(f - 1);
+                        }
+                    }
+                });
+                ui.weak(
+                    "Como usar: num frame, mexa nos valores (ex.: Zoom) — vira keyframe. \
+                     Vá para outro frame e mude de novo — o movimento entre eles é \
+                     interpolado sozinho. Rode a animação com 'Ver pela câmera' ligado.",
+                );
+            });
+        if let Some(g) = goto {
+            self.document.go_to_frame(g);
+            self.dirty = true;
+        }
+        if do_add {
+            self.camera_keyframe_atual();
+        }
+        if do_remove {
+            self.document.camera.remove_keyframe(cur);
+            self.dirty = true;
+            self.status = "Keyframe de câmera removido".into();
+        }
+        if do_reset {
+            let (w, h) = (self.document.width, self.document.height);
+            self.document.camera.reset(w, h);
+            self.dirty = true;
+            self.status = "Câmera resetada (enquadramento = canvas)".into();
+        }
+        self.win_camera = open;
+    }
+
+    /// Desenha o retângulo azul da câmera (estado amostrado no frame atual).
+    fn desenhar_camera(&self, ui: &mut egui::Ui, rect: egui::Rect, zoom: f32) {
+        let s = self.document.camera.sample(self.document.current);
+        let painter = ui.painter_at(rect);
+        let blue = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
+        let ang = s.rotation.to_radians();
+        let (sin, cos) = ang.sin_cos();
+        let (hw, hh) = (s.w * 0.5, s.h * 0.5);
+        let corner = |sx: f32, sy: f32| {
+            let (lx, ly) = (sx * hw, sy * hh);
+            let dx = s.x + lx * cos - ly * sin;
+            let dy = s.y + lx * sin + ly * cos;
+            egui::pos2(rect.min.x + dx * zoom, rect.min.y + dy * zoom)
+        };
+        let c = [
+            corner(-1.0, -1.0),
+            corner(1.0, -1.0),
+            corner(1.0, 1.0),
+            corner(-1.0, 1.0),
+        ];
+        for i in 0..4 {
+            painter.line_segment(
+                [c[i], c[(i + 1) % 4]],
+                egui::Stroke::new(2.0_f32, blue),
+            );
+        }
+        for p in c {
+            let hr = egui::Rect::from_center_size(p, egui::vec2(8.0, 8.0));
+            painter.rect_filled(hr, 1.0, egui::Color32::WHITE);
+            painter.rect_stroke(hr, 1.0, egui::Stroke::new(1.0_f32, blue));
+        }
+        // Marcador do pivô/âncora (offset a partir do centro).
+        let piv = egui::pos2(
+            rect.min.x + (s.x + s.anchor_x) * zoom,
+            rect.min.y + (s.y + s.anchor_y) * zoom,
+        );
+        painter.circle_stroke(piv, 5.0, egui::Stroke::new(1.5_f32, blue));
+    }
+
+    /// Aplica o enquadramento da câmera (no frame `pf`) sobre a composição
+    /// `full` (tamanho do documento), devolvendo um RGBA do MESMO tamanho já
+    /// "visto pela câmera": a região do retângulo azul preenche a saída, com
+    /// zoom/pan/rotação. Não altera os dados originais — só a visualização.
+    fn aplicar_camera_rgba(&self, full: &[u8], dw: u32, dh: u32, pf: usize) -> Vec<u8> {
+        let s = self.document.camera.sample(pf);
+        let (ow, oh) = (dw as usize, dh as usize);
+        let mut out = vec![0u8; ow * oh * 4];
+        if full.len() < ow * oh * 4 {
+            return out;
+        }
+        let ang = s.rotation.to_radians();
+        let (sin, cos) = ang.sin_cos();
+        for oy in 0..oh {
+            for ox in 0..ow {
+                // Ponto normalizado (centro-base) dentro do retângulo da câmera.
+                let u = (ox as f32 + 0.5) / ow as f32 - 0.5;
+                let v = (oy as f32 + 0.5) / oh as f32 - 0.5;
+                let lx = u * s.w;
+                let ly = v * s.h;
+                // Roda pelo ângulo da câmera e soma o centro → coord. do documento.
+                let dx = s.x + lx * cos - ly * sin;
+                let dy = s.y + lx * sin + ly * cos;
+                let sx = dx.floor() as i32;
+                let sy = dy.floor() as i32;
+                let di = (oy * ow + ox) * 4;
+                if sx >= 0 && sy >= 0 && (sx as u32) < dw && (sy as u32) < dh {
+                    let si = ((sy as u32 * dw + sx as u32) * 4) as usize;
+                    out[di..di + 4].copy_from_slice(&full[si..si + 4]);
+                }
+            }
+        }
+        out
     }
 
     /// Desenha as alças de redimensionamento ao redor do canvas e trata o
@@ -7153,6 +7487,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_objetos(ctx);
         self.janela_editar_peca(ctx);
         self.janela_prancheta(ctx);
+        self.janela_camera(ctx);
         self.ensure_piece_textures(ctx);
         self.ensure_part_textures(ctx);
         // Rodapé (fica no fundo, criado antes da timeline).
@@ -7367,6 +7702,10 @@ impl eframe::App for SketchMotionApp {
                     // Prancheta aberta: mostra as alças e suspende o desenho normal.
                     if self.win_prancheta {
                         self.prancheta_handles(ui, rect, zoom);
+                    }
+                    // Câmera: retângulo azul do enquadramento (janela aberta ou ferramenta ativa).
+                    if self.win_camera || self.tool == Tool::Camera {
+                        self.desenhar_camera(ui, rect, zoom);
                     }
                     let pressed = pressed && !self.win_prancheta;
                     let down = down && !self.win_prancheta;

@@ -33,6 +33,8 @@ pub enum Tool {
     Rig,
     /// Objetos — laço para agrupar/salvar peças e reutilizá-las (colar).
     Grupo,
+    /// Câmera — enquadramento animado por keyframes (retângulo azul).
+    Camera,
 }
 
 impl Tool {
@@ -63,6 +65,7 @@ impl Tool {
             Tool::Eraser => "Borracha",
             Tool::Rig => "Rig",
             Tool::Grupo => "Objetos",
+            Tool::Camera => "Câmera",
         }
     }
 }

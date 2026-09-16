@@ -4,6 +4,7 @@
 //! sem histórico/undo (v0.2), frames (v0.3) ou rig (v0.5). Não depende de
 //! nenhum outro crate do workspace, então pode ser testado sem abrir janela.
 
+mod camera;
 mod color;
 mod document;
 mod frame;
@@ -13,6 +14,7 @@ mod piece;
 mod skeleton;
 mod vector;
 
+pub use camera::{Camera, CameraKeyframe, CameraState, Interp};
 pub use color::Color;
 pub use document::Document;
 pub use frame::Frame;
