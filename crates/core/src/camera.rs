@@ -74,7 +74,7 @@ fn default_interp() -> Interp {
 }
 
 /// Um keyframe da câmera, atrelado a um frame da timeline.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct CameraKeyframe {
     /// Frame (índice na timeline) a que este keyframe está atrelado.
     pub frame: usize,

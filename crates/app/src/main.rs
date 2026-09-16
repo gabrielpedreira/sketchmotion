@@ -1187,6 +1187,17 @@ struct SketchMotionApp {
     win_camera: bool,
     /// Interpolação padrão ao criar novos keyframes de câmera.
     cam_interp: Interp,
+    /// Manipulação direta do retângulo: 0 nada, 1 mover, 2 redimensionar,
+    /// 3 rotacionar, 4 pivô.
+    cam_act: u8,
+    /// Canto sendo arrastado (0 TL, 1 TR, 2 BR, 3 BL) quando cam_act == 2.
+    cam_h: usize,
+    /// Estado do keyframe no início do arrasto (referência).
+    cam_orig: CameraKeyframe,
+    /// Offset (doc) do ponteiro em relação ao centro, para mover.
+    cam_grab: (f32, f32),
+    /// Ângulo inicial do ponteiro (rad) para rotacionar.
+    cam_start_ang: f32,
     // Prancheta: redimensionar o papel (canvas) sem mexer no desenho.
     win_prancheta: bool,
     pr_w: u32,
@@ -1364,6 +1375,11 @@ impl SketchMotionApp {
             timeline_h: 260.0,
             win_camera: false,
             cam_interp: Interp::Linear,
+            cam_act: 0,
+            cam_h: 0,
+            cam_orig: CameraKeyframe::default(),
+            cam_grab: (0.0, 0.0),
+            cam_start_ang: 0.0,
             win_prancheta: false,
             pr_w: CANVAS_W,
             pr_h: CANVAS_H,
@@ -5458,12 +5474,163 @@ impl SketchMotionApp {
             painter.rect_filled(hr, 1.0, egui::Color32::WHITE);
             painter.rect_stroke(hr, 1.0, egui::Stroke::new(1.0_f32, blue));
         }
+        // Alça de rotação: acima do meio do topo.
+        let topc = egui::pos2((c[0].x + c[1].x) * 0.5, (c[0].y + c[1].y) * 0.5);
+        let mut dir = topc - egui::pos2((c[2].x + c[3].x) * 0.5, (c[2].y + c[3].y) * 0.5);
+        let len = dir.length();
+        if len > 0.001 {
+            dir /= len;
+        }
+        let rotp = topc + dir * 24.0;
+        painter.line_segment([topc, rotp], egui::Stroke::new(1.5_f32, blue));
+        painter.circle_filled(rotp, 5.0, egui::Color32::WHITE);
+        painter.circle_stroke(rotp, 5.0, egui::Stroke::new(1.5_f32, blue));
         // Marcador do pivô/âncora (offset a partir do centro).
         let piv = egui::pos2(
             rect.min.x + (s.x + s.anchor_x) * zoom,
             rect.min.y + (s.y + s.anchor_y) * zoom,
         );
-        painter.circle_stroke(piv, 5.0, egui::Stroke::new(1.5_f32, blue));
+        painter.circle_stroke(piv, 6.0, egui::Stroke::new(1.5_f32, blue));
+        painter.circle_filled(piv, 2.0, blue);
+    }
+
+    /// Manipulação direta do retângulo azul da câmera (ferramenta Câmera):
+    /// mover (arrastar dentro), redimensionar (4 cantos, preservando o centro),
+    /// rotacionar (alça acima do topo) e mover o pivô. Grava no keyframe do
+    /// frame atual (cria automaticamente se não houver — auto-keyframe).
+    fn interacao_camera(
+        &mut self,
+        pressed: bool,
+        down: bool,
+        hover: Option<egui::Pos2>,
+        ppos: Option<egui::Pos2>,
+        rect: egui::Rect,
+        zoom: f32,
+    ) {
+        let cur = self.document.current;
+        let to_doc = |p: egui::Pos2| ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+        let s = self.document.camera.sample(cur);
+        // Ponto (doc) de um canto normalizado (sx, sy ∈ {-1,1}).
+        let cam_point = |sx: f32, sy: f32| -> egui::Pos2 {
+            let (sin, cos) = s.rotation.to_radians().sin_cos();
+            let (lx, ly) = (sx * s.w * 0.5, sy * s.h * 0.5);
+            egui::pos2(
+                rect.min.x + (s.x + lx * cos - ly * sin) * zoom,
+                rect.min.y + (s.y + lx * sin + ly * cos) * zoom,
+            )
+        };
+        let corners = [
+            cam_point(-1.0, -1.0),
+            cam_point(1.0, -1.0),
+            cam_point(1.0, 1.0),
+            cam_point(-1.0, 1.0),
+        ];
+        // Alça de rotação (mesma geometria do desenho).
+        let topc = egui::pos2(
+            (corners[0].x + corners[1].x) * 0.5,
+            (corners[0].y + corners[1].y) * 0.5,
+        );
+        let botc = egui::pos2(
+            (corners[2].x + corners[3].x) * 0.5,
+            (corners[2].y + corners[3].y) * 0.5,
+        );
+        let mut dir = topc - botc;
+        let len = dir.length();
+        if len > 0.001 {
+            dir /= len;
+        }
+        let rotp = topc + dir * 24.0;
+        let pivp = egui::pos2(
+            rect.min.x + (s.x + s.anchor_x) * zoom,
+            rect.min.y + (s.y + s.anchor_y) * zoom,
+        );
+
+        if pressed {
+            if let Some(p) = hover {
+                let dp = to_doc(p);
+                let orig = match self.document.camera.keyframe_index(cur) {
+                    Some(i) => self.document.camera.keyframes[i],
+                    None => CameraKeyframe {
+                        frame: cur,
+                        x: s.x,
+                        y: s.y,
+                        w: s.w,
+                        h: s.h,
+                        rotation: s.rotation,
+                        anchor_x: s.anchor_x,
+                        anchor_y: s.anchor_y,
+                        interp: self.cam_interp,
+                    },
+                };
+                self.cam_orig = orig;
+                let near = |a: egui::Pos2, b: egui::Pos2| a.distance(b) <= 10.0;
+                if near(p, rotp) {
+                    self.cam_act = 3;
+                    self.cam_start_ang = (dp.1 - s.y).atan2(dp.0 - s.x);
+                } else if near(p, pivp) {
+                    self.cam_act = 4;
+                } else if let Some(hi) = corners.iter().position(|&h| near(p, h)) {
+                    self.cam_act = 2;
+                    self.cam_h = hi;
+                } else if self.camera_ponto_dentro(&s, dp) {
+                    self.cam_act = 1;
+                    self.cam_grab = (dp.0 - s.x, dp.1 - s.y);
+                } else {
+                    self.cam_act = 0;
+                }
+            }
+        }
+
+        if down && self.cam_act != 0 {
+            if let Some(pp) = ppos {
+                let dp = to_doc(pp);
+                let mut k = self.cam_orig;
+                match self.cam_act {
+                    1 => {
+                        k.x = dp.0 - self.cam_grab.0;
+                        k.y = dp.1 - self.cam_grab.1;
+                    }
+                    2 => {
+                        // Ponteiro em coords LOCAIS (desfaz a rotação em torno do centro).
+                        let (sin, cos) = (-self.cam_orig.rotation.to_radians()).sin_cos();
+                        let (rx, ry) = (dp.0 - self.cam_orig.x, dp.1 - self.cam_orig.y);
+                        let lx = rx * cos - ry * sin;
+                        let ly = rx * sin + ry * cos;
+                        // Cantos preservam o centro: nova meia-dimensão = |local|.
+                        k.w = (lx.abs() * 2.0).max(4.0);
+                        k.h = (ly.abs() * 2.0).max(4.0);
+                        k.x = self.cam_orig.x;
+                        k.y = self.cam_orig.y;
+                    }
+                    3 => {
+                        let ang = (dp.1 - self.cam_orig.y).atan2(dp.0 - self.cam_orig.x);
+                        let delta = (ang - self.cam_start_ang).to_degrees();
+                        k.rotation = self.cam_orig.rotation + delta;
+                    }
+                    4 => {
+                        k.anchor_x = dp.0 - self.cam_orig.x;
+                        k.anchor_y = dp.1 - self.cam_orig.y;
+                    }
+                    _ => {}
+                }
+                k.frame = cur;
+                self.document.camera.set_keyframe(k);
+                self.dirty = true;
+            }
+        }
+
+        if !down {
+            self.cam_act = 0;
+        }
+    }
+
+    /// Testa se um ponto (doc) está dentro do retângulo (rotacionado) da câmera.
+    fn camera_ponto_dentro(&self, s: &sketchmotion_core::CameraState, dp: (f32, f32)) -> bool {
+        let (sin, cos) = (-s.rotation.to_radians()).sin_cos();
+        let (rx, ry) = (dp.0 - s.x, dp.1 - s.y);
+        let lx = rx * cos - ry * sin;
+        let ly = rx * sin + ry * cos;
+        lx.abs() <= s.w * 0.5 && ly.abs() <= s.h * 0.5
     }
 
     /// Aplica o enquadramento da câmera (no frame `pf`) sobre a composição
@@ -8055,6 +8222,9 @@ impl eframe::App for SketchMotionApp {
                                 self.tool = Tool::Select;
                             }
                         }
+                        self.last_pos = None;
+                    } else if self.tool == Tool::Camera {
+                        self.interacao_camera(pressed, down, hover, ppos, rect, zoom);
                         self.last_pos = None;
                     } else if self.tool == Tool::Rig {
                         if let Some(si) = self.rig_active_index() {
