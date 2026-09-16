@@ -198,6 +198,20 @@ impl Camera {
         *self = Camera::new(w, h);
     }
 
+    /// Move o keyframe do frame `from` para o frame `to` (mantém os valores).
+    /// Se já houver um keyframe em `to`, ele é substituído.
+    pub fn move_keyframe(&mut self, from: usize, to: usize) {
+        if from == to {
+            return;
+        }
+        if let Some(i) = self.keyframe_index(from) {
+            let mut k = self.keyframes[i];
+            self.keyframes.remove(i);
+            k.frame = to;
+            self.set_keyframe(k);
+        }
+    }
+
     /// Estado interpolado da câmera no `frame` pedido.
     pub fn sample(&self, frame: usize) -> CameraState {
         if self.keyframes.is_empty() {

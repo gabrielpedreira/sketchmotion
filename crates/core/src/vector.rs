@@ -40,6 +40,10 @@ pub struct VectorObject {
     /// Cor de preenchimento (None = sem preenchimento). Usada por formas.
     #[serde(default)]
     pub fill: Option<Color>,
+    /// Grupo ao qual o objeto pertence (None = solto). Objetos com o mesmo id
+    /// selecionam/movem juntos. Usado por Agrupar/Desagrupar.
+    #[serde(default)]
+    pub group: Option<u32>,
 }
 
 fn one() -> f32 {
@@ -65,6 +69,7 @@ impl VectorObject {
             stroke_width,
             opacity: 1.0,
             fill: None,
+            group: None,
         }
     }
 
