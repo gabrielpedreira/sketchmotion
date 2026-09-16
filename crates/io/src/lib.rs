@@ -126,6 +126,62 @@ pub fn export_gif(
     Ok(())
 }
 
+/// Exporta uma sequência de frames RGBA como vídeo MP4 (H.264) via `ffmpeg`.
+///
+/// Não usamos codec H.264 embutido (evita dependência nativa pesada). Em vez
+/// disso, gravamos os frames como PNGs num diretório temporário e chamamos o
+/// `ffmpeg` do sistema. Requer o `ffmpeg` instalado e no PATH. Devolve um erro
+/// claro se ele não for encontrado.
+pub fn export_mp4(
+    width: u32,
+    height: u32,
+    frames: &[Vec<u8>],
+    fps: u32,
+    path: &Path,
+) -> Result<(), String> {
+    use std::process::Command;
+    if frames.is_empty() {
+        return Err("Nada para exportar".to_string());
+    }
+    let fps = fps.max(1);
+    // Diretório temporário exclusivo desta exportação.
+    let tmp = std::env::temp_dir().join(format!("sketchmotion_mp4_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    for (i, rgba) in frames.iter().enumerate() {
+        let fp = tmp.join(format!("f_{:05}.png", i));
+        if let Err(e) = image::save_buffer(&fp, rgba, width, height, image::ExtendedColorType::Rgba8)
+        {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e.to_string());
+        }
+    }
+    let pat = tmp.join("f_%05d.png");
+    // yuv420p (compatível com players) exige dimensões pares → pad.
+    let vf = "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=yuv420p";
+    let result = Command::new("ffmpeg")
+        .arg("-y")
+        .args(["-framerate", &fps.to_string()])
+        .arg("-i")
+        .arg(&pat)
+        .args(["-vf", vf])
+        .args(["-c:v", "libx264", "-preset", "medium", "-crf", "18"])
+        .args(["-movflags", "+faststart"])
+        .arg(path)
+        .output();
+    let _ = std::fs::remove_dir_all(&tmp);
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let tail: String = err.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+            Err(format!("ffmpeg falhou: {tail}"))
+        }
+        Err(e) => Err(format!(
+            "não encontrei o ffmpeg no PATH ({e}). Instale o ffmpeg para exportar MP4."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
