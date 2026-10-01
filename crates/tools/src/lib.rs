@@ -39,6 +39,8 @@ pub enum Tool {
     Pivot,
     /// Vetor de Direção — animação automática por interpolação entre frames.
     DirVector,
+    /// Mão — move/desloca o canvas (pan), sem desenhar.
+    Hand,
 }
 
 impl Tool {
@@ -72,6 +74,7 @@ impl Tool {
             Tool::Camera => "Câmera",
             Tool::Pivot => "Pivô",
             Tool::DirVector => "Vetor de Direção",
+            Tool::Hand => "Mão",
         }
     }
 }

@@ -202,6 +202,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 760.0])
+            .with_maximized(true)
             .with_icon(std::sync::Arc::new(load_icon())),
         ..Default::default()
     };
@@ -1461,6 +1462,15 @@ struct SketchMotionApp {
     last_pos: Option<(i32, i32)>,
     tool: Tool,
     brush_color: egui::Color32,
+    /// Opacidade do pincel (0..1) — multiplica o alpha ao pintar.
+    brush_opacity: f32,
+    /// Deslocamento de rolagem pendente (zoom-no-ponto / pan programático).
+    pending_scroll: Option<egui::Vec2>,
+    /// Geometria do canvas capturada no frame (para zoom-no-ponto).
+    cv_vp_min: egui::Pos2,
+    cv_rect_min: egui::Pos2,
+    cv_pad: egui::Vec2,
+    cv_zoom: f32,
     /// Palette radial (popup estilo Krita) aberta no botão direito.
     win_roda: bool,
     /// Centro da palette radial (posição do clique).
@@ -1817,6 +1827,12 @@ impl SketchMotionApp {
             last_pos: None,
             tool: Tool::Pencil,
             brush_color: egui::Color32::BLACK,
+            brush_opacity: 1.0,
+            pending_scroll: None,
+            cv_vp_min: egui::Pos2::ZERO,
+            cv_rect_min: egui::Pos2::ZERO,
+            cv_pad: egui::Vec2::ZERO,
+            cv_zoom: 1.0,
             win_roda: false,
             roda_pos: egui::Pos2::ZERO,
             brush_radius: 2,
@@ -2044,7 +2060,8 @@ impl SketchMotionApp {
 
     fn brush_core_color(&self) -> Color {
         let c = self.brush_color;
-        Color::rgba(c.r(), c.g(), c.b(), c.a())
+        let a = (c.a() as f32 * self.brush_opacity.clamp(0.0, 1.0)).round() as u8;
+        Color::rgba(c.r(), c.g(), c.b(), a)
     }
 
     fn active_color(&self) -> Color {
@@ -4873,6 +4890,7 @@ impl SketchMotionApp {
                         (Tool::Lasso, icon::LASSO, "Seleção livre (laço)"),
                         (Tool::DirectSelect, icon::SELECTION, "Seleção direta — editar por pontos"),
                         (Tool::MagicWand, icon::MAGIC_WAND, "Varinha mágica — selecionar por cor"),
+                        (Tool::Hand, icon::HAND, "Mão — mover o canvas (ou segure Espaço)"),
                     ] {
                         let bloq = self.bloqueada_pixel(t);
                         let ativa =
@@ -6189,6 +6207,9 @@ impl SketchMotionApp {
                         Tool::Camera => self.opcoes_camera(ui),
                         Tool::Pivot => self.opcoes_pivo(ui),
                         Tool::DirVector => self.opcoes_dirvec(ui),
+                        Tool::Hand => {
+                            ui.label("Mão — arraste para mover o canvas (ou segure Espaço).");
+                        }
                     }
                 }
             });
@@ -6464,6 +6485,20 @@ impl SketchMotionApp {
         );
     }
 
+    /// Aplica um fator de zoom mantendo o ponto de TELA `ponto` fixo (zoom no
+    /// ponto do clique). Ajusta a rolagem do canvas no próximo frame.
+    fn zoom_no_ponto(&mut self, fator: f32, ponto: egui::Pos2) {
+        let z = self.cv_zoom.max(0.0001);
+        let d = (ponto - self.cv_rect_min) / z; // coord do documento sob o ponto
+        let z2 = (z * fator).clamp(0.1, 64.0);
+        self.zoom = z2;
+        let off = egui::vec2(
+            self.cv_pad.x + d.x * z2 - ponto.x + self.cv_vp_min.x,
+            self.cv_pad.y + d.y * z2 - ponto.y + self.cv_vp_min.y,
+        );
+        self.pending_scroll = Some(off.max(egui::Vec2::ZERO));
+    }
+
     /// Palette radial (popup estilo Krita/SAI): botão direito abre uma roda com
     /// seletor de cor (anel de matiz + triângulo SV), ferramentas à mão (pincel,
     /// borracha, caneta, conta-gotas), presets de ponta de pincel (fora do pixel
@@ -6479,6 +6514,8 @@ impl SketchMotionApp {
         }
         let size = 300.0_f32;
         let mut fechar = false;
+        let mut zoom_in_pt = false;
+        let mut zoom_out_pt = false;
 
         // Monta os slots de ferramentas ao redor do anel.
         #[derive(Clone)]
@@ -6728,6 +6765,26 @@ impl SketchMotionApp {
                         }
                     });
                     ui.horizontal(|ui| {
+                        ui.label("Opacidade");
+                        let mut pct = (self.brush_opacity * 100.0).round();
+                        if ui
+                            .add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%"))
+                            .changed()
+                        {
+                            self.brush_opacity = (pct / 100.0).clamp(0.0, 1.0);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Zoom");
+                        if ui.button(" − ").on_hover_text("Afastar no ponto do clique").clicked() {
+                            zoom_out_pt = true;
+                        }
+                        ui.weak(format!("{}%", (self.zoom * 100.0).round() as i32));
+                        if ui.button(" + ").on_hover_text("Aproximar no ponto do clique").clicked() {
+                            zoom_in_pt = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
                         ui.weak("Botão direito / lateral da caneta abre • Esc fecha");
                         if ui.button("Fechar").clicked() {
                             fechar = true;
@@ -6738,6 +6795,12 @@ impl SketchMotionApp {
 
         if fechar {
             self.win_roda = false;
+        }
+        if zoom_in_pt {
+            self.zoom_no_ponto(1.25, self.roda_pos);
+        }
+        if zoom_out_pt {
+            self.zoom_no_ponto(0.8, self.roda_pos);
         }
         // Clique fora da roda fecha.
         let area_rect = area.response.rect;
@@ -6829,6 +6892,12 @@ impl SketchMotionApp {
         ui.label("Tamanho:");
         ui.add(egui::Slider::new(&mut self.brush_radius, 1..=40));
         nudge_i32(ui, &mut self.brush_radius, 1, 40);
+        ui.separator();
+        ui.label("Opacidade:");
+        let mut pct = (self.brush_opacity * 100.0).round();
+        if ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%")).changed() {
+            self.brush_opacity = (pct / 100.0).clamp(0.0, 1.0);
+        }
         ui.separator();
         self.swatch_cor(ui);
         ui.separator();
@@ -12383,6 +12452,11 @@ impl eframe::App for SketchMotionApp {
             // movê-lo com rolagem H/V (estilo Illustrator).
             let pad_x = (avail.x * self.workspace_pad).max(120.0);
             let pad_y = (avail.y * self.workspace_pad).max(120.0);
+            // Modo "mão" (pan): segurar ESPAÇO (fora de campos de texto) ou a
+            // ferramenta Mão. Nesse modo arrastar move o canvas e não desenha.
+            let space_pan = !ctx.wants_keyboard_input()
+                && ctx.input(|i| i.key_down(egui::Key::Space));
+            let pan_mode = space_pan || self.tool == Tool::Hand;
             let mut area = egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .drag_to_scroll(false);
@@ -12392,6 +12466,8 @@ impl eframe::App for SketchMotionApp {
                     (pad_y + ch * 0.5 - avail.y * 0.5).max(0.0),
                 );
                 area = area.scroll_offset(off);
+            } else if let Some(off) = self.pending_scroll.take() {
+                area = area.scroll_offset(off.max(egui::Vec2::ZERO));
             }
             area
                 .show(ui, |ui| {
@@ -12403,6 +12479,11 @@ impl eframe::App for SketchMotionApp {
                         content_rect.min + egui::vec2(pad_x, pad_y),
                         egui::vec2(cw, ch),
                     );
+                    // Geometria do frame (para zoom-no-ponto da roda).
+                    self.cv_vp_min = ui.clip_rect().min;
+                    self.cv_rect_min = rect.min;
+                    self.cv_pad = egui::vec2(pad_x, pad_y);
+                    self.cv_zoom = zoom;
                     let response = ui.interact(
                         rect,
                         ui.id().with("canvas_area"),
@@ -12689,6 +12770,23 @@ impl eframe::App for SketchMotionApp {
                     // Roda de ferramentas aberta: não desenha no canvas.
                     let pressed = pressed && !self.win_roda;
                     let down = down && !self.win_roda;
+
+                    // Modo "mão": arrastar move o canvas (pan) e não desenha.
+                    if pan_mode {
+                        if response.hovered() || response.dragged() {
+                            ui.ctx().set_cursor_icon(if response.dragged() {
+                                egui::CursorIcon::Grabbing
+                            } else {
+                                egui::CursorIcon::Grab
+                            });
+                        }
+                        if response.dragged() {
+                            let d = response.drag_delta();
+                            ui.scroll_with_delta(d);
+                        }
+                    }
+                    let pressed = pressed && !pan_mode;
+                    let down = down && !pan_mode;
 
                     // Solta a trava do conta-gotas quando o botão é liberado.
                     if !down {
