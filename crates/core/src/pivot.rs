@@ -22,8 +22,9 @@ pub enum PivotTarget {
     /// grupo próprio ao ser associado — assim a ligação sobrevive a reordenações
     /// e mudanças de índice entre frames).
     Group(u32),
-    /// Um objeto de imagem, pelo índice no frame.
-    Image(usize),
+    /// Um objeto de imagem, pelo seu id ESTÁVEL (não o índice — o índice muda
+    /// quando a lista é reordenada ao mover imagens).
+    Image(u32),
 }
 
 impl Default for PivotTarget {
@@ -52,6 +53,13 @@ pub struct Pivot {
     /// O ponto de movimentação já foi posicionado? (segundo clique.)
     #[serde(default)]
     pub has_mov: bool,
+    /// Para alvo de IMAGEM: eixo/mov guardados RELATIVOS à imagem (offset no
+    /// referencial local, não girado). Permite recalcular os pontos do transform
+    /// atual da imagem, fazendo-os seguir a peça ao mover/girar/escalar.
+    #[serde(default)]
+    pub img_local_axis: (f32, f32),
+    #[serde(default)]
+    pub img_local_mov: (f32, f32),
 }
 
 fn yes() -> bool {
@@ -68,6 +76,8 @@ impl Pivot {
             target: PivotTarget::None,
             has_axis: false,
             has_mov: false,
+            img_local_axis: (0.0, 0.0),
+            img_local_mov: (0.0, 0.0),
         }
     }
 

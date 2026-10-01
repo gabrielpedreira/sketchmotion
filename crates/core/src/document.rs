@@ -64,6 +64,9 @@ pub struct Document {
     /// Vetores de direção (animação automática por interpolação entre frames).
     #[serde(default)]
     pub dir_vectors: Vec<DirVector>,
+    /// Guias de régua globais (linhas H/V visíveis em qualquer camada/frame).
+    #[serde(default)]
+    pub guides: Vec<crate::guide::Guide>,
 }
 
 /// Uma timeline (faixa) de animação: lista própria de frames, FPS e
@@ -109,6 +112,7 @@ impl Document {
             camera: Camera::new(width, height),
             pivots: Vec::new(),
             dir_vectors: Vec::new(),
+            guides: Vec::new(),
         };
         doc.add_layer("Camada 1");
         doc.frames = vec![Frame {
@@ -140,6 +144,15 @@ impl Document {
         for f in &mut self.frames {
             if f.layers.is_empty() {
                 f.layers.push(Layer::new("Camada 1", self.width, self.height));
+            }
+            // Corrige objetos-imagem que apontam para uma camada inexistente
+            // (ex.: a camada foi excluída): limita o índice ao intervalo válido,
+            // para não serem tratados como "em camada bloqueada".
+            let ult = f.layers.len().saturating_sub(1);
+            for img in &mut f.images {
+                if img.layer > ult {
+                    img.layer = ult;
+                }
             }
         }
         if self.current >= self.frames.len() {
@@ -217,6 +230,14 @@ impl Document {
     /// Clona os vetores de um frame específico (para ler o estado sem alterá-lo).
     pub fn frame_vectors(&self, f: usize) -> Vec<VectorObject> {
         self.frames.get(f).map(|fr| fr.vectors.clone()).unwrap_or_default()
+    }
+
+    /// Índice do objeto de imagem com o id estável dado (na cópia de trabalho).
+    pub fn image_index_by_id(&self, id: u32) -> Option<usize> {
+        if id == 0 {
+            return None;
+        }
+        self.images.iter().position(|o| o.id == id)
     }
 
     /// Recarrega a cópia de trabalho a partir do frame atual e espelha na faixa.

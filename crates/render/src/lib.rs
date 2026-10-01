@@ -61,34 +61,79 @@ pub fn render_layers(width: u32, height: u32, background: Color, layers: &[Layer
 }
 
 /// Compõe camadas sobre fundo TRANSPARENTE (para onion skin do frame anterior).
+/// Compõe UMA camada (respeitando visibilidade/opacidade) sobre `rgba`
+/// (alpha "over", fundo transparente).
+fn composite_layer_alpha(rgba: &mut [u8], layer: &Layer) {
+    if !layer.visible {
+        return;
+    }
+    let op = layer.opacity();
+    if op <= 0.0 {
+        return;
+    }
+    let src = layer.pixels();
+    for (dst, s) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+        let sa = (s[3] as f32 / 255.0) * op;
+        if sa <= 0.0 {
+            continue;
+        }
+        let da = dst[3] as f32 / 255.0;
+        let oa = sa + da * (1.0 - sa);
+        if oa <= 0.0 {
+            continue;
+        }
+        for k in 0..3 {
+            let sc = s[k] as f32 / 255.0;
+            let dc = dst[k] as f32 / 255.0;
+            dst[k] = (((sc * sa + dc * da * (1.0 - sa)) / oa) * 255.0).round() as u8;
+        }
+        dst[3] = (oa * 255.0).round() as u8;
+    }
+}
+
 pub fn render_layers_alpha(width: u32, height: u32, layers: &[Layer]) -> PixelImage {
     let (w, h) = (width as usize, height as usize);
     let mut rgba = vec![0u8; w * h * 4];
     for layer in layers {
-        if !layer.visible {
+        composite_layer_alpha(&mut rgba, layer);
+    }
+    PixelImage {
+        width: width as i32,
+        height: height as i32,
+        rgba,
+    }
+}
+
+/// Compõe camadas E objetos de imagem INTERCALADOS: cada imagem é desenhada
+/// logo acima da camada a que pertence (campo `layer`), preservando a ordem de
+/// exibição = ordem das camadas. Imagens com camada fora da faixa vão ao topo.
+pub fn render_layers_images_alpha(
+    width: u32,
+    height: u32,
+    layers: &[Layer],
+    images: &[ImageObject],
+) -> PixelImage {
+    let (w, h) = (width as usize, height as usize);
+    let mut rgba = vec![0u8; w * h * 4];
+    let n = layers.len();
+    for (li, layer) in layers.iter().enumerate() {
+        composite_layer_alpha(&mut rgba, layer);
+        // Imagens desta camada só aparecem se a camada estiver visível — ocultar
+        // a camada oculta também os objetos (imagens) que pertencem a ela.
+        if !layer.visible || layer.opacity() <= 0.0 {
             continue;
         }
-        let op = layer.opacity();
-        if op <= 0.0 {
-            continue;
+        for obj in images {
+            let ol = obj.layer.min(n.saturating_sub(1));
+            if ol == li {
+                rasterize_one_image(width, height, obj, &mut rgba);
+            }
         }
-        let src = layer.pixels();
-        for (dst, s) in rgba.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-            let sa = (s[3] as f32 / 255.0) * op;
-            if sa <= 0.0 {
-                continue;
-            }
-            let da = dst[3] as f32 / 255.0;
-            let oa = sa + da * (1.0 - sa);
-            if oa <= 0.0 {
-                continue;
-            }
-            for k in 0..3 {
-                let sc = s[k] as f32 / 255.0;
-                let dc = dst[k] as f32 / 255.0;
-                dst[k] = (((sc * sa + dc * da * (1.0 - sa)) / oa) * 255.0).round() as u8;
-            }
-            dst[3] = (oa * 255.0).round() as u8;
+    }
+    // Imagens cuja camada não existe mais (>= nº de camadas): topo.
+    for obj in images {
+        if n == 0 || obj.layer >= n {
+            rasterize_one_image(width, height, obj, &mut rgba);
         }
     }
     PixelImage {
@@ -235,59 +280,60 @@ fn img_corner(cx: f32, cy: f32, hw: f32, hh: f32, angle: f32, sx: f32, sy: f32) 
 
 /// Compõe os objetos de imagem (com transformação: centro/escala/rotação/opac.)
 /// sobre o buffer RGBA já existente — mesma resolução do documento.
-pub fn rasterize_images(width: u32, height: u32, images: &[ImageObject], rgba: &mut [u8]) {
+/// Rasteriza UM objeto de imagem sobre `rgba` (usado tanto no laço geral quanto
+/// na composição intercalada por camada).
+fn rasterize_one_image(width: u32, height: u32, obj: &ImageObject, rgba: &mut [u8]) {
     let (w, h) = (width as i32, height as i32);
-    for obj in images {
-        let op = obj.opacity.clamp(0.0, 1.0);
-        if op <= 0.0 || obj.ow == 0 || obj.oh == 0 || obj.hw <= 0.0 || obj.hh <= 0.0 {
-            continue;
-        }
-        if obj.pixels.len() < (obj.ow * obj.oh * 4) as usize {
-            continue;
-        }
-        // Caixa envolvente (do retângulo girado) recortada ao documento.
-        let corners = [
-            img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, -1.0, -1.0),
-            img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, 1.0, -1.0),
-            img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, 1.0, 1.0),
-            img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, -1.0, 1.0),
-        ];
-        let (mut minx, mut miny) = (f32::INFINITY, f32::INFINITY);
-        let (mut maxx, mut maxy) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for (x, y) in corners {
-            minx = minx.min(x);
-            miny = miny.min(y);
-            maxx = maxx.max(x);
-            maxy = maxy.max(y);
-        }
-        let x0 = (minx.floor() as i32).max(0);
-        let y0 = (miny.floor() as i32).max(0);
-        let x1 = (maxx.ceil() as i32).min(w);
-        let y1 = (maxy.ceil() as i32).min(h);
-        for py in y0..y1 {
-            for px in x0..x1 {
-                let (lx, ly) = img_local(obj.cx, obj.cy, obj.angle, px as f32 + 0.5, py as f32 + 0.5);
-                let u = lx / (2.0 * obj.hw) + 0.5;
-                let v = ly / (2.0 * obj.hh) + 0.5;
-                if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
-                    continue;
-                }
-                let sx = ((u * obj.ow as f32) as i32).clamp(0, obj.ow as i32 - 1);
-                let sy = ((v * obj.oh as f32) as i32).clamp(0, obj.oh as i32 - 1);
-                let si = ((sy * obj.ow as i32 + sx) * 4) as usize;
-                let sa = obj.pixels[si + 3];
-                if sa == 0 {
-                    continue;
-                }
-                let c = Color::rgba(
-                    obj.pixels[si],
-                    obj.pixels[si + 1],
-                    obj.pixels[si + 2],
-                    sa,
-                );
-                blend_px(rgba, ((py * w + px) * 4) as usize, c, op);
+    let op = obj.opacity.clamp(0.0, 1.0);
+    if op <= 0.0 || obj.ow == 0 || obj.oh == 0 || obj.hw <= 0.0 || obj.hh <= 0.0 {
+        return;
+    }
+    if obj.pixels.len() < (obj.ow * obj.oh * 4) as usize {
+        return;
+    }
+    // Caixa envolvente (do retângulo girado) recortada ao documento.
+    let corners = [
+        img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, -1.0, -1.0),
+        img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, 1.0, -1.0),
+        img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, 1.0, 1.0),
+        img_corner(obj.cx, obj.cy, obj.hw, obj.hh, obj.angle, -1.0, 1.0),
+    ];
+    let (mut minx, mut miny) = (f32::INFINITY, f32::INFINITY);
+    let (mut maxx, mut maxy) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (x, y) in corners {
+        minx = minx.min(x);
+        miny = miny.min(y);
+        maxx = maxx.max(x);
+        maxy = maxy.max(y);
+    }
+    let x0 = (minx.floor() as i32).max(0);
+    let y0 = (miny.floor() as i32).max(0);
+    let x1 = (maxx.ceil() as i32).min(w);
+    let y1 = (maxy.ceil() as i32).min(h);
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let (lx, ly) = img_local(obj.cx, obj.cy, obj.angle, px as f32 + 0.5, py as f32 + 0.5);
+            let u = lx / (2.0 * obj.hw) + 0.5;
+            let v = ly / (2.0 * obj.hh) + 0.5;
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                continue;
             }
+            let sx = ((u * obj.ow as f32) as i32).clamp(0, obj.ow as i32 - 1);
+            let sy = ((v * obj.oh as f32) as i32).clamp(0, obj.oh as i32 - 1);
+            let si = ((sy * obj.ow as i32 + sx) * 4) as usize;
+            let sa = obj.pixels[si + 3];
+            if sa == 0 {
+                continue;
+            }
+            let c = Color::rgba(obj.pixels[si], obj.pixels[si + 1], obj.pixels[si + 2], sa);
+            blend_px(rgba, ((py * w + px) * 4) as usize, c, op);
         }
+    }
+}
+
+pub fn rasterize_images(width: u32, height: u32, images: &[ImageObject], rgba: &mut [u8]) {
+    for obj in images {
+        rasterize_one_image(width, height, obj, rgba);
     }
 }
 
@@ -300,13 +346,44 @@ pub fn render_frame(
     vectors: &[VectorObject],
     images: &[ImageObject],
 ) -> PixelImage {
-    let mut img = render_layers(width, height, background, layers);
-    rasterize_vectors(width, height, vectors, &mut img.rgba);
-    rasterize_images(width, height, images, &mut img.rgba);
-    img
+    let (w, h) = (width as usize, height as usize);
+    let mut rgba = vec![0u8; w * h * 4];
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = background.r;
+        px[1] = background.g;
+        px[2] = background.b;
+        px[3] = 255;
+    }
+    // Camadas e imagens intercaladas (imagem logo acima da sua camada).
+    let n = layers.len();
+    for (li, layer) in layers.iter().enumerate() {
+        composite_layer_alpha(&mut rgba, layer);
+        if !layer.visible || layer.opacity() <= 0.0 {
+            continue;
+        }
+        for obj in images {
+            if obj.layer.min(n.saturating_sub(1)) == li {
+                rasterize_one_image(width, height, obj, &mut rgba);
+            }
+        }
+    }
+    for obj in images {
+        if n == 0 || obj.layer >= n {
+            rasterize_one_image(width, height, obj, &mut rgba);
+        }
+    }
+    // Vetores (ilustração) ficam no topo.
+    rasterize_vectors(width, height, vectors, &mut rgba);
+    PixelImage {
+        width: width as i32,
+        height: height as i32,
+        rgba,
+    }
 }
 
 /// Frame completo (camadas + vetores + imagens) sobre fundo TRANSPARENTE.
+/// As imagens são compostas na ordem das camadas a que pertencem; os vetores
+/// ficam no topo.
 pub fn render_frame_alpha(
     width: u32,
     height: u32,
@@ -314,8 +391,7 @@ pub fn render_frame_alpha(
     vectors: &[VectorObject],
     images: &[ImageObject],
 ) -> PixelImage {
-    let mut img = render_layers_alpha(width, height, layers);
+    let mut img = render_layers_images_alpha(width, height, layers, images);
     rasterize_vectors(width, height, vectors, &mut img.rgba);
-    rasterize_images(width, height, images, &mut img.rgba);
     img
 }

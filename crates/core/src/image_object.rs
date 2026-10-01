@@ -35,6 +35,10 @@ pub struct ImageObject {
     /// Camada à qual o objeto está associado (para z-order/integração).
     #[serde(default)]
     pub layer: usize,
+    /// Identidade estável do objeto (sobrevive a mover/reordenar a lista).
+    /// 0 = ainda sem id; é atribuído quando um pivô/vetor se liga à peça.
+    #[serde(default)]
+    pub id: u32,
 }
 
 impl ImageObject {
@@ -63,6 +67,7 @@ impl ImageObject {
             angle,
             opacity,
             layer,
+            id: 0,
         }
     }
 }

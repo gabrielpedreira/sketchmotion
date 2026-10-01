@@ -60,8 +60,9 @@ pub struct DirVector {
     pub base_vectors: Vec<VectorObject>,
     #[serde(default)]
     pub base_image: Option<ImageObject>,
+    /// id estável da imagem-base (sobrevive a reordenação da lista).
     #[serde(default)]
-    pub base_image_index: usize,
+    pub base_image_id: u32,
 
     // ---- Fluxo ----
     #[serde(default)]
@@ -96,7 +97,7 @@ impl DirVector {
             pivot_axis: (0.0, 0.0),
             base_vectors: Vec::new(),
             base_image: None,
-            base_image_index: 0,
+            base_image_id: 0,
             has_start: false,
             has_end: false,
         }
