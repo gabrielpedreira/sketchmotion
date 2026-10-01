@@ -7905,7 +7905,8 @@ impl SketchMotionApp {
         self.document.resize_canvas_anchored(w, h, dx, dy);
         self.pr_w = w;
         self.pr_h = h;
-        self.center_canvas = true;
+        // NÃO recentraliza aqui: quem chama (arrasto das alças) ajusta o scroll
+        // para o desenho ficar visualmente parado (esticar, não "andar").
         self.dirty = true;
         self.track_thumbs.clear();
         self.between_cache.clear();
@@ -10556,6 +10557,11 @@ impl SketchMotionApp {
                 self.pr_h = nh as u32;
                 if ui.input(|i| i.pointer.any_released()) {
                     self.prancheta_drag = None;
+                    // Compensa o scroll pelo deslocamento do conteúdo, para o
+                    // desenho não "pular" ao esticar (sobretudo pela esq./topo).
+                    let s_old = self.cv_vp_min - self.cv_rect_min + self.cv_pad;
+                    let s_new = s_old + egui::vec2(dx as f32 * zoom, dy as f32 * zoom);
+                    self.pending_scroll = Some(s_new.max(egui::Vec2::ZERO));
                     self.aplicar_prancheta_offset(nw as u32, nh as u32, dx, dy);
                 }
             } else if ui.input(|i| !i.pointer.any_down()) {
@@ -13882,6 +13888,11 @@ impl eframe::App for SketchMotionApp {
 
                     // Cursor personalizado por ferramenta + decorações no canvas.
                     if response.hovered() {
+                        // Fora da área do papel (faixa cinza): cursor normal
+                        // do sistema — evita o cursor sumir no pasteboard.
+                        if !hover.map_or(false, |hp| rect.contains(hp)) {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
+                        } else {
                         use egui::CursorIcon as CI;
                         self.ensure_cursor_textures(ui.ctx());
                         let painter = ui.painter_at(rect);
@@ -14072,6 +14083,7 @@ impl eframe::App for SketchMotionApp {
                                     ui.ctx().set_cursor_icon(CI::Default);
                                 }
                             }
+                        }
                         }
                     }
 
