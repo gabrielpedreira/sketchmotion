@@ -31,3 +31,13 @@ repository = "https://github.com/gabrielpedreira/sketchmotion"
 [profile.release]
 opt-level = 3
 lto = true
+
+# Perfil de desenvolvimento ACELERADO: nosso código com otimização leve (compila
+# rápido no incremental) e TODAS as dependências totalmente otimizadas (egui,
+# image, etc. são compiladas uma vez). Isso tira o travamento ao desenhar em
+# `cargo run` (debug), que recompõe o canvas inteiro a cada traço.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

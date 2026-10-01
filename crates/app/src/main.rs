@@ -10,8 +10,8 @@
 use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{
-    Anchor, Camera, CameraKeyframe, Color, Document, Frame, ImageObject, Interp, Layer,
-    PieceLibrary, VectorObject,
+    Anchor, Camera, CameraKeyframe, Color, Document, Frame, Guide, GuideOrient, ImageObject,
+    Interp, Layer, PieceLibrary, VectorObject,
 };
 use sketchmotion_render::{rasterize_images, render_frame_alpha, render_layers_alpha, PixelImage};
 use sketchmotion_trace::{trace_bilevel, trace_quantized, BilevelParams, QuantParams, TracedRegion};
@@ -40,7 +40,165 @@ const BRUSHES: [&str; 8] = [
     "Esfumador",
 ];
 
+/// Gancho nativo do Windows para o botão LATERAL (secundário) da caneta.
+///
+/// Com o "Windows Ink" ligado, o botão lateral da caneta chega à janela como
+/// um clique comum (esquerdo) — a informação de "botão secundário da caneta"
+/// se perde na tradução do winit/egui, então o app não consegue distingui-lo de
+/// um toque da ponta (e acaba pintando). Aqui interceptamos a window procedure
+/// e lemos a flag POINTER_FLAG_SECONDBUTTON direto da API de ponteiro do
+/// Windows: ao detectá-la, registramos a posição, ENGOLIMOS a mensagem (o winit
+/// não pinta) e sinalizamos para o app abrir a roda.
+///
+/// Falha segura: se qualquer passo não corresponder (struct, janela, API), a
+/// condição simplesmente não bate e a mensagem segue o fluxo normal — o app
+/// continua funcionando como antes, sem travar.
+#[cfg(windows)]
+mod winhook {
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
+
+    pub static PEN_RCLICK: AtomicBool = AtomicBool::new(false);
+    pub static PEN_X: AtomicI32 = AtomicI32::new(0);
+    pub static PEN_Y: AtomicI32 = AtomicI32::new(0);
+    static ORIG: AtomicIsize = AtomicIsize::new(0);
+    static HOOKED: AtomicBool = AtomicBool::new(false);
+    static SEC_WAS: AtomicBool = AtomicBool::new(false);
+    static FOUND: AtomicIsize = AtomicIsize::new(0);
+
+    type Hwnd = isize;
+    type Wparam = usize;
+    type Lparam = isize;
+    type Lresult = isize;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct PointerInfo {
+        pointer_type: u32,
+        pointer_id: u32,
+        frame_id: u32,
+        pointer_flags: u32,
+        source_device: isize,
+        hwnd_target: isize,
+        pt_pixel_location: Point,
+        pt_himetric_location: Point,
+        pt_pixel_location_raw: Point,
+        pt_himetric_location_raw: Point,
+        dw_time: u32,
+        history_count: u32,
+        input_data: i32,
+        dw_key_states: u32,
+        performance_count: u64,
+        button_change_type: i32,
+    }
+
+    const WM_POINTERDOWN: u32 = 0x0246;
+    const WM_POINTERUPDATE: u32 = 0x0245;
+    const WM_POINTERUP: u32 = 0x0247;
+    const GWLP_WNDPROC: i32 = -4;
+    const PT_PEN: u32 = 3;
+    const POINTER_FLAG_SECONDBUTTON: u32 = 0x0020;
+    const GW_OWNER: u32 = 4;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, newlong: isize) -> isize;
+        fn CallWindowProcW(prev: isize, hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult;
+        fn DefWindowProcW(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult;
+        fn GetPointerInfo(pointer_id: u32, info: *mut PointerInfo) -> i32;
+        fn ScreenToClient(hwnd: Hwnd, pt: *mut Point) -> i32;
+        fn EnumThreadWindows(
+            thread_id: u32,
+            cb: extern "system" fn(Hwnd, Lparam) -> i32,
+            l: Lparam,
+        ) -> i32;
+        fn IsWindowVisible(hwnd: Hwnd) -> i32;
+        fn GetWindow(hwnd: Hwnd, cmd: u32) -> Hwnd;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    extern "system" fn enum_cb(hwnd: Hwnd, _l: Lparam) -> i32 {
+        unsafe {
+            if IsWindowVisible(hwnd) != 0 && GetWindow(hwnd, GW_OWNER) == 0 {
+                FOUND.store(hwnd, Ordering::SeqCst);
+                return 0; // para a enumeração
+            }
+        }
+        1
+    }
+
+    extern "system" fn wnd_proc(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult {
+        let orig = ORIG.load(Ordering::SeqCst);
+        if msg == WM_POINTERDOWN || msg == WM_POINTERUPDATE || msg == WM_POINTERUP {
+            let pid = (w & 0xFFFF) as u32;
+            let mut info: PointerInfo = unsafe { std::mem::zeroed() };
+            let ok = unsafe { GetPointerInfo(pid, &mut info) };
+            if ok != 0 && info.pointer_type == PT_PEN {
+                let has_sec = (info.pointer_flags & POINTER_FLAG_SECONDBUTTON) != 0;
+                let was = SEC_WAS.swap(has_sec, Ordering::SeqCst);
+                if has_sec {
+                    if !was {
+                        // Borda de subida: registra o clique direito da caneta.
+                        let mut pt = info.pt_pixel_location;
+                        unsafe {
+                            ScreenToClient(hwnd, &mut pt);
+                        }
+                        PEN_X.store(pt.x, Ordering::SeqCst);
+                        PEN_Y.store(pt.y, Ordering::SeqCst);
+                        PEN_RCLICK.store(true, Ordering::SeqCst);
+                    }
+                    return 0; // engole: o winit não pinta enquanto o botão está ativo
+                }
+            }
+        }
+        if orig != 0 {
+            unsafe { CallWindowProcW(orig, hwnd, msg, w, l) }
+        } else {
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
+    }
+
+    /// Instala o gancho na janela principal da thread (a janela do winit).
+    /// Idempotente; tenta de novo nos próximos frames se a janela ainda não
+    /// existir.
+    pub fn instalar() {
+        if HOOKED.load(Ordering::SeqCst) {
+            return;
+        }
+        unsafe {
+            let tid = GetCurrentThreadId();
+            FOUND.store(0, Ordering::SeqCst);
+            EnumThreadWindows(tid, enum_cb, 0);
+            let hwnd = FOUND.load(Ordering::SeqCst);
+            if hwnd == 0 {
+                return; // janela ainda não pronta; tenta no próximo frame
+            }
+            let f = wnd_proc as extern "system" fn(Hwnd, u32, Wparam, Lparam) -> Lresult;
+            let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, f as usize as isize);
+            ORIG.store(old, Ordering::SeqCst);
+            HOOKED.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    // Gancho de panic: grava o erro em panic.log (e no stderr), para capturar
+    // falhas de runtime mesmo quando o terminal não mostra a mensagem.
+    let anterior = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = format!("{info}\n");
+        let _ = std::fs::write("panic.log", &msg);
+        eprintln!("{msg}");
+        anterior(info);
+    }));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1120.0, 760.0])
@@ -812,6 +970,31 @@ fn stamp_disc(rgba: &mut [u8], w: u32, h: u32, cx: f32, cy: f32, r: f32, col: Co
     }
 }
 
+/// Coordenadas baricêntricas de P em relação ao triângulo (a, b, c).
+fn baricentricas(
+    p: egui::Pos2,
+    a: egui::Pos2,
+    b: egui::Pos2,
+    c: egui::Pos2,
+) -> (f32, f32, f32) {
+    let v0 = b - a;
+    let v1 = c - a;
+    let v2 = p - a;
+    let d00 = v0.dot(v0);
+    let d01 = v0.dot(v1);
+    let d11 = v1.dot(v1);
+    let d20 = v2.dot(v0);
+    let d21 = v2.dot(v1);
+    let den = d00 * d11 - d01 * d01;
+    if den.abs() < 1e-6 {
+        return (1.0, 0.0, 0.0);
+    }
+    let wb = (d11 * d20 - d01 * d21) / den;
+    let wc = (d00 * d21 - d01 * d20) / den;
+    let wa = 1.0 - wb - wc;
+    (wa, wb, wc)
+}
+
 /// Gera a grade de cores básicas: uma linha de tons de cinza + linhas de
 /// matizes em variações de saturação/valor (primárias, secundárias,
 /// terciárias e suas variações claras/escuras).
@@ -1214,6 +1397,21 @@ struct FloatSel {
     /// vira um `ImageObject` persistente em vez de ser integrada aos pixels.
     /// Só o botão "Integrar" a rasteriza na camada.
     is_image: bool,
+    /// id estável do objeto de imagem (preservado ao mover/soltar).
+    id: u32,
+}
+
+/// Origem de uma seleção raster (marquee/laço/varinha): a MÁSCARA de pixels
+/// capturados, para poder limpar exatamente esses pixels de todas as camadas
+/// usáveis quando a seleção for movida/recortada/apagada. Enquanto não for
+/// movida, a captura é NÃO destrutiva (os originais permanecem).
+#[derive(Clone)]
+struct SelOrigem {
+    x0: i32,
+    y0: i32,
+    w: u32,
+    h: u32,
+    mask: Vec<bool>,
 }
 
 /// Área de transferência de OBJETOS (vetores e/ou imagens) para
@@ -1263,6 +1461,10 @@ struct SketchMotionApp {
     last_pos: Option<(i32, i32)>,
     tool: Tool,
     brush_color: egui::Color32,
+    /// Palette radial (popup estilo Krita) aberta no botão direito.
+    win_roda: bool,
+    /// Centro da palette radial (posição do clique).
+    roda_pos: egui::Pos2,
     brush_radius: i32,
     hex_input: String,
     status: String,
@@ -1301,6 +1503,9 @@ struct SketchMotionApp {
     reopen_color: bool,
     reopen_palette: bool,
     eyedropper: Eyedropper,
+    /// Trava a pintura até soltar o botão, após coletar cor com o conta-gotas
+    /// (evita que o mesmo clique pinte por cima ao capturar a cor).
+    conta_gotas_trava: bool,
     active_layer: usize,
     win_layers: bool,
     reopen_layers: bool,
@@ -1356,8 +1561,14 @@ struct SketchMotionApp {
     selected_obj: Option<usize>,
     /// Seleção múltipla de objetos vetoriais (para mover em conjunto / agrupar).
     sel_set: Vec<usize>,
+    /// Seleção múltipla de IMAGENS (por id estável), junto com `sel_set`.
+    sel_imgs: Vec<u32>,
+    /// Arraste da seleção múltipla: 0 = nenhum, 1 = mover, 2 = rotacionar.
+    multi_drag: u8,
     /// Próximo id de grupo a distribuir.
     next_group: u32,
+    /// Próximo id estável de imagem a atribuir.
+    next_img_id: u32,
     pen_anchors: Vec<Anchor>,
     pen_drag_idx: Option<usize>,
     dragging_obj: bool,
@@ -1404,7 +1615,11 @@ struct SketchMotionApp {
     fill_tolerance: i32,
     /// Área de transferência de pixels (largura, altura, RGBA) para copiar/colar
     /// uma seleção — inclusive entre frames.
-    clip: Option<(u32, u32, Vec<u8>)>,
+    clip: Option<(u32, u32, Vec<u8>, f32, f32)>,
+    /// Origem da seleção raster flutuante atual (None = colada/importada).
+    sel_origem: Option<SelOrigem>,
+    /// A seleção já foi movida/transformada (fonte já limpa)?
+    sel_movida: bool,
     // frames / animação
     onion: bool,
     onion_tex: Option<egui::TextureHandle>,
@@ -1478,6 +1693,13 @@ struct SketchMotionApp {
     tex_dirvec: Option<egui::TextureHandle>,
     // Ferramenta Vetor de Direção (animação automática por interpolação).
     win_dirvec: bool,
+    /// Guia (régua) sendo arrastada (índice em document.guides), se houver.
+    ruler_drag: Option<usize>,
+    /// Pressionou numa barra da régua e aguarda o arraste sair da barra para
+    /// criar a guia (evita criar guia com cliques acidentais na borda).
+    ruler_pending: Option<GuideOrient>,
+    /// Já registrou o "desfazer" do arraste atual? (evita entradas vazias.)
+    ruler_pushed: bool,
     /// Vetor de direção selecionado na lista.
     dirvec_sel: Option<usize>,
     /// Fluxo de criação: 0 = ocioso, 1 = aguardando clique no objeto (associar).
@@ -1499,10 +1721,6 @@ struct SketchMotionApp {
     dirvec_ghost_tex: Option<egui::TextureHandle>,
     /// Índice do vetor para o qual a textura do fantasma foi montada.
     dirvec_ghost_tex_for: Option<usize>,
-    /// Janelinha de nome ao criar um vetor novo.
-    dirvec_naming: bool,
-    /// Texto do nome sendo digitado.
-    dirvec_name_buf: String,
     // Traçado de Imagem (raster → vetor).
     win_trace: bool,
     /// Imagem de origem para traçar (já reduzida): (w, h, rgba).
@@ -1551,6 +1769,8 @@ struct SketchMotionApp {
     win_fechar: bool,
     /// Fechamento já confirmado (permite a janela fechar sem novo diálogo).
     confirmado_fechar: bool,
+    /// Diálogo "salvar antes de abrir outro trabalho?" visível.
+    win_abrir_confirm: bool,
     // Prancheta: redimensionar o papel (canvas) sem mexer no desenho.
     win_prancheta: bool,
     pr_w: u32,
@@ -1597,6 +1817,8 @@ impl SketchMotionApp {
             last_pos: None,
             tool: Tool::Pencil,
             brush_color: egui::Color32::BLACK,
+            win_roda: false,
+            roda_pos: egui::Pos2::ZERO,
             brush_radius: 2,
             hex_input: String::new(),
             status: String::new(),
@@ -1630,6 +1852,7 @@ impl SketchMotionApp {
             reopen_color: false,
             reopen_palette: false,
             eyedropper: Eyedropper::Off,
+            conta_gotas_trava: false,
             active_layer: 0,
             win_layers: false,
             reopen_layers: false,
@@ -1679,7 +1902,10 @@ impl SketchMotionApp {
             pen_width: 2,
             selected_obj: None,
             sel_set: Vec::new(),
+            sel_imgs: Vec::new(),
+            multi_drag: 0,
             next_group: 1,
+            next_img_id: 1,
             pen_anchors: Vec::new(),
             pen_drag_idx: None,
             dragging_obj: false,
@@ -1718,6 +1944,8 @@ impl SketchMotionApp {
             lasso_points: Vec::new(),
             fill_tolerance: 24,
             clip: None,
+            sel_origem: None,
+            sel_movida: false,
             onion: true,
             onion_tex: None,
             onion_for: None,
@@ -1754,6 +1982,9 @@ impl SketchMotionApp {
             pivot_name_buf: String::new(),
             tex_dirvec: None,
             win_dirvec: false,
+            ruler_drag: None,
+            ruler_pending: None,
+            ruler_pushed: false,
             dirvec_sel: None,
             dirvec_stage: 0,
             dirvec_dragging: false,
@@ -1764,8 +1995,6 @@ impl SketchMotionApp {
             dirvec_ghost_drag: false,
             dirvec_ghost_tex: None,
             dirvec_ghost_tex_for: None,
-            dirvec_naming: false,
-            dirvec_name_buf: String::new(),
             win_trace: false,
             trace_src: None,
             trace_tf: (0.0, 0.0, 0.0, 0.0, 0.0),
@@ -1790,6 +2019,7 @@ impl SketchMotionApp {
             modificado: false,
             win_fechar: false,
             confirmado_fechar: false,
+            win_abrir_confirm: false,
             win_prancheta: false,
             pr_w: CANVAS_W,
             pr_h: CANVAS_H,
@@ -1821,14 +2051,40 @@ impl SketchMotionApp {
         self.tool.effective_color(self.brush_core_color())
     }
 
-    /// A camada `li` está bloqueada? (também true se não existir.)
+    /// A camada `li` está bloqueada? O índice é SEMPRE limitado ao intervalo
+    /// válido antes de checar: um elemento pode carregar um índice de camada de
+    /// outro projeto/frame (ex.: colar entre trabalhos) que não existe aqui, e
+    /// nesse caso ele pertence à camada válida mais próxima — não a uma camada
+    /// "inexistente" que seria falsamente tratada como bloqueada.
     fn layer_locked(&self, li: usize) -> bool {
+        let n = self.document.layers.len();
+        if n == 0 {
+            return true;
+        }
+        let li = li.min(n - 1);
         self.document.layer(li).map_or(true, |l| l.locked)
     }
 
-    /// A camada ativa está bloqueada? (também true se não existir camada.)
-    fn active_locked(&self) -> bool {
-        self.layer_locked(self.active_layer)
+    /// Índice da camada VISÍVEL mais ao topo que tem um pixel opaco em (x, y).
+    /// Base da auto-troca de camada da Seleção: clicar em conteúdo de outra
+    /// camada leva o foco para a camada desse conteúdo.
+    fn layer_topo_no_ponto(&self, x: i32, y: i32) -> Option<usize> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let (xu, yu) = (x as u32, y as u32);
+        for i in (0..self.document.layers.len()).rev() {
+            let l = &self.document.layers[i];
+            if !l.visible {
+                continue;
+            }
+            if let Some(c) = l.get_pixel(xu, yu) {
+                if c.a > 0 {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     /// A camada à qual a seleção/imagem flutuante pertence está bloqueada?
@@ -1845,9 +2101,8 @@ impl SketchMotionApp {
     /// em outra camada e tentou interagir com algo de uma camada bloqueada, a
     /// interação é apenas recusada (pelo `return` de quem chamou), sem aviso.
     fn warn_locked_layer(&mut self, li: usize) {
-        if li != self.active_layer {
-            return;
-        }
+        let n = self.document.layers.len();
+        let li = if n == 0 { li } else { li.min(n - 1) };
         let nome = self
             .document
             .layer(li)
@@ -1890,16 +2145,32 @@ impl SketchMotionApp {
 
     /// Salva o estado atual no histórico e limpa o refazer. O histórico é
     /// ilimitado (cresce conforme as ações; só a memória disponível o limita).
+    /// Limite do histórico: cada estado é um clone do documento inteiro (todas
+    /// as camadas/frames), então uma pilha ilimitada consumia memória sem parar
+    /// (causa de lentidão e de fechamentos inesperados). Mantemos os N mais
+    /// recentes; os mais antigos são descartados.
+    const MAX_UNDO: usize = 30;
+
     fn push_undo(&mut self) {
         self.undo_stack.push(self.document.clone());
+        if self.undo_stack.len() > Self::MAX_UNDO {
+            let excesso = self.undo_stack.len() - Self::MAX_UNDO;
+            self.undo_stack.drain(0..excesso);
+        }
         self.redo_stack.clear();
         self.modificado = true;
     }
 
     fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
-            self.redo_stack.push(self.document.clone());
-            self.document = prev;
+            // MOVE o documento atual para o redo (sem clonar): elimina a cópia
+            // pesada que causava atraso ao desfazer.
+            let atual = std::mem::replace(&mut self.document, prev);
+            self.redo_stack.push(atual);
+            if self.redo_stack.len() > Self::MAX_UNDO {
+                let excesso = self.redo_stack.len() - Self::MAX_UNDO;
+                self.redo_stack.drain(0..excesso);
+            }
             self.active_layer = self
                 .active_layer
                 .min(self.document.layers.len().saturating_sub(1));
@@ -1909,6 +2180,8 @@ impl SketchMotionApp {
             self.float_sel = None;
             self.float_tex = None;
             self.sel_set.clear();
+            self.sel_imgs.clear();
+            self.multi_drag = 0;
             self.selected_obj = None;
             self.modificado = true;
             self.dirty = true;
@@ -1918,8 +2191,12 @@ impl SketchMotionApp {
 
     fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
-            self.undo_stack.push(self.document.clone());
-            self.document = next;
+            let atual = std::mem::replace(&mut self.document, next);
+            self.undo_stack.push(atual);
+            if self.undo_stack.len() > Self::MAX_UNDO {
+                let excesso = self.undo_stack.len() - Self::MAX_UNDO;
+                self.undo_stack.drain(0..excesso);
+            }
             self.active_layer = self
                 .active_layer
                 .min(self.document.layers.len().saturating_sub(1));
@@ -1927,6 +2204,8 @@ impl SketchMotionApp {
             self.float_sel = None;
             self.float_tex = None;
             self.sel_set.clear();
+            self.sel_imgs.clear();
+            self.multi_drag = 0;
             self.selected_obj = None;
             self.modificado = true;
             self.dirty = true;
@@ -2006,6 +2285,48 @@ impl SketchMotionApp {
                     y as u32,
                     Color::rgba(bl(c.r, d.r), bl(c.g, d.g), bl(c.b, d.b), (oa * 255.0).round() as u8),
                 );
+            }
+        }
+    }
+
+    /// Borracha: apaga o disco/quadrado em TODAS as camadas usáveis (visíveis e
+    /// desbloqueadas), independentemente de qual camada está ativa. As travadas
+    /// e ocultas ficam intactas.
+    fn stamp_erase_multi(&mut self, x: i32, y: i32, r: i32) {
+        let pixel = self.pixel_mode;
+        let usaveis: Vec<usize> =
+            (0..self.document.layers.len()).filter(|&i| self.layer_usavel(i)).collect();
+        if usaveis.is_empty() {
+            return;
+        }
+        let mut pts: Vec<(i32, i32)> = Vec::new();
+        if pixel {
+            let sq = r.max(1);
+            let half = sq / 2;
+            for dy in -half..=(sq - 1 - half) {
+                for dx in -half..=(sq - 1 - half) {
+                    pts.push((dx, dy));
+                }
+            }
+        } else if r <= 1 {
+            pts.push((0, 0));
+        } else {
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx * dx + dy * dy <= r * r {
+                        pts.push((dx, dy));
+                    }
+                }
+            }
+        }
+        for &li in &usaveis {
+            if let Some(layer) = self.document.layer_mut(li) {
+                for &(dx, dy) in &pts {
+                    let (px, py) = (x + dx, y + dy);
+                    if px >= 0 && py >= 0 {
+                        layer.set_pixel(px as u32, py as u32, Color::TRANSPARENT);
+                    }
+                }
             }
         }
     }
@@ -2156,6 +2477,13 @@ impl SketchMotionApp {
 
     /// Carimba um dab conforme o tipo de pincel (ou quadrado no pixel art).
     fn stamp(&mut self, x: i32, y: i32, r: i32) {
+        // Borracha age em TODAS as camadas usáveis (independe da ativa).
+        if self.tool == Tool::Eraser {
+            self.stamp_erase_multi(x, y, r);
+            self.dirty = true;
+            return;
+        }
+        // Desenho/inserção: sempre na camada ATIVA (precisa estar usável).
         let li = self.active_layer;
         if self.active_bloqueada_para_edicao() {
             return;
@@ -2173,11 +2501,6 @@ impl SketchMotionApp {
                     }
                 }
             }
-            self.dirty = true;
-            return;
-        }
-        if self.tool == Tool::Eraser {
-            self.stamp_hard(x, y, r);
             self.dirty = true;
             return;
         }
@@ -2228,6 +2551,10 @@ impl SketchMotionApp {
     /// (comportamento específico virá com o painel de configuração).
     fn novo_documento(&mut self, w: u32, h: u32, pixel: bool) {
         self.document = Document::new(w, h, Color::WHITE);
+        // Libera o histórico do trabalho anterior (memória).
+        self.undo_stack = Vec::new();
+        self.redo_stack = Vec::new();
+        self.confirmado_fechar = false;
         self.active_layer = 0;
         self.last_pos = None;
         self.current_path = None;
@@ -2379,6 +2706,11 @@ impl SketchMotionApp {
     /// Aplica um documento recém-aberto ao estado do app.
     fn aplicar_documento_aberto(&mut self, doc: Document, path: std::path::PathBuf) {
         self.document = doc;
+        // Libera o histórico do trabalho anterior (memória) — abrir substitui o
+        // trabalho atual, então o desfazer dele não precisa mais existir.
+        self.undo_stack = Vec::new();
+        self.redo_stack = Vec::new();
+        self.confirmado_fechar = false;
         self.active_layer = 0;
         self.last_pos = None;
         self.dirty = true;
@@ -2517,6 +2849,7 @@ impl SketchMotionApp {
             opacity: 1.0,
             layer: self.active_layer,
             is_image: true,
+            id: 0,
         });
         self.float_tex = None;
         self.tool = Tool::Select;
@@ -2868,6 +3201,181 @@ impl SketchMotionApp {
         out
     }
 
+    /// Índices das imagens cuja caixa cruza a marca (rubber-band).
+    fn imagens_na_marca(&self, a: (i32, i32), b: (i32, i32)) -> Vec<usize> {
+        let (x0, x1) = (a.0.min(b.0) as f32, a.0.max(b.0) as f32);
+        let (y0, y1) = (a.1.min(b.1) as f32, a.1.max(b.1) as f32);
+        if (x1 - x0) < 2.0 && (y1 - y0) < 2.0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (i, o) in self.document.images.iter().enumerate() {
+            let (minx, miny, maxx, maxy) =
+                (o.cx - o.hw, o.cy - o.hh, o.cx + o.hw, o.cy + o.hh);
+            if minx <= x1 && maxx >= x0 && miny <= y1 && maxy >= y0 {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    /// A seleção múltipla (vetores + imagens) está ativa?
+    fn multi_ativa(&self) -> bool {
+        !self.sel_imgs.is_empty() || self.sel_set.len() >= 2
+    }
+
+    /// Caixa combinada (doc) da seleção múltipla: vetores + imagens.
+    fn selecao_multi_bbox(&self) -> Option<(f32, f32, f32, f32)> {
+        let mut bb: Option<(f32, f32, f32, f32)> = None;
+        let mut acc = |a: f32, b: f32, c: f32, d: f32| {
+            bb = Some(match bb {
+                Some((x0, y0, x1, y1)) => (x0.min(a), y0.min(b), x1.max(c), y1.max(d)),
+                None => (a, b, c, d),
+            });
+        };
+        for &i in &self.sel_set {
+            if let Some(o) = self.document.vectors.get(i) {
+                if let Some((a, b, c, d)) = o.bounds() {
+                    acc(a, b, c, d);
+                }
+            }
+        }
+        for &id in &self.sel_imgs {
+            if let Some(o) = self.document.images.iter().find(|o| o.id == id) {
+                acc(o.cx - o.hw, o.cy - o.hh, o.cx + o.hw, o.cy + o.hh);
+            }
+        }
+        bb
+    }
+
+    fn selecao_multi_center(&self) -> Option<(f32, f32)> {
+        self.selecao_multi_bbox()
+            .map(|(a, b, c, d)| ((a + c) / 2.0, (b + d) / 2.0))
+    }
+
+    /// Translada toda a seleção múltipla (vetores + imagens) por (dx, dy).
+    fn multi_translate(&mut self, dx: f32, dy: f32) {
+        for &i in &self.sel_set.clone() {
+            if let Some(o) = self.document.vectors.get_mut(i) {
+                o.translate(dx, dy);
+            }
+        }
+        for &id in &self.sel_imgs.clone() {
+            if let Some(o) = self.document.images.iter_mut().find(|o| o.id == id) {
+                o.cx += dx;
+                o.cy += dy;
+            }
+        }
+        self.dirty = true;
+        self.modificado = true;
+    }
+
+    /// Rotaciona toda a seleção múltipla por `ang` rad ao redor de um centro.
+    fn multi_rotate(&mut self, center: (f32, f32), ang: f32) {
+        for &i in &self.sel_set.clone() {
+            if let Some(o) = self.document.vectors.get_mut(i) {
+                o.rotate_around(center.0, center.1, ang);
+            }
+        }
+        let (s, c) = ang.sin_cos();
+        for &id in &self.sel_imgs.clone() {
+            if let Some(o) = self.document.images.iter_mut().find(|o| o.id == id) {
+                let (dx, dy) = (o.cx - center.0, o.cy - center.1);
+                o.cx = center.0 + dx * c - dy * s;
+                o.cy = center.1 + dx * s + dy * c;
+                o.angle += ang;
+            }
+        }
+        self.dirty = true;
+        self.modificado = true;
+    }
+
+    /// Interação da SELEÇÃO MÚLTIPLA (mover/rotacionar vetores + imagens juntos).
+    /// Devolve true se consumiu a interação (não deixa a seleção normal agir).
+    fn interacao_multi_selecao(
+        &mut self,
+        pressed: bool,
+        down: bool,
+        hover: Option<egui::Pos2>,
+        ppos: Option<egui::Pos2>,
+        pdelta: egui::Vec2,
+        rect: egui::Rect,
+        zoom: f32,
+    ) -> bool {
+        let to_doc = |p: egui::Pos2| ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+        // Continua um arraste/rotação em andamento.
+        if self.multi_drag != 0 {
+            if down {
+                if let Some(pp) = ppos {
+                    if self.multi_drag == 2 {
+                        let center = self.selecao_multi_center().unwrap_or((0.0, 0.0));
+                        let cur = to_doc(pp);
+                        let prev = (cur.0 - pdelta.x / zoom, cur.1 - pdelta.y / zoom);
+                        let a0 = (prev.1 - center.1).atan2(prev.0 - center.0);
+                        let a1 = (cur.1 - center.1).atan2(cur.0 - center.0);
+                        let d = a1 - a0;
+                        if d.abs() > f32::EPSILON {
+                            self.multi_rotate(center, d);
+                        }
+                    } else {
+                        let (dx, dy) = (pdelta.x / zoom, pdelta.y / zoom);
+                        if dx != 0.0 || dy != 0.0 {
+                            self.multi_translate(dx, dy);
+                        }
+                    }
+                }
+            } else {
+                self.multi_drag = 0;
+            }
+            return true;
+        }
+        if !self.multi_ativa() || !pressed {
+            return false;
+        }
+        let Some(p) = hover else { return false };
+        let Some((minx, miny, maxx, maxy)) = self.selecao_multi_bbox() else {
+            return false;
+        };
+        let scr = |q: (f32, f32)| egui::pos2(rect.min.x + q.0 * zoom, rect.min.y + q.1 * zoom);
+        let r = egui::Rect::from_min_max(scr((minx, miny)), scr((maxx, maxy)));
+        // Alça de rotação acima do centro-topo.
+        let handle = egui::pos2(r.center().x, r.top() - 24.0);
+        if handle.distance(p) <= 12.0 {
+            self.multi_drag = 2;
+            self.push_undo();
+            return true;
+        }
+        if r.expand(6.0).contains(p) {
+            self.multi_drag = 1;
+            self.push_undo();
+            return true;
+        }
+        // Clique fora da seleção: limpa e deixa a seleção normal seguir.
+        self.sel_set.clear();
+        self.sel_imgs.clear();
+        false
+    }
+
+    /// Desenha a caixa da seleção múltipla + alça de rotação.
+    fn desenhar_selecao_multi(&self, ui: &mut egui::Ui, rect: egui::Rect, zoom: f32) {
+        if !self.multi_ativa() {
+            return;
+        }
+        let Some((minx, miny, maxx, maxy)) = self.selecao_multi_bbox() else {
+            return;
+        };
+        let painter = ui.painter_at(ui.clip_rect());
+        let scr = |q: (f32, f32)| egui::pos2(rect.min.x + q.0 * zoom, rect.min.y + q.1 * zoom);
+        let r = egui::Rect::from_min_max(scr((minx, miny)), scr((maxx, maxy)));
+        let azul = egui::Color32::from_rgb(60, 140, 255);
+        painter.rect_stroke(r, 2.0, egui::Stroke::new(1.5, azul));
+        let top = egui::pos2(r.center().x, r.top());
+        let handle = egui::pos2(r.center().x, r.top() - 24.0);
+        painter.line_segment([top, handle], egui::Stroke::new(1.5, azul));
+        painter.circle_filled(handle, 5.0, azul);
+        painter.circle_stroke(handle, 5.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+    }
+
     /// Agrupa os objetos do conjunto atual (passam a mover/selecionar juntos).
     fn agrupar_selecao(&mut self) {
         if self.sel_set.len() < 2 {
@@ -3009,7 +3517,7 @@ impl SketchMotionApp {
         if self.sel_set.len() < 2 {
             return;
         }
-        let painter = ui.painter_at(rect);
+        let painter = ui.painter_at(ui.clip_rect());
         let blue = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
         for &i in &self.sel_set {
             if let Some(obj) = self.document.vectors.get(i) {
@@ -3082,38 +3590,114 @@ impl SketchMotionApp {
         }
     }
 
-    /// Recorta a região retangular (coords do documento) da camada ativa para
-    /// uma seleção flutuante e limpa esses pixels na camada.
-    fn lift_selection(&mut self, start: (i32, i32), end: (i32, i32)) {
-        let x0 = start.0.min(end.0).max(0);
-        let y0 = start.1.min(end.1).max(0);
-        let x1 = start.0.max(end.0).min(self.document.width as i32);
-        let y1 = start.1.max(end.1).min(self.document.height as i32);
-        if x1 - x0 < 1 || y1 - y0 < 1 {
-            return;
+    /// Uma camada é "usável" para seleção/edição quando está visível e não
+    /// bloqueada. As demais (ocultas ou com cadeado) ficam de fora.
+    fn layer_usavel(&self, li: usize) -> bool {
+        self.document.layer(li).map_or(false, |l| l.visible && !l.locked)
+    }
+
+    /// Camada usável do topo (destino padrão quando a ativa não é usável).
+    fn camada_usavel_topo(&self) -> Option<usize> {
+        (0..self.document.layers.len()).rev().find(|&i| self.layer_usavel(i))
+    }
+
+    /// Camada de destino da seleção: a ativa se usável, senão a do topo usável.
+    fn destino_selecao(&self) -> Option<usize> {
+        if self.layer_usavel(self.active_layer) {
+            Some(self.active_layer)
+        } else {
+            self.camada_usavel_topo()
         }
-        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
-        if self.active_locked() {
-            self.warn_lock();
-            return;
+    }
+
+    /// Cor composta (alpha-over, de baixo p/ cima) das camadas USÁVEIS no pixel.
+    fn cor_composta_usavel(&self, x: u32, y: u32) -> Color {
+        let (mut r, mut g, mut b, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for i in 0..self.document.layers.len() {
+            if !self.layer_usavel(i) {
+                continue;
+            }
+            let Some(layer) = self.document.layer(i) else { continue };
+            let Some(c) = layer.get_pixel(x, y) else { continue };
+            let sa = (c.a as f32 / 255.0) * layer.opacity().clamp(0.0, 1.0);
+            if sa <= 0.0 {
+                continue;
+            }
+            let na = sa + a * (1.0 - sa);
+            if na <= 0.0 {
+                continue;
+            }
+            r = (c.r as f32 * sa + r * a * (1.0 - sa)) / na;
+            g = (c.g as f32 * sa + g * a * (1.0 - sa)) / na;
+            b = (c.b as f32 * sa + b * a * (1.0 - sa)) / na;
+            a = na;
         }
-        self.push_undo();
-        let li = self.active_layer;
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
-        if let Some(layer) = self.document.layer_mut(li) {
-            for yy in 0..h {
-                for xx in 0..w {
-                    let (px, py) = (x0 as u32 + xx, y0 as u32 + yy);
-                    if let Some(c) = layer.get_pixel(px, py) {
-                        let di = ((yy * w + xx) * 4) as usize;
-                        pixels[di] = c.r;
-                        pixels[di + 1] = c.g;
-                        pixels[di + 2] = c.b;
-                        pixels[di + 3] = c.a;
+        Color::rgba(
+            r.round() as u8,
+            g.round() as u8,
+            b.round() as u8,
+            (a * 255.0).round() as u8,
+        )
+    }
+
+    /// Limpa (transparente) os pixels da máscara de origem em TODAS as camadas
+    /// usáveis. Usado ao mover/recortar/apagar a seleção.
+    fn limpar_origem_selecao(&mut self) {
+        let Some(o) = self.sel_origem.take() else { return };
+        let usaveis: Vec<usize> =
+            (0..self.document.layers.len()).filter(|&i| self.layer_usavel(i)).collect();
+        for yy in 0..o.h {
+            for xx in 0..o.w {
+                if !o.mask[(yy * o.w + xx) as usize] {
+                    continue;
+                }
+                let (px, py) = (o.x0 as u32 + xx, o.y0 as u32 + yy);
+                for &li in &usaveis {
+                    if let Some(layer) = self.document.layer_mut(li) {
                         layer.set_pixel(px, py, Color::TRANSPARENT);
                     }
                 }
             }
+        }
+        // As camadas mudaram: força refazer as texturas de composição (below/
+        // above e miniaturas), senão a origem "some" só no próximo evento.
+        self.split_for = None;
+        self.below_tex = None;
+        self.above_tex = None;
+        self.onion_for = None;
+        self.dirty = true;
+    }
+
+    /// Cria uma seleção flutuante a partir de uma máscara (coords absolutas),
+    /// compondo o conteúdo de todas as camadas usáveis. NÃO destrói o original
+    /// (a limpeza acontece só ao mover/recortar/apagar).
+    fn iniciar_selecao_mascara(&mut self, x0: i32, y0: i32, w: u32, h: u32, mask: Vec<bool>) {
+        let Some(dest) = self.destino_selecao() else {
+            self.status = "Nenhuma camada disponível (todas ocultas ou bloqueadas)".into();
+            self.warn_ticks = 150;
+            return;
+        };
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let mut algo = false;
+        for yy in 0..h {
+            for xx in 0..w {
+                if !mask[(yy * w + xx) as usize] {
+                    continue;
+                }
+                let c = self.cor_composta_usavel(x0 as u32 + xx, y0 as u32 + yy);
+                if c.a == 0 {
+                    continue;
+                }
+                algo = true;
+                let di = ((yy * w + xx) * 4) as usize;
+                pixels[di] = c.r;
+                pixels[di + 1] = c.g;
+                pixels[di + 2] = c.b;
+                pixels[di + 3] = c.a;
+            }
+        }
+        if !algo {
+            return;
         }
         self.float_sel = Some(FloatSel {
             pixels,
@@ -3125,12 +3709,30 @@ impl SketchMotionApp {
             hh: h as f32 / 2.0,
             angle: 0.0,
             opacity: 1.0,
-            layer: li,
+            layer: dest,
             is_image: false,
+            id: 0,
         });
+        self.sel_origem = Some(SelOrigem { x0, y0, w, h, mask });
+        self.sel_movida = false;
         self.float_tex = None;
+        self.active_layer = dest;
         self.dirty = true;
-        self.status = "Seleção recortada — arraste para mover".into();
+        self.status = "Seleção (camadas desbloqueadas) — arraste para mover".into();
+    }
+
+    /// Seleção retangular: captura o conjunto das camadas usáveis (não destrutiva).
+    fn lift_selection(&mut self, start: (i32, i32), end: (i32, i32)) {
+        let x0 = start.0.min(end.0).max(0);
+        let y0 = start.1.min(end.1).max(0);
+        let x1 = start.0.max(end.0).min(self.document.width as i32);
+        let y1 = start.1.max(end.1).min(self.document.height as i32);
+        if x1 - x0 < 1 || y1 - y0 < 1 {
+            return;
+        }
+        let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
+        let mask = vec![true; (w * h) as usize];
+        self.iniciar_selecao_mascara(x0, y0, w, h, mask);
     }
 
     /// Carimba a seleção flutuante de volta na camada ativa (alpha over).
@@ -3212,13 +3814,30 @@ impl SketchMotionApp {
     fn drop_float(&mut self) {
         let is_img = matches!(&self.float_sel, Some(f) if f.is_image);
         if !is_img {
+            // Seleção raster que NÃO foi movida: descarta (os originais seguem
+            // intactos, pois a captura foi não destrutiva).
+            if self.sel_origem.is_some() && !self.sel_movida {
+                self.float_sel = None;
+                self.float_tex = None;
+                self.sel_origem = None;
+                self.sel_movida = false;
+                self.dirty = true;
+                return;
+            }
             self.commit_float();
+            self.sel_origem = None;
+            self.sel_movida = false;
             return;
         }
         if let Some(fs) = self.float_sel.take() {
-            self.document.images.push(ImageObject::new(
-                fs.pixels, fs.ow, fs.oh, fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, fs.opacity, fs.layer,
-            ));
+            // Limita a camada ao intervalo válido (a flutuante pode ter vindo de
+            // outro projeto com mais camadas — colar entre trabalhos).
+            let li = fs.layer.min(self.document.layers.len().saturating_sub(1));
+            let mut im = ImageObject::new(
+                fs.pixels, fs.ow, fs.oh, fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, fs.opacity, li,
+            );
+            im.id = fs.id; // preserva a identidade (pivô/vetor continuam ligados)
+            self.document.images.push(im);
             // Grava no frame atual para persistir (salvar/exportar) já refletir.
             self.document.sync_to_frames();
             self.float_tex = None;
@@ -3250,15 +3869,22 @@ impl SketchMotionApp {
         let Some(i) = hit else {
             return false;
         };
-        // Objeto em camada bloqueada não pode ser pego. Só notifica se essa
-        // camada for a ativa (você está nela); em outra camada, recusa em
-        // silêncio e o clique passa adiante (você continua podendo desenhar).
-        if self.layer_locked(self.document.images[i].layer) {
-            self.warn_locked_layer(self.document.images[i].layer);
+        // Índice da camada do objeto, SEMPRE limitado ao intervalo válido: um
+        // objeto pode ter guardado um índice de uma camada que não existe mais
+        // (ex.: camada excluída). Sem esse clamp, layer_locked trataria o índice
+        // inexistente como "bloqueado" e recusaria o objeto mesmo sem cadeado.
+        let layer = self.document.images[i]
+            .layer
+            .min(self.document.layers.len().saturating_sub(1));
+        // Só bloqueia se essa camada (válida) estiver realmente travada.
+        if self.layer_locked(layer) {
+            self.warn_locked_layer(layer);
             return false;
         }
         let o = self.document.images.remove(i);
-        let layer = o.layer.min(self.document.layers.len().saturating_sub(1));
+        // Clicar num objeto leva o seletor de camadas para a camada dele — o
+        // usuário passa a saber sempre em qual camada o objeto está.
+        self.active_layer = layer;
         self.float_sel = Some(FloatSel {
             pixels: o.pixels,
             ow: o.ow,
@@ -3271,6 +3897,7 @@ impl SketchMotionApp {
             opacity: o.opacity,
             layer,
             is_image: true,
+            id: o.id,
         });
         self.float_tex = None;
         self.selected_obj = None;
@@ -3339,6 +3966,15 @@ impl SketchMotionApp {
     fn float_down(&mut self, ppos: Option<egui::Pos2>, rect: egui::Rect, zoom: f32) -> bool {
         if !(self.float_resize.is_some() || self.float_rotating || self.float_dragging) {
             return false;
+        }
+        // Primeiro movimento/transformação de uma seleção raster: agora sim
+        // limpa a origem (o conjunto das camadas usáveis) — até aqui era não
+        // destrutivo, para permitir copiar sem apagar.
+        let raster = matches!(&self.float_sel, Some(f) if !f.is_image);
+        if raster && self.sel_origem.is_some() && !self.sel_movida {
+            self.push_undo();
+            self.limpar_origem_selecao();
+            self.sel_movida = true;
         }
         if let Some(pp) = ppos {
             let cur = ((pp.x - rect.min.x) / zoom, (pp.y - rect.min.y) / zoom);
@@ -3448,48 +4084,18 @@ impl SketchMotionApp {
             return;
         }
         let (w, h) = ((x1 - x0) as u32, (y1 - y0) as u32);
-        if self.active_locked() {
-            self.warn_lock();
-            return;
-        }
-        self.push_undo();
-        let li = self.active_layer;
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
-        if let Some(layer) = self.document.layer_mut(li) {
-            for yy in 0..h {
-                for xx in 0..w {
-                    let wx = x0 as f32 + xx as f32 + 0.5;
-                    let wy = y0 as f32 + yy as f32 + 0.5;
-                    if ponto_no_poligono(wx, wy, pts) {
-                        let (px, py) = (x0 as u32 + xx, y0 as u32 + yy);
-                        if let Some(c) = layer.get_pixel(px, py) {
-                            let di = ((yy * w + xx) * 4) as usize;
-                            pixels[di] = c.r;
-                            pixels[di + 1] = c.g;
-                            pixels[di + 2] = c.b;
-                            pixels[di + 3] = c.a;
-                            layer.set_pixel(px, py, Color::TRANSPARENT);
-                        }
-                    }
+        // Máscara pelo polígono do laço; captura o conjunto das camadas usáveis.
+        let mut mask = vec![false; (w * h) as usize];
+        for yy in 0..h {
+            for xx in 0..w {
+                let wx = x0 as f32 + xx as f32 + 0.5;
+                let wy = y0 as f32 + yy as f32 + 0.5;
+                if ponto_no_poligono(wx, wy, pts) {
+                    mask[(yy * w + xx) as usize] = true;
                 }
             }
         }
-        self.float_sel = Some(FloatSel {
-            pixels,
-            ow: w,
-            oh: h,
-            cx: x0 as f32 + w as f32 / 2.0,
-            cy: y0 as f32 + h as f32 / 2.0,
-            hw: w as f32 / 2.0,
-            hh: h as f32 / 2.0,
-            angle: 0.0,
-            opacity: 1.0,
-            layer: li,
-            is_image: false,
-        });
-        self.float_tex = None;
-        self.dirty = true;
-        self.status = "Seleção livre recortada — arraste para mover".into();
+        self.iniciar_selecao_mascara(x0, y0, w, h, mask);
     }
 
     /// Captura (SEM apagar) o conteúdo visível dentro do contorno para virar uma
@@ -3570,6 +4176,7 @@ impl SketchMotionApp {
             opacity: 1.0,
             layer: self.active_layer,
             is_image: false,
+            id: 0,
         });
         self.float_tex = None;
         self.tool = Tool::Select;
@@ -4043,41 +4650,19 @@ impl SketchMotionApp {
             return;
         }
         let (bw, bh) = ((maxx - minx + 1) as u32, (maxy - miny + 1) as u32);
-        self.push_undo();
-        let mut pixels = vec![0u8; (bw * bh * 4) as usize];
-        if let Some(layer) = self.document.layer_mut(li) {
-            for yy in 0..bh {
-                for xx in 0..bw {
-                    let (gx, gy) = (minx + xx as i32, miny + yy as i32);
-                    if mask[(gy * w + gx) as usize] {
-                        if let Some(c) = layer.get_pixel(gx as u32, gy as u32) {
-                            let di = ((yy * bw + xx) * 4) as usize;
-                            pixels[di] = c.r;
-                            pixels[di + 1] = c.g;
-                            pixels[di + 2] = c.b;
-                            pixels[di + 3] = c.a;
-                            layer.set_pixel(gx as u32, gy as u32, Color::TRANSPARENT);
-                        }
-                    }
+        // Recorta a máscara para a caixa e captura o conjunto das camadas
+        // usáveis (não destrutivo — a limpeza vem ao mover/recortar/apagar).
+        let mut bmask = vec![false; (bw * bh) as usize];
+        for yy in 0..bh {
+            for xx in 0..bw {
+                let gx = minx + xx as i32;
+                let gy = miny + yy as i32;
+                if mask[(gy * w + gx) as usize] {
+                    bmask[(yy * bw + xx) as usize] = true;
                 }
             }
         }
-        self.float_sel = Some(FloatSel {
-            pixels,
-            ow: bw,
-            oh: bh,
-            cx: minx as f32 + bw as f32 / 2.0,
-            cy: miny as f32 + bh as f32 / 2.0,
-            hw: bw as f32 / 2.0,
-            hh: bh as f32 / 2.0,
-            angle: 0.0,
-            opacity: 1.0,
-            layer: li,
-            is_image: false,
-        });
-        self.float_tex = None;
-        self.dirty = true;
-        self.status = "Seleção por cor — arraste para mover".into();
+        self.iniciar_selecao_mascara(minx, miny, bw, bh, bmask);
     }
 
     fn opcoes_laco(&mut self, ui: &mut egui::Ui) {
@@ -4190,7 +4775,7 @@ impl SketchMotionApp {
     /// Desenha os objetos vetoriais (curvas), a caixa/alças de seleção e o
     /// traço em progresso da Caneta, como overlay sobre o canvas.
     fn desenhar_vetores(&self, ui: &egui::Ui, rect: egui::Rect, zoom: f32) {
-        let painter = ui.painter_at(rect);
+        let painter = ui.painter_at(ui.clip_rect());
         let sp = |x: f32, y: f32| egui::pos2(rect.min.x + x * zoom, rect.min.y + y * zoom);
         let azul = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
         for (idx, obj) in self.document.vectors.iter().enumerate() {
@@ -5510,10 +6095,12 @@ impl SketchMotionApp {
             self.commit_float();
             // Se ficou por bloqueio, devolve como objeto para não se perder.
             if let Some(fs) = self.float_sel.take() {
-                self.document.images.push(ImageObject::new(
+                let mut im = ImageObject::new(
                     fs.pixels, fs.ow, fs.oh, fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, fs.opacity,
                     fs.layer,
-                ));
+                );
+                im.id = fs.id;
+                self.document.images.push(im);
                 self.float_tex = None;
             }
         }
@@ -5537,13 +6124,16 @@ impl SketchMotionApp {
                 opacity: o.opacity,
                 layer: li,
                 is_image: true,
+                id: o.id,
             });
             self.commit_float();
             if let Some(fs) = self.float_sel.take() {
-                restantes.push(ImageObject::new(
+                let mut im = ImageObject::new(
                     fs.pixels, fs.ow, fs.oh, fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, fs.opacity,
                     fs.layer,
-                ));
+                );
+                im.id = fs.id;
+                restantes.push(im);
             }
         }
         self.document.images = restantes;
@@ -5604,6 +6194,560 @@ impl SketchMotionApp {
             });
             ui.add_space(2.0);
         });
+    }
+
+    /// Escolhe um passo "redondo" (em px do documento) entre rótulos da régua,
+    /// de forma que fiquem espaçados o bastante na tela para o zoom atual.
+    fn passo_regua(zoom: f32) -> i32 {
+        const CANDS: [i32; 12] = [1, 2, 5, 10, 20, 25, 50, 100, 200, 500, 1000, 2000];
+        for c in CANDS {
+            if c as f32 * zoom >= 48.0 {
+                return c;
+            }
+        }
+        5000
+    }
+
+    /// Interação global das guias/régua. Só age sobre o canvas "puro": se o
+    /// ponteiro está sobre uma janela/painel flutuante (`sobre_area`), ignora,
+    /// para não criar guias por baixo de janelas. Criar uma guia exige ARRASTAR
+    /// a partir de uma barra (um clique solto na barra não cria nada), e nada é
+    /// registrado no histórico de desfazer sem uma mudança real. Devolve `true`
+    /// quando consome o evento (a ferramenta ativa então não age no clique).
+    fn interacao_guias(
+        &mut self,
+        pressed: bool,
+        down: bool,
+        dbl: bool,
+        sobre_area: bool,
+        ppos: Option<egui::Pos2>,
+        rect: egui::Rect,
+        vp: egui::Rect,
+        zoom: f32,
+    ) -> bool {
+        const RULER: f32 = 18.0;
+        let to_doc_x = |x: f32| (x - rect.min.x) / zoom;
+        let to_doc_y = |y: f32| (y - rect.min.y) / zoom;
+        let em_barra_topo = |p: egui::Pos2| vp.contains(p) && p.y <= vp.min.y + RULER;
+        let em_barra_esq = |p: egui::Pos2| vp.contains(p) && p.x <= vp.min.x + RULER;
+
+        // Duplo-clique numa barra remove TODAS as guias.
+        if dbl && !sobre_area {
+            if let Some(pp) = ppos {
+                if em_barra_topo(pp) || em_barra_esq(pp) {
+                    if !self.document.guides.is_empty() {
+                        self.push_undo();
+                        self.document.guides.clear();
+                        self.status = "Todas as guias removidas".into();
+                        self.dirty = true;
+                    }
+                    self.ruler_drag = None;
+                    self.ruler_pending = None;
+                    return true;
+                }
+            }
+        }
+
+        // Arraste de uma guia EXISTENTE em andamento.
+        if let Some(idx) = self.ruler_drag {
+            if idx >= self.document.guides.len() {
+                self.ruler_drag = None;
+                self.ruler_pushed = false;
+                return false;
+            }
+            if down {
+                if let Some(pp) = ppos {
+                    let horiz = self.document.guides[idx].is_horizontal();
+                    let novo = if horiz { to_doc_y(pp.y).round() } else { to_doc_x(pp.x).round() };
+                    if (novo - self.document.guides[idx].pos).abs() > f32::EPSILON {
+                        if !self.ruler_pushed {
+                            self.push_undo();
+                            self.ruler_pushed = true;
+                        }
+                        self.document.guides[idx].pos = novo;
+                        self.dirty = true;
+                    }
+                }
+                return true;
+            }
+            // Soltou: apaga se ficou fora do papel.
+            let g = self.document.guides[idx];
+            let fora = if g.is_horizontal() {
+                g.pos < 0.0 || g.pos > self.document.height as f32
+            } else {
+                g.pos < 0.0 || g.pos > self.document.width as f32
+            };
+            if fora {
+                if !self.ruler_pushed {
+                    self.push_undo();
+                }
+                self.document.guides.remove(idx);
+                self.status = "Guia removida".into();
+                self.dirty = true;
+            }
+            self.ruler_drag = None;
+            self.ruler_pushed = false;
+            return true;
+        }
+
+        // Pressionou numa barra e aguarda o arraste sair dela para criar a guia.
+        if let Some(orient) = self.ruler_pending {
+            if down {
+                if let Some(pp) = ppos {
+                    let saiu = match orient {
+                        GuideOrient::Horizontal => pp.y > vp.min.y + RULER,
+                        GuideOrient::Vertical => pp.x > vp.min.x + RULER,
+                    };
+                    if saiu {
+                        self.push_undo();
+                        let g = match orient {
+                            GuideOrient::Horizontal => Guide::horizontal(to_doc_y(pp.y).round()),
+                            GuideOrient::Vertical => Guide::vertical(to_doc_x(pp.x).round()),
+                        };
+                        self.document.guides.push(g);
+                        self.ruler_drag = Some(self.document.guides.len() - 1);
+                        self.ruler_pushed = true;
+                        self.ruler_pending = None;
+                        self.status = "Guia — arraste; solte fora do papel para cancelar".into();
+                        self.dirty = true;
+                    }
+                }
+                return true;
+            }
+            // Soltou sem arrastar para fora da barra: não cria nada.
+            self.ruler_pending = None;
+            return true;
+        }
+
+        if !pressed || sobre_area {
+            return false;
+        }
+        let Some(pp) = ppos else { return false };
+        if !vp.contains(pp) {
+            return false;
+        }
+
+        // 1) Pressionar numa barra ARMA a criação (a guia só nasce ao arrastar).
+        if em_barra_topo(pp) {
+            self.ruler_pending = Some(GuideOrient::Horizontal);
+            return true;
+        }
+        if em_barra_esq(pp) {
+            self.ruler_pending = Some(GuideOrient::Vertical);
+            return true;
+        }
+
+        // 2) Pegar uma guia existente para mover (distância em px de tela).
+        let mut hit: Option<usize> = None;
+        for (i, g) in self.document.guides.iter().enumerate() {
+            let d = if g.is_horizontal() {
+                (rect.min.y + g.pos * zoom - pp.y).abs()
+            } else {
+                (rect.min.x + g.pos * zoom - pp.x).abs()
+            };
+            if d <= 5.0 {
+                hit = Some(i);
+                break;
+            }
+        }
+        if let Some(i) = hit {
+            self.ruler_drag = Some(i);
+            self.ruler_pushed = false;
+            return true;
+        }
+        false
+    }
+
+    /// Desenha as guias globais sobre o canvas (sempre visíveis, em qualquer
+    /// camada/frame). Linha intensa (ciano) para boa leitura em fundo claro/escuro.
+    fn desenhar_guias(&self, ui: &egui::Ui, rect: egui::Rect, zoom: f32) {
+        if self.document.guides.is_empty() {
+            return;
+        }
+        let painter = ui.painter_at(rect);
+        let cor = egui::Color32::from_rgb(0x1E, 0xD0, 0xF0);
+        let halo = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 90);
+        for g in &self.document.guides {
+            if g.is_horizontal() {
+                let y = rect.min.y + g.pos * zoom;
+                if y >= rect.min.y - 1.0 && y <= rect.max.y + 1.0 {
+                    painter.line_segment(
+                        [egui::pos2(rect.min.x, y + 1.0), egui::pos2(rect.max.x, y + 1.0)],
+                        egui::Stroke::new(2.0_f32, halo),
+                    );
+                    painter.line_segment(
+                        [egui::pos2(rect.min.x, y), egui::pos2(rect.max.x, y)],
+                        egui::Stroke::new(1.5_f32, cor),
+                    );
+                }
+            } else {
+                let x = rect.min.x + g.pos * zoom;
+                if x >= rect.min.x - 1.0 && x <= rect.max.x + 1.0 {
+                    painter.line_segment(
+                        [egui::pos2(x + 1.0, rect.min.y), egui::pos2(x + 1.0, rect.max.y)],
+                        egui::Stroke::new(2.0_f32, halo),
+                    );
+                    painter.line_segment(
+                        [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
+                        egui::Stroke::new(1.5_f32, cor),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Desenha as barras de régua fixas nas bordas (topo e esquerda) da área de
+    /// trabalho visível, com marcações e números em coordenadas do documento.
+    /// Arrastar a partir daqui cria guias (ver `interacao_guias`).
+    fn desenhar_reguas_borda(&self, ui: &egui::Ui, rect: egui::Rect, zoom: f32) {
+        const RULER: f32 = 18.0;
+        let vp = ui.clip_rect();
+        let painter = ui.painter_at(vp);
+        let bg = egui::Color32::from_gray(38);
+        let fg = egui::Color32::from_gray(160);
+        let tick_cor = egui::Color32::from_gray(110);
+        let top = egui::Rect::from_min_max(vp.min, egui::pos2(vp.max.x, vp.min.y + RULER));
+        let left = egui::Rect::from_min_max(vp.min, egui::pos2(vp.min.x + RULER, vp.max.y));
+        painter.rect_filled(top, 0.0, bg);
+        painter.rect_filled(left, 0.0, bg);
+        let step = Self::passo_regua(zoom);
+        let font = egui::FontId::proportional(9.0);
+
+        // Régua superior (coordenada X do documento).
+        let dx0 = ((vp.min.x + RULER - rect.min.x) / zoom).floor() as i32;
+        let dx1 = ((vp.max.x - rect.min.x) / zoom).ceil() as i32;
+        let mut vx = (dx0.div_euclid(step)) * step;
+        while vx <= dx1 {
+            let sx = rect.min.x + vx as f32 * zoom;
+            if sx >= vp.min.x + RULER && sx <= vp.max.x {
+                painter.line_segment(
+                    [egui::pos2(sx, vp.min.y + RULER - 5.0), egui::pos2(sx, vp.min.y + RULER)],
+                    egui::Stroke::new(1.0_f32, tick_cor),
+                );
+                painter.text(
+                    egui::pos2(sx + 2.0, vp.min.y + 1.0),
+                    egui::Align2::LEFT_TOP,
+                    vx.to_string(),
+                    font.clone(),
+                    fg,
+                );
+            }
+            vx += step;
+        }
+
+        // Régua esquerda (coordenada Y do documento).
+        let dy0 = ((vp.min.y + RULER - rect.min.y) / zoom).floor() as i32;
+        let dy1 = ((vp.max.y - rect.min.y) / zoom).ceil() as i32;
+        let mut vy = (dy0.div_euclid(step)) * step;
+        while vy <= dy1 {
+            let sy = rect.min.y + vy as f32 * zoom;
+            if sy >= vp.min.y + RULER && sy <= vp.max.y {
+                painter.line_segment(
+                    [egui::pos2(vp.min.x + RULER - 5.0, sy), egui::pos2(vp.min.x + RULER, sy)],
+                    egui::Stroke::new(1.0_f32, tick_cor),
+                );
+                painter.text(
+                    egui::pos2(vp.min.x + 1.0, sy + 1.0),
+                    egui::Align2::LEFT_TOP,
+                    vy.to_string(),
+                    font.clone(),
+                    fg,
+                );
+            }
+            vy += step;
+        }
+        // Cantinho para não sobrar número por baixo do cruzamento das barras.
+        painter.rect_filled(
+            egui::Rect::from_min_max(vp.min, egui::pos2(vp.min.x + RULER, vp.min.y + RULER)),
+            0.0,
+            bg,
+        );
+    }
+
+    /// Palette radial (popup estilo Krita/SAI): botão direito abre uma roda com
+    /// seletor de cor (anel de matiz + triângulo SV), ferramentas à mão (pincel,
+    /// borracha, caneta, conta-gotas), presets de ponta de pincel (fora do pixel
+    /// art) e o tamanho da ferramenta atual.
+    fn palette_radial(&mut self, ctx: &egui::Context) {
+        if !self.win_roda {
+            return;
+        }
+        use egui_phosphor::regular as icon;
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.win_roda = false;
+            return;
+        }
+        let size = 300.0_f32;
+        let mut fechar = false;
+
+        // Monta os slots de ferramentas ao redor do anel.
+        #[derive(Clone)]
+        enum Slot {
+            Pincel,
+            Borracha,
+            Caneta,
+            ContaGotas,
+            Ponta(usize),
+        }
+        let mut slots: Vec<(String, Slot, bool, &str)> = vec![
+            (
+                icon::PAINT_BRUSH.to_string(),
+                Slot::Pincel,
+                self.tool == Tool::Pencil && self.eyedropper == Eyedropper::Off,
+                "Pincel",
+            ),
+            (icon::ERASER.to_string(), Slot::Borracha, self.tool == Tool::Eraser, "Borracha"),
+            (icon::PEN_NIB.to_string(), Slot::Caneta, self.tool == Tool::Pen, "Caneta"),
+            (
+                icon::EYEDROPPER.to_string(),
+                Slot::ContaGotas,
+                self.eyedropper != Eyedropper::Off,
+                "Conta-gotas",
+            ),
+        ];
+        if !self.pixel_mode {
+            for i in 0..BRUSHES.len() {
+                let marca = self.tool == Tool::Pencil && self.brush_kind == i
+                    && self.eyedropper == Eyedropper::Off;
+                // Rótulo curto: iniciais do tipo de ponta; nome completo no tooltip.
+                let abbr: String = BRUSHES[i].chars().take(3).collect();
+                slots.push((abbr, Slot::Ponta(i), marca, BRUSHES[i]));
+            }
+        }
+
+        let area = egui::Area::new(egui::Id::new("palette_radial"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(self.roda_pos - egui::vec2(size / 2.0, size / 2.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    let (rect, resp) = ui
+                        .allocate_exact_size(egui::vec2(size, size), egui::Sense::click_and_drag());
+                    let painter = ui.painter_at(rect);
+                    let c = rect.center();
+                    painter.circle_filled(c, size / 2.0 - 2.0, egui::Color32::from_gray(46));
+                    painter.circle_stroke(
+                        c,
+                        size / 2.0 - 2.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_gray(28)),
+                    );
+
+                    let ptr = resp.interact_pointer_pos();
+                    let hov = resp.hover_pos();
+                    let pcheck = hov.or(ptr);
+                    let ativo = resp.is_pointer_button_down_on() || resp.dragged();
+                    let clicou = resp.clicked();
+                    let mut legenda: Option<&str> = None;
+
+                    // ---- Slots de ferramenta ao redor ----
+                    let rs = size / 2.0 - 26.0;
+                    let n = slots.len().max(1);
+                    let mut slot_hit: Option<Slot> = None;
+                    for (k, (label, slot, marcado, nome)) in slots.iter().enumerate() {
+                        let ang = -std::f32::consts::FRAC_PI_2
+                            + (k as f32 / n as f32) * std::f32::consts::TAU;
+                        let pc = c + egui::vec2(ang.cos() * rs, ang.sin() * rs);
+                        let sr = 19.0_f32;
+                        let hovered = pcheck.map_or(false, |pp| pp.distance(pc) <= sr);
+                        let bg = if *marcado {
+                            egui::Color32::from_rgb(0x2F, 0x84, 0xFE)
+                        } else if hovered {
+                            egui::Color32::from_gray(90)
+                        } else {
+                            egui::Color32::from_gray(66)
+                        };
+                        painter.circle_filled(pc, sr, bg);
+                        painter.circle_stroke(pc, sr, egui::Stroke::new(1.0, egui::Color32::from_gray(30)));
+                        painter.text(
+                            pc,
+                            egui::Align2::CENTER_CENTER,
+                            label,
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::WHITE,
+                        );
+                        if hovered {
+                            legenda = Some(*nome);
+                        }
+                        if clicou && hovered {
+                            slot_hit = Some(slot.clone());
+                        }
+                    }
+                    if let Some(slot) = slot_hit {
+                        match slot {
+                            Slot::Pincel => {
+                                self.tool = Tool::Pencil;
+                                self.eyedropper = Eyedropper::Off;
+                            }
+                            Slot::Borracha => {
+                                self.tool = Tool::Eraser;
+                                self.eyedropper = Eyedropper::Off;
+                            }
+                            Slot::Caneta => {
+                                self.tool = Tool::Pen;
+                                self.eyedropper = Eyedropper::Off;
+                            }
+                            Slot::ContaGotas => {
+                                self.eyedropper = Eyedropper::ToBrush;
+                            }
+                            Slot::Ponta(i) => {
+                                self.tool = Tool::Pencil;
+                                self.brush_kind = i;
+                                self.eyedropper = Eyedropper::Off;
+                            }
+                        }
+                    }
+
+                    // ---- Anel de matiz ----
+                    let ri = 50.0_f32;
+                    let ro = 68.0_f32;
+                    let segs = 180;
+                    for k in 0..segs {
+                        let a0 = (k as f32 / segs as f32) * std::f32::consts::TAU;
+                        let a1 = ((k + 1) as f32 / segs as f32) * std::f32::consts::TAU;
+                        let hue = k as f32 / segs as f32;
+                        let col = egui::Color32::from(egui::ecolor::Hsva::new(hue, 1.0, 1.0, 1.0));
+                        let poly = vec![
+                            c + egui::vec2(a0.cos() * ri, a0.sin() * ri),
+                            c + egui::vec2(a0.cos() * ro, a0.sin() * ro),
+                            c + egui::vec2(a1.cos() * ro, a1.sin() * ro),
+                            c + egui::vec2(a1.cos() * ri, a1.sin() * ri),
+                        ];
+                        painter.add(egui::Shape::convex_polygon(poly, col, egui::Stroke::NONE));
+                    }
+                    let ha = self.picker_hsva.h * std::f32::consts::TAU;
+                    let hm = c + egui::vec2(ha.cos() * (ri + ro) / 2.0, ha.sin() * (ri + ro) / 2.0);
+                    painter.circle_stroke(hm, 6.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    painter.circle_stroke(hm, 6.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+
+                    // ---- Triângulo SV (branco topo, matiz dir-baixo, preto esq-baixo) ----
+                    let rt = 46.0_f32;
+                    let aw = -std::f32::consts::FRAC_PI_2;
+                    let ab = aw + std::f32::consts::TAU / 3.0;
+                    let ak = aw + 2.0 * std::f32::consts::TAU / 3.0;
+                    let va = c + egui::vec2(aw.cos() * rt, aw.sin() * rt);
+                    let vb = c + egui::vec2(ab.cos() * rt, ab.sin() * rt);
+                    let vc = c + egui::vec2(ak.cos() * rt, ak.sin() * rt);
+                    let hue_col =
+                        egui::Color32::from(egui::ecolor::Hsva::new(self.picker_hsva.h, 1.0, 1.0, 1.0));
+                    let mut mesh = egui::Mesh::default();
+                    mesh.colored_vertex(va, egui::Color32::WHITE);
+                    mesh.colored_vertex(vb, hue_col);
+                    mesh.colored_vertex(vc, egui::Color32::BLACK);
+                    mesh.add_triangle(0, 1, 2);
+                    painter.add(egui::Shape::mesh(mesh));
+                    let (s0, v0) = (self.picker_hsva.s, self.picker_hsva.v);
+                    let (wa, wb, wc) = (v0 * (1.0 - s0), v0 * s0, 1.0 - v0);
+                    let sm = egui::pos2(
+                        va.x * wa + vb.x * wb + vc.x * wc,
+                        va.y * wa + vb.y * wb + vc.y * wc,
+                    );
+                    painter.circle_stroke(sm, 5.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+                    painter.circle_stroke(sm, 5.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+
+                    // ---- Interação de cor (anel + triângulo) ----
+                    if ativo {
+                        if let Some(pp) = ptr {
+                            let (ba, bb, bc) = baricentricas(pp, va, vb, vc);
+                            let dist = (pp - c).length();
+                            if ba >= -0.03 && bb >= -0.03 && bc >= -0.03 {
+                                let (a, b, cc) = (ba.max(0.0), bb.max(0.0), bc.max(0.0));
+                                let sum = (a + b + cc).max(1e-6);
+                                let (a, b) = (a / sum, b / sum);
+                                self.picker_hsva.v = (a + b).clamp(0.0, 1.0);
+                                self.picker_hsva.s =
+                                    if a + b > 0.0 { (b / (a + b)).clamp(0.0, 1.0) } else { 0.0 };
+                                self.brush_color = egui::Color32::from(self.picker_hsva);
+                            } else if dist >= ri - 6.0 && dist <= ro + 6.0 {
+                                let d = pp - c;
+                                let mut a = d.y.atan2(d.x) / std::f32::consts::TAU;
+                                if a < 0.0 {
+                                    a += 1.0;
+                                }
+                                self.picker_hsva.h = a;
+                                self.brush_color = egui::Color32::from(self.picker_hsva);
+                            }
+                        }
+                    }
+
+                    // ---- Amostra de cor atual (canto superior esquerdo) ----
+                    let sw = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(8.0, 8.0),
+                        egui::vec2(30.0, 30.0),
+                    );
+                    painter.rect_filled(sw, 4.0, self.brush_color);
+                    painter.rect_stroke(sw, 4.0, egui::Stroke::new(1.0, egui::Color32::from_gray(210)));
+
+                    // ---- Legenda do seletor de cor (quando não está sobre um slot) ----
+                    if legenda.is_none() {
+                        if let Some(pp) = hov {
+                            let dist = (pp - c).length();
+                            let (ba, bb, bc) = baricentricas(pp, va, vb, vc);
+                            if ba >= 0.0 && bb >= 0.0 && bc >= 0.0 {
+                                legenda = Some("Saturação / Brilho");
+                            } else if dist >= ri && dist <= ro {
+                                legenda = Some("Matiz (cor)");
+                            }
+                        }
+                    }
+
+                    // ---- Tooltip (legenda) do item sob o cursor ----
+                    if let (Some(txt), Some(pp)) = (legenda, hov) {
+                        let gal = painter.layout_no_wrap(
+                            txt.to_string(),
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::WHITE,
+                        );
+                        let pad = egui::vec2(6.0, 4.0);
+                        let mut tl = pp + egui::vec2(14.0, 14.0);
+                        let sz = gal.size() + pad * 2.0;
+                        // Mantém dentro da área da roda.
+                        if tl.x + sz.x > rect.max.x {
+                            tl.x = rect.max.x - sz.x - 2.0;
+                        }
+                        if tl.y + sz.y > rect.max.y {
+                            tl.y = rect.max.y - sz.y - 2.0;
+                        }
+                        let box_rect = egui::Rect::from_min_size(tl, sz);
+                        painter.rect_filled(box_rect, 4.0, egui::Color32::from_gray(18));
+                        painter.rect_stroke(
+                            box_rect,
+                            4.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                        );
+                        painter.galley(tl + pad, gal, egui::Color32::WHITE);
+                    }
+
+                    // ---- Tamanho da ferramenta atual ----
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if self.tool == Tool::Eraser {
+                            ui.label("Borracha");
+                            ui.add(egui::Slider::new(&mut self.eraser_radius, 1..=60));
+                        } else {
+                            ui.label("Pincel");
+                            ui.add(egui::Slider::new(&mut self.brush_radius, 1..=40));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.weak("Botão direito / lateral da caneta abre • Esc fecha");
+                        if ui.button("Fechar").clicked() {
+                            fechar = true;
+                        }
+                    });
+                });
+            });
+
+        if fechar {
+            self.win_roda = false;
+        }
+        // Clique fora da roda fecha.
+        let area_rect = area.response.rect;
+        if ctx.input(|i| i.pointer.any_pressed()) {
+            if let Some(pp) = ctx.input(|i| i.pointer.interact_pos()) {
+                if !area_rect.contains(pp) {
+                    self.win_roda = false;
+                }
+            }
+        }
     }
 
     /// Amostra da cor atual; clicar abre a janela de seleção de cores.
@@ -6339,6 +7483,64 @@ impl SketchMotionApp {
     /// Descobre a que objeto/grupo o ponto (doc) pertence, para associar ao
     /// pivô. Um vetor solto ganha um grupo próprio (para a associação sobreviver
     /// a mudanças de índice/frames).
+    /// Garante um id estável para a imagem em `index` (atribui se ainda for 0).
+    fn ensure_img_id(&mut self, index: usize) -> u32 {
+        let cur = self.document.images.get(index).map(|o| o.id).unwrap_or(0);
+        if cur != 0 {
+            return cur;
+        }
+        let id = self.next_img_id;
+        self.next_img_id += 1;
+        if let Some(o) = self.document.images.get_mut(index) {
+            o.id = id;
+            return id;
+        }
+        0
+    }
+
+    /// Recalcula, a cada frame, os pontos (eixo/mov) dos pivôs ligados a IMAGENS
+    /// a partir do transform atual da imagem (offset local guardado). Assim os
+    /// pontos SEGUEM a peça quando ela é movida/girada por qualquer ferramenta.
+    fn pivot_tick_follow(&mut self) {
+        use sketchmotion_core::PivotTarget;
+        if self.document.pivots.is_empty() {
+            return;
+        }
+        let imgs: Vec<(u32, f32, f32, f32)> = self
+            .document
+            .images
+            .iter()
+            .map(|o| (o.id, o.cx, o.cy, o.angle))
+            .collect();
+        for pv in self.document.pivots.iter_mut() {
+            if let PivotTarget::Image(id) = pv.target {
+                if id == 0 {
+                    continue;
+                }
+                if let Some(&(_, cx, cy, ang)) = imgs.iter().find(|t| t.0 == id) {
+                    let (s, c) = ang.sin_cos();
+                    if pv.has_axis {
+                        let (lx, ly) = pv.img_local_axis;
+                        pv.axis = (cx + lx * c - ly * s, cy + lx * s + ly * c);
+                    }
+                    if pv.has_mov {
+                        let (lx, ly) = pv.img_local_mov;
+                        pv.mov = (cx + lx * c - ly * s, cy + lx * s + ly * c);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Converte um ponto do mundo para o referencial LOCAL (não girado) da
+    /// imagem de id `id`, se existir.
+    fn img_world_to_local(&self, id: u32, world: (f32, f32)) -> Option<(f32, f32)> {
+        let o = self.document.images.iter().find(|o| o.id == id)?;
+        let (s, c) = (-o.angle).sin_cos();
+        let (rx, ry) = (world.0 - o.cx, world.1 - o.cy);
+        Some((rx * c - ry * s, rx * s + ry * c))
+    }
+
     fn pivot_hit_target(&mut self, dp: (f32, f32)) -> sketchmotion_core::PivotTarget {
         use sketchmotion_core::PivotTarget;
         if let Some(i) = self.hit_test(dp, 6.0) {
@@ -6348,6 +7550,11 @@ impl SketchMotionApp {
                     let ng = self.next_group;
                     self.next_group += 1;
                     self.document.vectors[i].group = Some(ng);
+                    // Carimba o mesmo grupo nas cópias iguais em TODOS os frames,
+                    // para que a identidade do objeto seja a mesma em qualquer
+                    // frame — assim o Vetor de Direção sempre reconhece o pivô.
+                    let base = vec![self.document.vectors[i].clone()];
+                    self.dirvec_stamp_grupo(ng, &base);
                     ng
                 }
             };
@@ -6363,7 +7570,8 @@ impl SketchMotionApp {
             let lx = rx * c - ry * s;
             let ly = rx * s + ry * c;
             if lx.abs() <= o.hw && ly.abs() <= o.hh {
-                return PivotTarget::Image(i);
+                let id = self.ensure_img_id(i);
+                return PivotTarget::Image(id);
             }
         }
         PivotTarget::None
@@ -6382,8 +7590,8 @@ impl SketchMotionApp {
                         dp.0 >= a && dp.0 <= c && dp.1 >= b && dp.1 <= d
                     })
             }),
-            PivotTarget::Image(i) => {
-                if let Some(o) = self.document.images.get(*i) {
+            PivotTarget::Image(id) => {
+                if let Some(o) = self.document.images.iter().find(|o| o.id == *id) {
                     let (s, c) = (-o.angle).sin_cos();
                     let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
                     let lx = rx * c - ry * s;
@@ -6404,6 +7612,7 @@ impl SketchMotionApp {
             Some(p) => p.target.clone(),
             None => return,
         };
+        let mut eh_imagem = false;
         match target {
             PivotTarget::Group(g) => {
                 for o in self.document.vectors.iter_mut() {
@@ -6412,19 +7621,24 @@ impl SketchMotionApp {
                     }
                 }
             }
-            PivotTarget::Image(i) => {
-                if let Some(o) = self.document.images.get_mut(i) {
+            PivotTarget::Image(id) => {
+                eh_imagem = true;
+                if let Some(o) = self.document.images.iter_mut().find(|o| o.id == id) {
                     o.cx += dx;
                     o.cy += dy;
                 }
             }
             PivotTarget::None => {}
         }
-        if let Some(pv) = self.document.pivots.get_mut(pi) {
-            pv.axis.0 += dx;
-            pv.axis.1 += dy;
-            pv.mov.0 += dx;
-            pv.mov.1 += dy;
+        // Vetores/None: os pontos acompanham a translação. Imagens: os pontos são
+        // recalculados do transform (offset local), então NÃO os mexemos aqui.
+        if !eh_imagem {
+            if let Some(pv) = self.document.pivots.get_mut(pi) {
+                pv.axis.0 += dx;
+                pv.axis.1 += dy;
+                pv.mov.0 += dx;
+                pv.mov.1 += dy;
+            }
         }
         self.dirty = true;
         self.modificado = true;
@@ -6439,6 +7653,7 @@ impl SketchMotionApp {
             Some(p) => (p.axis, p.target.clone()),
             None => return,
         };
+        let mut eh_imagem = false;
         match target {
             PivotTarget::Group(g) => {
                 for o in self.document.vectors.iter_mut() {
@@ -6447,8 +7662,9 @@ impl SketchMotionApp {
                     }
                 }
             }
-            PivotTarget::Image(i) => {
-                if let Some(o) = self.document.images.get_mut(i) {
+            PivotTarget::Image(id) => {
+                eh_imagem = true;
+                if let Some(o) = self.document.images.iter_mut().find(|o| o.id == id) {
                     let (s, c) = ang.sin_cos();
                     let (dx, dy) = (o.cx - ax.0, o.cy - ax.1);
                     o.cx = ax.0 + dx * c - dy * s;
@@ -6458,11 +7674,15 @@ impl SketchMotionApp {
             }
             PivotTarget::None => {}
         }
-        if let Some(pv) = self.document.pivots.get_mut(pi) {
-            let (s, c) = ang.sin_cos();
-            let (dx, dy) = (pv.mov.0 - ax.0, pv.mov.1 - ax.1);
-            pv.mov.0 = ax.0 + dx * c - dy * s;
-            pv.mov.1 = ax.1 + dx * s + dy * c;
+        // Imagem: o laranja é recalculado do transform (segue). Vetores: giramos
+        // o ponto manualmente ao redor do eixo.
+        if !eh_imagem {
+            if let Some(pv) = self.document.pivots.get_mut(pi) {
+                let (s, c) = ang.sin_cos();
+                let (dx, dy) = (pv.mov.0 - ax.0, pv.mov.1 - ax.1);
+                pv.mov.0 = ax.0 + dx * c - dy * s;
+                pv.mov.1 = ax.1 + dx * s + dy * c;
+            }
         }
         self.dirty = true;
         self.modificado = true;
@@ -6486,28 +7706,75 @@ impl SketchMotionApp {
                 // Fluxo de criação: primeiro clique = objeto + EIXO; segundo = MOV.
                 if self.pivot_stage == 1 {
                     if let Some(pi) = self.pivot_sel {
+                        use sketchmotion_core::PivotTarget;
                         let target = self.pivot_hit_target(dp);
-                        let achou = !matches!(target, sketchmotion_core::PivotTarget::None);
+                        // Exige clicar EM CIMA de uma peça — sem peça, não cria o
+                        // eixo (evita o pivô "solto" que não funciona).
+                        if matches!(target, PivotTarget::None) {
+                            self.status =
+                                "Clique EM CIMA da peça para começar o pivô (nada foi selecionado)."
+                                    .into();
+                            return;
+                        }
+                        // SELECIONA a peça automaticamente (o usuário e o sistema
+                        // veem a qual peça o pivô pertence).
+                        match &target {
+                            PivotTarget::Group(g) => {
+                                let g = *g;
+                                self.sel_set = (0..self.document.vectors.len())
+                                    .filter(|&k| self.document.vectors[k].group == Some(g))
+                                    .collect();
+                                self.selected_obj = self.sel_set.first().copied();
+                            }
+                            PivotTarget::Image(id) => {
+                                if let Some(o) = self.document.images.iter().find(|o| o.id == *id) {
+                                    self.active_layer =
+                                        o.layer.min(self.document.layers.len().saturating_sub(1));
+                                }
+                                self.sel_set.clear();
+                                self.selected_obj = None;
+                            }
+                            PivotTarget::None => {}
+                        }
+                        let local = if let PivotTarget::Image(id) = target {
+                            self.img_world_to_local(id, dp)
+                        } else {
+                            None
+                        };
                         if let Some(pv) = self.document.pivots.get_mut(pi) {
                             pv.target = target;
                             pv.axis = dp;
                             pv.has_axis = true;
+                            if let Some(l) = local {
+                                pv.img_local_axis = l;
+                            }
                         }
                         self.pivot_stage = 2;
                         self.modificado = true;
-                        self.status = if achou {
-                            "Eixo definido. Agora clique no ponto de movimentação.".into()
-                        } else {
-                            "Eixo definido (nenhum objeto sob o clique). Defina o ponto de movimentação.".into()
-                        };
+                        self.status =
+                            "Peça selecionada e eixo definido. Agora clique no ponto de movimentação.".into();
                     }
                     return;
                 }
                 if self.pivot_stage == 2 {
                     if let Some(pi) = self.pivot_sel {
+                        let target = self
+                            .document
+                            .pivots
+                            .get(pi)
+                            .map(|p| p.target.clone())
+                            .unwrap_or(sketchmotion_core::PivotTarget::None);
+                        let local = if let sketchmotion_core::PivotTarget::Image(id) = target {
+                            self.img_world_to_local(id, dp)
+                        } else {
+                            None
+                        };
                         if let Some(pv) = self.document.pivots.get_mut(pi) {
                             pv.mov = dp;
                             pv.has_mov = true;
+                            if let Some(l) = local {
+                                pv.img_local_mov = l;
+                            }
                         }
                         self.pivot_stage = 0;
                         self.modificado = true;
@@ -6516,62 +7783,130 @@ impl SketchMotionApp {
                     }
                     return;
                 }
-                // Ocioso: inicia arraste sobre azul / laranja / objeto.
-                if let Some(pi) = self.pivot_sel {
-                    let completo = self.document.pivots.get(pi).map_or(false, |p| p.completo());
-                    if completo {
-                        let (ax, mv) = {
-                            let pv = &self.document.pivots[pi];
-                            (pv.axis, pv.mov)
-                        };
-                        let r = 10.0 / zoom;
-                        let da = ((dp.0 - ax.0).powi(2) + (dp.1 - ax.1).powi(2)).sqrt();
-                        let dm = ((dp.0 - mv.0).powi(2) + (dp.1 - mv.1).powi(2)).sqrt();
-                        if dm <= r && dm <= da {
-                            self.pivot_drag = 2;
-                            self.push_undo();
-                        } else if da <= r {
-                            self.pivot_drag = 1;
-                            self.push_undo();
-                        } else if self.pivot_point_on_object(pi, dp) {
-                            self.pivot_drag = 3;
-                            self.push_undo();
-                        } else {
-                            self.pivot_drag = 0;
-                        }
+                // Ocioso: pega o ponto (azul/laranja) de QUALQUER pivô próximo do
+                // cursor — distância medida na TELA (fácil de acertar em qualquer
+                // zoom). Laranja tem leve prioridade (é a "alavanca").
+                let scr = |q: (f32, f32)| egui::pos2(rect.min.x + q.0 * zoom, rect.min.y + q.1 * zoom);
+                let raio = 16.0_f32; // pixels na tela
+                let mut best: Option<(usize, u8, f32)> = None; // (pivô, 1=azul 2=laranja, dist)
+                for (i, pv) in self.document.pivots.iter().enumerate() {
+                    if !pv.completo() {
+                        continue;
                     }
+                    let dm = scr(pv.mov).distance(p);
+                    let da = scr(pv.axis).distance(p);
+                    if dm <= raio && best.map_or(true, |(_, _, bd)| dm < bd) {
+                        best = Some((i, 2, dm));
+                    }
+                    if da <= raio && best.map_or(true, |(_, _, bd)| da < bd) {
+                        best = Some((i, 1, da));
+                    }
+                }
+                if let Some((i, which, _)) = best {
+                    self.pivot_sel = Some(i);
+                    self.pivot_drag = which;
+                    self.push_undo();
+                } else if let Some(pi) = self.pivot_sel {
+                    // Sem ponto por perto: arrasta o objeto do pivô selecionado.
+                    let completo = self.document.pivots.get(pi).map_or(false, |p| p.completo());
+                    if completo && self.pivot_point_on_object(pi, dp) {
+                        self.pivot_drag = 3;
+                        self.push_undo();
+                    } else {
+                        self.pivot_drag = 0;
+                    }
+                } else {
+                    self.pivot_drag = 0;
                 }
             }
         }
         if down && self.pivot_drag != 0 {
-            if let (Some(pp), Some(pi)) = (ppos, self.pivot_sel) {
-                match self.pivot_drag {
-                    2 => {
-                        // Laranja: gira o objeto ao redor do eixo pelo ângulo que
-                        // o ponteiro varreu em torno do eixo.
-                        let cur = to_doc(pp);
-                        let ax = self.document.pivots[pi].axis;
-                        let prev = (cur.0 - pdelta.x / zoom, cur.1 - pdelta.y / zoom);
-                        let a0 = (prev.1 - ax.1).atan2(prev.0 - ax.0);
-                        let a1 = (cur.1 - ax.1).atan2(cur.0 - ax.0);
-                        let delta = a1 - a0;
-                        if delta.abs() > f32::EPSILON {
-                            self.pivot_rotate(pi, delta);
-                        }
-                    }
-                    _ => {
-                        // Azul ou objeto: translada tudo pelo deslocamento.
-                        let (dx, dy) = (pdelta.x / zoom, pdelta.y / zoom);
-                        if dx != 0.0 || dy != 0.0 {
-                            self.pivot_translate(pi, dx, dy);
-                        }
-                    }
-                }
-            }
+            self.pivot_drag_step(ppos, pdelta, rect, zoom);
         }
         if !down {
             self.pivot_drag = 0;
         }
+    }
+
+    /// Aplica um passo do arraste de pivô em andamento (2 = girar pelo laranja;
+    /// 1/3 = transladar pelo azul/objeto). Compartilhado por Pivô e Seleção.
+    fn pivot_drag_step(&mut self, ppos: Option<egui::Pos2>, pdelta: egui::Vec2, rect: egui::Rect, zoom: f32) {
+        let to_doc = |p: egui::Pos2| ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+        if let (Some(pp), Some(pi)) = (ppos, self.pivot_sel) {
+            if pi >= self.document.pivots.len() {
+                return;
+            }
+            match self.pivot_drag {
+                2 => {
+                    let cur = to_doc(pp);
+                    let ax = self.document.pivots[pi].axis;
+                    let prev = (cur.0 - pdelta.x / zoom, cur.1 - pdelta.y / zoom);
+                    let a0 = (prev.1 - ax.1).atan2(prev.0 - ax.0);
+                    let a1 = (cur.1 - ax.1).atan2(cur.0 - ax.0);
+                    let delta = a1 - a0;
+                    if delta.abs() > f32::EPSILON {
+                        self.pivot_rotate(pi, delta);
+                    }
+                }
+                _ => {
+                    let (dx, dy) = (pdelta.x / zoom, pdelta.y / zoom);
+                    if dx != 0.0 || dy != 0.0 {
+                        self.pivot_translate(pi, dx, dy);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Para a ferramenta SELEÇÃO: se o clique/arraste estiver sobre um PONTO de
+    /// pivô (azul/laranja) de qualquer pivô, usa o pivô e devolve true. Clicar
+    /// fora dos pontos devolve false (segue a seleção normal).
+    fn select_pivot_points(
+        &mut self,
+        pressed: bool,
+        down: bool,
+        hover: Option<egui::Pos2>,
+        ppos: Option<egui::Pos2>,
+        pdelta: egui::Vec2,
+        rect: egui::Rect,
+        zoom: f32,
+    ) -> bool {
+        // Continua um arraste de PONTO já iniciado (1 = azul, 2 = laranja).
+        if self.pivot_drag == 1 || self.pivot_drag == 2 {
+            if down {
+                self.pivot_drag_step(ppos, pdelta, rect, zoom);
+            } else {
+                self.pivot_drag = 0;
+            }
+            return true;
+        }
+        if !pressed {
+            return false;
+        }
+        let Some(p) = hover else { return false };
+        let scr = |q: (f32, f32)| egui::pos2(rect.min.x + q.0 * zoom, rect.min.y + q.1 * zoom);
+        let raio = 16.0_f32;
+        let mut best: Option<(usize, u8, f32)> = None;
+        for (i, pv) in self.document.pivots.iter().enumerate() {
+            if !pv.completo() {
+                continue;
+            }
+            let dm = scr(pv.mov).distance(p);
+            let da = scr(pv.axis).distance(p);
+            if dm <= raio && best.map_or(true, |(_, _, bd)| dm < bd) {
+                best = Some((i, 2, dm));
+            }
+            if da <= raio && best.map_or(true, |(_, _, bd)| da < bd) {
+                best = Some((i, 1, da));
+            }
+        }
+        if let Some((i, which, _)) = best {
+            self.pivot_sel = Some(i);
+            self.pivot_drag = which;
+            self.push_undo();
+            return true;
+        }
+        false
     }
 
     /// Desenha os pontos do(s) pivô(s): eixo azul, movimentação laranja e a
@@ -6582,6 +7917,40 @@ impl SketchMotionApp {
         let azul = egui::Color32::from_rgb(30, 120, 255);
         let laranja = egui::Color32::from_rgb(255, 140, 0);
         let branco = egui::Color32::WHITE;
+        // Destaque da PEÇA do pivô selecionado (o usuário vê a quem pertence).
+        if let Some(pi) = self.pivot_sel {
+            use sketchmotion_core::PivotTarget;
+            if let Some(pv) = self.document.pivots.get(pi) {
+                let contorno = egui::Color32::from_rgb(120, 180, 255);
+                let bb = match &pv.target {
+                    PivotTarget::Group(g) => {
+                        let mut b: Option<(f32, f32, f32, f32)> = None;
+                        for o in self.document.vectors.iter().filter(|o| o.group == Some(*g)) {
+                            if let Some((a, bo, c, d)) = o.bounds() {
+                                b = Some(match b {
+                                    Some((x0, y0, x1, y1)) => {
+                                        (x0.min(a), y0.min(bo), x1.max(c), y1.max(d))
+                                    }
+                                    None => (a, bo, c, d),
+                                });
+                            }
+                        }
+                        b
+                    }
+                    PivotTarget::Image(id) => self
+                        .document
+                        .images
+                        .iter()
+                        .find(|o| o.id == *id)
+                        .map(|o| (o.cx - o.hw, o.cy - o.hh, o.cx + o.hw, o.cy + o.hh)),
+                    PivotTarget::None => None,
+                };
+                if let Some((x0, y0, x1, y1)) = bb {
+                    let r = egui::Rect::from_min_max(scr((x0, y0)), scr((x1, y1)));
+                    painter.rect_stroke(r.expand(2.0), 2.0, egui::Stroke::new(1.5, contorno));
+                }
+            }
+        }
         for (idx, pv) in self.document.pivots.iter().enumerate() {
             if !pv.has_axis {
                 continue;
@@ -6828,6 +8197,36 @@ impl SketchMotionApp {
             .position(|p| p.completo() && &p.target == target)
     }
 
+    /// Carimba o grupo `g` em todas as cópias iguais (mesma geometria) do objeto
+    /// em TODOS os frames da faixa ativa. Assim o objeto passa a ter a mesma
+    /// identidade em todo lugar e o bake do vetor o SUBSTITUI (em vez de somar
+    /// uma cópia por cima da antiga, o que gerava duplicatas).
+    fn dirvec_stamp_grupo(&mut self, g: u32, base: &[sketchmotion_core::VectorObject]) {
+        let casa = |o: &sketchmotion_core::VectorObject| -> bool {
+            if o.group.is_some() {
+                return false;
+            }
+            base.iter().any(|b| {
+                b.points.len() == o.points.len()
+                    && !b.points.is_empty()
+                    && (b.points[0].x - o.points[0].x).abs() < 0.5
+                    && (b.points[0].y - o.points[0].y).abs() < 0.5
+            })
+        };
+        // Salva a cópia de trabalho atual nos frames ANTES de mexer, para não
+        // perder alterações recentes (ex.: o grupo recém-atribuído) no reload.
+        self.document.sync_to_frames();
+        // Todos os frames da faixa ativa.
+        for f in self.document.frames.iter_mut() {
+            for o in f.vectors.iter_mut() {
+                if casa(o) {
+                    o.group = Some(g);
+                }
+            }
+        }
+        self.document.reload_working();
+    }
+
     /// Captura o ESTADO INICIAL do vetor `vi` no frame atual: geometria-base,
     /// centro, e (se houver pivô associado) o eixo e o ângulo inicial.
     fn dirvec_definir_inicio(&mut self, vi: usize) {
@@ -6877,9 +8276,13 @@ impl SketchMotionApp {
                 v.start_frame = cur;
                 v.has_start = true;
                 v.has_end = false;
+                // Carimba o mesmo grupo nas cópias iguais em TODOS os frames, para
+                // que o bake substitua o objeto (e não crie cópias sobre cópias).
+                let base_clone = self.document.dir_vectors[vi].base_vectors.clone();
+                self.dirvec_stamp_grupo(g, &base_clone);
             }
-            PivotTarget::Image(i) => {
-                let Some(o) = self.document.images.get(i).cloned() else {
+            PivotTarget::Image(id) => {
+                let Some(o) = self.document.images.iter().find(|o| o.id == id).cloned() else {
                     self.status = "Imagem do vetor não está neste frame.".into();
                     return;
                 };
@@ -6888,7 +8291,7 @@ impl SketchMotionApp {
                 let v = &mut self.document.dir_vectors[vi];
                 v.start_centroid = (o.cx, o.cy);
                 v.base_image = Some(o);
-                v.base_image_index = i;
+                v.base_image_id = id;
                 v.base_vectors = Vec::new();
                 v.start_angle = 0.0;
                 v.end_angle = 0.0;
@@ -6930,7 +8333,12 @@ impl SketchMotionApp {
         let cur = self.document.current;
         let centroid = match &target {
             PivotTarget::Group(g) => self.dirvec_group_centroid(*g),
-            PivotTarget::Image(i) => self.document.images.get(*i).map(|o| (o.cx, o.cy)),
+            PivotTarget::Image(id) => self
+                .document
+                .images
+                .iter()
+                .find(|o| o.id == *id)
+                .map(|o| (o.cx, o.cy)),
             PivotTarget::None => None,
         };
         let Some(centroid) = centroid else {
@@ -7032,18 +8440,20 @@ impl SketchMotionApp {
                     fv.extend(base);
                     self.document.set_frame_vectors(f, fv);
                 }
-                PivotTarget::Image(_) => {
+                PivotTarget::Image(id) => {
                     if let Some(mut base) = dv.base_image.clone() {
                         Self::dirvec_transformar_imagem(&mut base, &dv, t);
+                        base.id = *id;
                         let mut fi = self
                             .document
                             .frames
                             .get(f)
                             .map(|fr| fr.images.clone())
                             .unwrap_or_default();
-                        let idx = dv.base_image_index;
-                        if idx < fi.len() {
-                            fi[idx] = base;
+                        // Substitui a imagem com o mesmo id (por identidade); se
+                        // não existir neste frame, acrescenta.
+                        if let Some(k) = fi.iter().position(|o| o.id == *id) {
+                            fi[k] = base;
                         } else {
                             fi.push(base);
                         }
@@ -7061,16 +8471,6 @@ impl SketchMotionApp {
 
     /// Interação da ferramenta no canvas: durante a criação, clicar vincula o
     /// objeto sob o cursor e fixa o estado inicial.
-    /// O alvo existe na cópia de trabalho (frame) atual?
-    fn dirvec_target_in_frame(&self, target: &sketchmotion_core::PivotTarget) -> bool {
-        use sketchmotion_core::PivotTarget;
-        match target {
-            PivotTarget::Group(g) => self.document.vectors.iter().any(|o| o.group == Some(*g)),
-            PivotTarget::Image(i) => *i < self.document.images.len(),
-            PivotTarget::None => false,
-        }
-    }
-
     /// Mantém o estado do "fantasma": quando a ferramenta está ativa, há um vetor
     /// com início definido, e o frame atual NÃO é o do início E o objeto não está
     /// neste frame, prepara um fantasma (na posição inicial) para ser arrastado.
@@ -7083,9 +8483,9 @@ impl SketchMotionApp {
             self.dirvec_ghost_frame = None;
             return;
         };
-        let (has_start, start_frame, start_centroid, target) = {
+        let (has_start, has_end, start_frame, start_centroid) = {
             match self.document.dir_vectors.get(vi) {
-                Some(v) => (v.has_start, v.start_frame, v.start_centroid, v.target.clone()),
+                Some(v) => (v.has_start, v.has_end, v.start_frame, v.start_centroid),
                 None => {
                     self.dirvec_ghost_frame = None;
                     return;
@@ -7093,8 +8493,10 @@ impl SketchMotionApp {
             }
         };
         let cur = self.document.current;
-        let present = self.dirvec_target_in_frame(&target);
-        if !has_start || cur == start_frame || present {
+        // O fantasma aparece SEMPRE que há um início definido, a animação ainda
+        // não foi gerada (sem fim) e estamos em outro frame. Depois de gerada, o
+        // objeto real existe em todos os frames e é ele que se arrasta.
+        if !has_start || has_end || cur == start_frame {
             self.dirvec_ghost_frame = None;
             return;
         }
@@ -7146,8 +8548,8 @@ impl SketchMotionApp {
                         dp.0 >= a - 2.0 && dp.0 <= c + 2.0 && dp.1 >= b - 2.0 && dp.1 <= d + 2.0
                     })
             }),
-            PivotTarget::Image(i) => {
-                if let Some(o) = self.document.images.get(*i) {
+            PivotTarget::Image(id) => {
+                if let Some(o) = self.document.images.iter().find(|o| o.id == *id) {
                     let (s, c) = (-o.angle).sin_cos();
                     let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
                     let lx = rx * c - ry * s;
@@ -7172,8 +8574,8 @@ impl SketchMotionApp {
                     }
                 }
             }
-            PivotTarget::Image(i) => {
-                if let Some(o) = self.document.images.get_mut(*i) {
+            PivotTarget::Image(id) => {
+                if let Some(o) = self.document.images.iter_mut().find(|o| o.id == *id) {
                     o.cx += dx;
                     o.cy += dy;
                 }
@@ -7193,8 +8595,8 @@ impl SketchMotionApp {
                     }
                 }
             }
-            PivotTarget::Image(i) => {
-                if let Some(o) = self.document.images.get_mut(*i) {
+            PivotTarget::Image(id) => {
+                if let Some(o) = self.document.images.iter_mut().find(|o| o.id == *id) {
                     let (s, c) = ang.sin_cos();
                     let (dx, dy) = (o.cx - cx, o.cy - cy);
                     o.cx = cx + dx * c - dy * s;
@@ -7527,25 +8929,12 @@ impl SketchMotionApp {
             .open(&mut open)
             .default_width(260.0)
             .show(ctx, |ui| {
-                if self.dirvec_naming {
-                    ui.label("Nome do vetor:");
-                    let resp = ui.text_edit_singleline(&mut self.dirvec_name_buf);
-                    resp.request_focus();
-                    ui.horizontal(|ui| {
-                        let ok = ui.button("Confirmar").clicked()
-                            || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                        if ok {
-                            do_criar = true;
-                        }
-                        if ui.button("Cancelar").clicked() {
-                            self.dirvec_naming = false;
-                            self.dirvec_name_buf.clear();
-                        }
-                    });
-                } else if ui.button("＋ Adicionar novo vetor").clicked() {
-                    self.dirvec_naming = true;
-                    self.dirvec_name_buf =
-                        format!("Vetor {}", self.document.dir_vectors.len() + 1);
+                if ui
+                    .button("＋ Adicionar novo vetor")
+                    .on_hover_text("Cria o vetor e pede para clicar na peça")
+                    .clicked()
+                {
+                    do_criar = true;
                 }
                 ui.separator();
                 ui.label("Vetores existentes:");
@@ -7638,21 +9027,15 @@ impl SketchMotionApp {
             });
         // Ações fora do closure.
         if do_criar {
-            let nome = if self.dirvec_name_buf.trim().is_empty() {
-                format!("Vetor {}", self.document.dir_vectors.len() + 1)
-            } else {
-                self.dirvec_name_buf.trim().to_string()
-            };
+            let nome = format!("Vetor {}", self.document.dir_vectors.len() + 1);
             self.document
                 .dir_vectors
                 .push(sketchmotion_core::DirVector::new(nome));
             self.dirvec_sel = Some(self.document.dir_vectors.len() - 1);
-            self.dirvec_naming = false;
-            self.dirvec_name_buf.clear();
             self.dirvec_stage = 1;
             self.tool = Tool::DirVector;
             self.modificado = true;
-            self.status = "Clique no objeto para vinculá-lo ao vetor.".into();
+            self.status = "Clique na peça que você quer animar.".into();
         }
         if do_vincular {
             self.dirvec_stage = 1;
@@ -10380,9 +11763,78 @@ impl eframe::App for SketchMotionApp {
                 self.win_fechar = false;
             }
         }
+        // Diálogo "salvar antes de abrir outro trabalho?" — abrir substitui o
+        // trabalho atual (e libera a memória dele), então trata como um fechar.
+        if self.win_abrir_confirm {
+            let mut do_salvar = false;
+            let mut do_descartar = false;
+            let mut do_cancelar = false;
+            egui::Window::new("Salvar antes de abrir?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .show(ctx, |ui| {
+                    ui.label(
+                        "O trabalho atual foi modificado e será fechado ao abrir outro. \
+                         Deseja salvar antes?",
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Salvar e abrir").clicked() {
+                            do_salvar = true;
+                        }
+                        if ui.button("Abrir sem salvar").clicked() {
+                            do_descartar = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            do_cancelar = true;
+                        }
+                    });
+                });
+            if do_salvar {
+                self.win_abrir_confirm = false;
+                // salvar_sync devolve false se o usuário cancelou o "salvar como";
+                // nesse caso não abre nada (mantém o trabalho atual).
+                if self.salvar_sync() {
+                    self.abrir();
+                }
+            }
+            if do_descartar {
+                self.win_abrir_confirm = false;
+                self.abrir();
+            }
+            if do_cancelar {
+                self.win_abrir_confirm = false;
+            }
+        }
         if self.screen == Screen::Home {
             self.tela_inicial(ctx);
             return;
+        }
+        // Sempre há uma camada válida selecionada: ao trocar para um frame com
+        // menos camadas, o índice ativo pode apontar para uma camada que não
+        // existe nesse frame — reencaixa no intervalo (se só há uma, é ela).
+        self.active_layer = self
+            .active_layer
+            .min(self.document.layers.len().saturating_sub(1));
+        // Gancho nativo (Windows): botão LATERAL da caneta -> abre a roda sem
+        // pintar, mesmo com Windows Ink ligado. Instala na 1ª vez que a janela
+        // existe; depois só consulta o sinal.
+        #[cfg(windows)]
+        {
+            use std::sync::atomic::Ordering;
+            winhook::instalar();
+            if winhook::PEN_RCLICK.swap(false, Ordering::SeqCst) {
+                let ppp = ctx.pixels_per_point().max(0.1);
+                self.roda_pos = egui::pos2(
+                    winhook::PEN_X.load(Ordering::SeqCst) as f32 / ppp,
+                    winhook::PEN_Y.load(Ordering::SeqCst) as f32 / ppp,
+                );
+                self.win_roda = true;
+                // Enquanto o Windows manda eventos de ponteiro do botão, mantém
+                // o loop ativo para a roda responder na hora.
+                ctx.request_repaint();
+            }
         }
         // Importar imagens arrastando de fora para dentro do canvas.
         let dropped: Vec<std::path::PathBuf> =
@@ -10469,6 +11921,12 @@ impl eframe::App for SketchMotionApp {
         }
         let mut do_undo = false;
         let mut do_redo = false;
+        // Atalhos de ferramenta (letra única): a=cores, s=borracha, d=conta-gotas, f=pincel.
+        let mut k_cor = false;
+        let mut k_borracha = false;
+        let mut k_contagotas = false;
+        let mut k_pincel = false;
+        let mut k_roda = false;
         let mut k_enter = false;
         let mut k_esc = false;
         let mut k_del = false;
@@ -10522,8 +11980,56 @@ impl eframe::App for SketchMotionApp {
             if i.key_pressed(egui::Key::Delete) {
                 k_del = true;
             }
+            // Atalhos de ferramenta — só teclas simples (sem Ctrl/Cmd).
+            if !i.modifiers.command && !i.modifiers.ctrl {
+                if i.key_pressed(egui::Key::A) {
+                    k_cor = true;
+                }
+                if i.key_pressed(egui::Key::S) {
+                    k_borracha = true;
+                }
+                if i.key_pressed(egui::Key::D) {
+                    k_contagotas = true;
+                }
+                if i.key_pressed(egui::Key::F) {
+                    k_pincel = true;
+                }
+                if i.key_pressed(egui::Key::Q) {
+                    k_roda = true;
+                }
+            }
         });
         let editando = ctx.wants_keyboard_input();
+        // Aplica os atalhos de ferramenta (só quando não se está digitando texto).
+        if !editando {
+            if k_cor {
+                self.win_color = true;
+                self.reopen_color = true;
+            }
+            if k_borracha {
+                self.tool = Tool::Eraser;
+                self.eyedropper = Eyedropper::Off;
+            }
+            if k_contagotas {
+                self.eyedropper = Eyedropper::ToBrush;
+                self.status = "Conta-gotas: clique no desenho para capturar a cor".into();
+            }
+            if k_pincel {
+                self.tool = Tool::Pencil;
+                self.eyedropper = Eyedropper::Off;
+            }
+            if k_roda {
+                // Abre a roda SEMPRE (à prova de falhas): na posição da caneta se
+                // conhecida, senão no centro da tela. Mapeie um botão da caneta/
+                // mesa XP-Pen na tecla Q para abrir sem depender do botão-direito
+                // (que o Windows Ink da XP-Pen entrega ao app como clique esquerdo).
+                let pp = ctx
+                    .input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()))
+                    .unwrap_or_else(|| ctx.screen_rect().center());
+                self.roda_pos = pp;
+                self.win_roda = true;
+            }
+        }
         if self.dirty || self.texture.is_none() {
             let PixelImage { width, height, rgba } = render_frame_alpha(
                 self.document.width,
@@ -10736,7 +12242,13 @@ impl eframe::App for SketchMotionApp {
             self.screen = Screen::Home;
         }
         if a_abrir {
-            self.abrir();
+            if self.modificado {
+                // Trabalho com alterações: pergunta antes (mesmo fluxo de fechar),
+                // pois abrir substitui o atual e libera a memória dele.
+                self.win_abrir_confirm = true;
+            } else {
+                self.abrir();
+            }
         }
         if a_salvar {
             self.salvar();
@@ -10787,11 +12299,19 @@ impl eframe::App for SketchMotionApp {
             }
             if k_del && matches!(self.tool, Tool::Select | Tool::Lasso | Tool::MagicWand) {
                 if self.float_sel.is_some() {
+                    // Seleção raster ainda não movida: apaga o conteúdo na origem
+                    // (todas as camadas usáveis). Já movida/imagem: só descarta.
+                    if self.sel_origem.is_some() && !self.sel_movida {
+                        self.push_undo();
+                        self.limpar_origem_selecao();
+                    }
                     self.float_sel = None;
                     self.float_tex = None;
+                    self.sel_origem = None;
+                    self.sel_movida = false;
                     self.dirty = true;
-                } else if !self.sel_set.is_empty() {
-                    // Apaga TODOS os objetos selecionados (conjunto/grupo).
+                } else if !self.sel_set.is_empty() || !self.sel_imgs.is_empty() {
+                    // Apaga TODA a seleção múltipla (vetores + imagens).
                     self.push_undo();
                     let mut idxs = self.sel_set.clone();
                     idxs.sort_unstable();
@@ -10801,7 +12321,10 @@ impl eframe::App for SketchMotionApp {
                             self.document.vectors.remove(i);
                         }
                     }
+                    let ids = self.sel_imgs.clone();
+                    self.document.images.retain(|o| !ids.contains(&o.id));
                     self.sel_set.clear();
+                    self.sel_imgs.clear();
                     self.selected_obj = None;
                     self.dirty = true;
                 } else if let Some(i) = self.selected_obj {
@@ -10829,6 +12352,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_camadas(ctx);
         self.janela_rig(ctx);
         self.janela_objetos(ctx);
+        self.palette_radial(ctx);
         self.janela_editar_peca(ctx);
         self.janela_prancheta(ctx);
         self.janela_camera(ctx);
@@ -10884,25 +12408,51 @@ impl eframe::App for SketchMotionApp {
                         ui.id().with("canvas_area"),
                         egui::Sense::click_and_drag(),
                     );
-                    // Botão direito: seleciona o objeto sob o cursor (se houver) e
-                    // abre o menu de contexto com as ações à mão.
-                    if response.secondary_clicked() {
-                        if let Some(p) = response.interact_pointer_pos() {
-                            let dp = ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
-                            let thr = 6.0 / zoom;
-                            if let Some(i) = self.hit_test(dp, thr) {
-                                let g = self.document.vectors[i].group;
-                                if let Some(g) = g {
-                                    self.sel_set = (0..self.document.vectors.len())
-                                        .filter(|&k| self.document.vectors[k].group == Some(g))
-                                        .collect();
-                                } else if !self.sel_set.contains(&i) {
-                                    self.sel_set = vec![i];
+                    // Botão direito: abre a PALETTE RADIAL (roda estilo Krita).
+                    // Detecção do botão secundário no NÍVEL MAIS BAIXO (varrendo os
+                    // eventos de ponteiro): pega o pressionar com a posição do
+                    // próprio evento. É o caminho mais robusto para caneta/tablet,
+                    // onde o "clique"/interact_pos podem não se formar.
+                    let mut sec_evt: Option<(egui::Pos2, bool)> = None;
+                    ui.input(|i| {
+                        for e in &i.events {
+                            if let egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Secondary,
+                                pressed: true,
+                                modifiers,
+                            } = e
+                            {
+                                sec_evt = Some((*pos, modifiers.shift));
+                            }
+                        }
+                    });
+                    let shift_rc = sec_evt.map(|(_, sh)| sh).unwrap_or(false)
+                        || ui.input(|i| i.modifiers.shift);
+                    if let Some((p, _)) = sec_evt {
+                        if rect.contains(p) {
+                            if shift_rc {
+                                // Seleciona o objeto sob o cursor para o menu de contexto.
+                                let dp = ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
+                                let thr = 6.0 / zoom;
+                                if let Some(i) = self.hit_test(dp, thr) {
+                                    let g = self.document.vectors[i].group;
+                                    if let Some(g) = g {
+                                        self.sel_set = (0..self.document.vectors.len())
+                                            .filter(|&k| self.document.vectors[k].group == Some(g))
+                                            .collect();
+                                    } else if !self.sel_set.contains(&i) {
+                                        self.sel_set = vec![i];
+                                    }
+                                    self.selected_obj = Some(i);
                                 }
-                                self.selected_obj = Some(i);
+                            } else {
+                                self.win_roda = true;
+                                self.roda_pos = p;
                             }
                         }
                     }
+                    if shift_rc {
                     response.context_menu(|ui| {
                         ui.set_min_width(150.0);
                         if ui.button("Copiar").clicked() {
@@ -10932,6 +12482,7 @@ impl eframe::App for SketchMotionApp {
                             ui.close_menu();
                         }
                     });
+                    }
                     // Fundo xadrez indica transparência; a imagem (com alfa) vai por cima.
                     {
                         let p = ui.painter_at(rect);
@@ -11110,9 +12661,11 @@ impl eframe::App for SketchMotionApp {
                     // Seleção múltipla de vetores: contorno em cada objeto.
                     if self.tool == Tool::Select {
                         self.desenhar_sel_set(ui, rect, zoom);
+                        self.desenhar_selecao_multi(ui, rect, zoom);
                     }
                     // Pivô: pontos azul (eixo) e laranja (movimentação).
-                    if self.tool == Tool::Pivot || self.win_pivot {
+                    if !self.document.pivots.is_empty() {
+                        self.pivot_tick_follow();
                         self.desenhar_pivos(ui, rect, zoom);
                     }
                     // Vetor de Direção: trajetória (linha reta ou arco orbital).
@@ -11123,6 +12676,24 @@ impl eframe::App for SketchMotionApp {
                     }
                     let pressed = pressed && !self.win_prancheta;
                     let down = down && !self.win_prancheta;
+                    // Réguas de borda + guias globais (prioridade sobre as ferramentas).
+                    // Só age sobre o canvas puro — não sob janelas/painéis flutuantes.
+                    let dbl_guia =
+                        ui.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+                    let sobre_area = ctx.is_pointer_over_area();
+                    let guia_consumiu = self.interacao_guias(
+                        pressed, down, dbl_guia, sobre_area, ppos, rect, ui.clip_rect(), zoom,
+                    );
+                    let pressed = pressed && !guia_consumiu;
+                    let down = down && !guia_consumiu;
+                    // Roda de ferramentas aberta: não desenha no canvas.
+                    let pressed = pressed && !self.win_roda;
+                    let down = down && !self.win_roda;
+
+                    // Solta a trava do conta-gotas quando o botão é liberado.
+                    if !down {
+                        self.conta_gotas_trava = false;
+                    }
 
                     if self.eyedropper != Eyedropper::Off {
                         if pressed {
@@ -11144,6 +12715,9 @@ impl eframe::App for SketchMotionApp {
                                 }
                                 self.eyedropper = Eyedropper::Off;
                                 self.tool = Tool::Pencil;
+                                // Trava a pintura até soltar o botão: sem isso, o
+                                // mesmo clique que capturou a cor pintaria por cima.
+                                self.conta_gotas_trava = true;
                                 self.status =
                                     format!("Cor {} capturada", sketchmotion_color::to_hex(cor));
                             }
@@ -11204,7 +12778,20 @@ impl eframe::App for SketchMotionApp {
                             }
                             self.last_pos = None;
                         }
-                        if !on_rig {
+                        // Pontos de pivô: perto de um ponto, a Seleção usa o pivô;
+                        // fora deles, cai na seleção normal (ferramenta universal).
+                        let on_pivo = if !on_rig {
+                            self.select_pivot_points(pressed, down, hover, ppos, pdelta, rect, zoom)
+                        } else {
+                            false
+                        };
+                        // Seleção múltipla (vetores + imagens): mover/rotacionar juntos.
+                        let on_multi = if !on_rig && !on_pivo {
+                            self.interacao_multi_selecao(pressed, down, hover, ppos, pdelta, rect, zoom)
+                        } else {
+                            false
+                        };
+                        if !on_rig && !on_pivo && !on_multi {
                         if pressed {
                             if let Some(p) = hover {
                                 let dp = to_doc(p);
@@ -11314,6 +12901,21 @@ impl eframe::App for SketchMotionApp {
                                                     self.dragging_obj = true;
                                                 }
                                                 None => {
+                                                    // Auto-troca de camada: clicar sobre conteúdo
+                                                    // raster de outra camada (desbloqueada) leva o
+                                                    // foco para a camada desse conteúdo. Só bloqueia
+                                                    // se a camada de topo ali estiver travada.
+                                                    let (cx, cy) =
+                                                        (dp.0.floor() as i32, dp.1.floor() as i32);
+                                                    if let Some(li) = self.layer_topo_no_ponto(cx, cy) {
+                                                        if li != self.active_layer {
+                                                            if self.layer_locked(li) {
+                                                                self.warn_locked_layer(li);
+                                                            } else {
+                                                                self.active_layer = li;
+                                                            }
+                                                        }
+                                                    }
                                                     if !shift {
                                                         self.sel_set.clear();
                                                     }
@@ -11423,11 +13025,18 @@ impl eframe::App for SketchMotionApp {
                             self.rotating = false;
                             self.float_release();
                             if let Some(start) = self.marquee_start.take() {
-                                // Marca sobre vetores = seleção múltipla; senão, lift raster.
+                                // Marca que cruza vetores E/OU imagens = seleção
+                                // múltipla movível/rotacionável; se não cruza nada,
+                                // faz o lift raster (pixels), como antes.
                                 let picked = self.vetores_na_marca(start, self.marquee_cur);
-                                if !picked.is_empty() {
+                                let img_idx = self.imagens_na_marca(start, self.marquee_cur);
+                                if !picked.is_empty() || !img_idx.is_empty() {
                                     self.selected_obj = picked.first().copied();
                                     self.sel_set = picked;
+                                    // Garante id estável para cada imagem pega.
+                                    let ids: Vec<u32> =
+                                        img_idx.iter().map(|&k| self.ensure_img_id(k)).collect();
+                                    self.sel_imgs = ids;
                                 } else {
                                     self.lift_selection(start, self.marquee_cur);
                                 }
@@ -11591,6 +13200,8 @@ impl eframe::App for SketchMotionApp {
                         }
                         self.last_pos = None;
                     } else if self.tool.paints()
+                        && !self.conta_gotas_trava
+                        && down
                         && (response.is_pointer_button_down_on() || response.dragged())
                     {
                         let mut pontos: Vec<(i32, i32)> = ui.input(|i| {
@@ -11864,6 +13475,8 @@ impl eframe::App for SketchMotionApp {
                     // Overlay vetorial: objetos, seleção e traço em progresso.
                     self.desenhar_vetores(ui, rect, zoom);
                     self.desenhar_rig(ui, rect, zoom);
+                    self.desenhar_guias(ui, rect, zoom);
+                    self.desenhar_reguas_borda(ui, rect, zoom);
 
                     // Seleção retangular raster: pixels flutuantes + marca.
                     if self.float_sel.is_some() && self.float_tex.is_none() {
@@ -11883,7 +13496,7 @@ impl eframe::App for SketchMotionApp {
                         let scr = |wx: f32, wy: f32| {
                             egui::pos2(rect.min.x + wx * zoom, rect.min.y + wy * zoom)
                         };
-                        let painter = ui.painter_at(rect);
+                        let painter = ui.painter_at(ui.clip_rect());
                         let cw = [
                             float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, -1.0, -1.0),
                             float_corner(fs.cx, fs.cy, fs.hw, fs.hh, fs.angle, 1.0, -1.0),
@@ -11976,7 +13589,7 @@ impl eframe::App for SketchMotionApp {
         let mut do_zoom_in = false;
         let mut do_zoom_out = false;
         egui::Area::new(egui::Id::new("acoes_canvas"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-66.0, 96.0))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-66.0, 128.0))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -12088,19 +13701,28 @@ impl eframe::App for SketchMotionApp {
                 let data = self
                     .float_sel
                     .as_ref()
-                    .map(|fs| (fs.ow, fs.oh, fs.pixels.clone()));
+                    .map(|fs| (fs.ow, fs.oh, fs.pixels.clone(), fs.cx, fs.cy));
                 if let Some(d) = data {
                     self.clip = Some(d);
                     self.clip_objetos = false;
                     if recortar {
+                        // Recortar: limpa a origem (se ainda não movida) e descarta.
+                        if self.sel_origem.is_some() && !self.sel_movida {
+                            self.push_undo();
+                            self.limpar_origem_selecao();
+                        }
                         self.float_sel = None;
                         self.float_tex = None;
+                        self.sel_origem = None;
+                        self.sel_movida = false;
                         self.dirty = true;
                         self.status = "Seleção recortada — Ctrl+V para colar".into();
                     } else {
+                        // Copiar: não destrutivo. drop_float descarta (se não
+                        // movida) mantendo os originais, ou carimba (se movida).
                         self.drop_float();
                         self.status =
-                            "Seleção copiada — Ctrl+V para colar (inclusive em outro frame)".into();
+                            "Seleção copiada — Ctrl+V para colar (mesmo lugar / outro frame)".into();
                     }
                 }
             } else {
@@ -12115,30 +13737,37 @@ impl eframe::App for SketchMotionApp {
         {
             self.colar_objetos();
         } else if k_paste {
-            if let Some((ow, oh, px)) = self.clip.clone() {
+            if let Some((ow, oh, px, scx, scy)) = self.clip.clone() {
                 // Finaliza a colagem anterior ANTES de registrar o histórico, para
                 // que cada colar seja uma ação de undo/redo separada (não uma só).
                 self.drop_float();
                 self.push_undo();
-                let (dw, dh) = (self.document.width as f32, self.document.height as f32);
+                // Cola EXATAMENTE no mesmo lugar de onde foi copiado (tipo Ctrl+F),
+                // inclusive em outro frame. A camada de destino é a usável atual
+                // (o conjunto copiado passa a viver junto nessa camada).
+                let dest = self.destino_selecao().unwrap_or(self.active_layer);
                 self.float_sel = Some(FloatSel {
                     pixels: px,
                     ow,
                     oh,
-                    cx: dw / 2.0,
-                    cy: dh / 2.0,
+                    cx: scx,
+                    cy: scy,
                     hw: ow as f32 / 2.0,
                     hh: oh as f32 / 2.0,
                     angle: 0.0,
                     opacity: 1.0,
-                    layer: self.active_layer,
+                    layer: dest,
                     is_image: false,
+                    id: 0,
                 });
+                self.sel_origem = None;
+                self.sel_movida = false;
                 self.float_tex = None;
                 self.tool = Tool::Select;
+                self.active_layer = dest;
                 self.selected_obj = None;
                 self.dirty = true;
-                self.status = "Colado — mova e confirme".into();
+                self.status = "Colado no mesmo lugar — mova se quiser e confirme".into();
             }
         }
         if do_zoom_in {
@@ -12161,6 +13790,12 @@ impl eframe::App for SketchMotionApp {
         // novo frame, a posição antiga fica "presa" na tela até o próximo evento
         // (aquele fantasma/delay). Pedir repaint garante a atualização imediata.
         if self.dirty {
+            ctx.request_repaint();
+        }
+        // Enquanto o botão (ponta da caneta) está pressionado, mantém o loop de
+        // render ativo a cada frame — sem isso, no modo reativo o traço só
+        // aparece quando chega um novo evento, o que com a caneta vira delay.
+        if ctx.input(|i| i.pointer.primary_down()) {
             ctx.request_repaint();
         }
     }
