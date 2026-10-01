@@ -117,6 +117,12 @@ pub struct Camera {
     pub base_h: f32,
     /// Keyframes ordenados por `frame` crescente.
     pub keyframes: Vec<CameraKeyframe>,
+    /// Quando ligado, a câmera enquadra SEMPRE o canvas inteiro (base_w×base_h),
+    /// em todos os frames, ignorando os keyframes. Como usa o tamanho-base
+    /// (atualizado ao redimensionar o papel), o enquadramento acompanha o canvas
+    /// automaticamente e com exatidão.
+    #[serde(default)]
+    pub fit_canvas: bool,
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -130,6 +136,7 @@ impl Camera {
         Self {
             base_w: bw,
             base_h: bh,
+            fit_canvas: false,
             keyframes: vec![CameraKeyframe {
                 frame: 0,
                 x: bw / 2.0,
@@ -214,6 +221,11 @@ impl Camera {
 
     /// Estado interpolado da câmera no `frame` pedido.
     pub fn sample(&self, frame: usize) -> CameraState {
+        // Enquadrar o canvas inteiro: ignora keyframes e devolve o estado cheio
+        // (tamanho-base = canvas) para QUALQUER frame.
+        if self.fit_canvas {
+            return self.full_state();
+        }
         if self.keyframes.is_empty() {
             return self.full_state();
         }

@@ -8004,6 +8004,16 @@ impl SketchMotionApp {
             self.win_camera = true;
         }
         ui.separator();
+        let mut fit = self.document.camera.fit_canvas;
+        if ui
+            .checkbox(&mut fit, "Canvas inteiro")
+            .on_hover_text("Enquadra o canvas inteiro em todos os frames (automático e exato).")
+            .changed()
+        {
+            self.document.camera.fit_canvas = fit;
+            self.dirty = true;
+        }
+        ui.separator();
         let cur = self.document.current;
         let has = self.document.camera.keyframe_index(cur).is_some();
         if ui
@@ -9636,6 +9646,30 @@ impl SketchMotionApp {
             .open(&mut open)
             .default_width(320.0)
             .show(ctx, |ui| {
+                // Enquadrar o canvas inteiro automaticamente, em todos os frames.
+                let mut fit = self.document.camera.fit_canvas;
+                if ui
+                    .checkbox(&mut fit, "Enquadrar o canvas inteiro (todos os frames)")
+                    .on_hover_text(
+                        "Trava a camera no tamanho exato do canvas, em todos os frames, e                          acompanha automaticamente quando voce redimensiona o papel.",
+                    )
+                    .changed()
+                {
+                    self.document.camera.fit_canvas = fit;
+                    self.dirty = true;
+                    self.status = if fit {
+                        "Camera: enquadrando o canvas inteiro (automatico)".into()
+                    } else {
+                        "Camera: enquadramento manual por keyframes".into()
+                    };
+                }
+                ui.separator();
+                if fit {
+                    ui.weak(
+                        "A camera esta travada no canvas inteiro. Os keyframes ficam                          desativados enquanto esta opcao estiver ligada.",
+                    );
+                }
+                if !fit {
                 ui.label(format!("Frame atual: {}", cur + 1));
                 let has_idx = self.document.camera.keyframe_index(cur);
                 if has_idx.is_some() {
@@ -9786,6 +9820,7 @@ impl SketchMotionApp {
                      Vá para outro frame e mude de novo — o movimento entre eles é \
                      interpolado sozinho. Rode a animação com 'Ver pela câmera' ligado.",
                 );
+                }
             });
         if let Some(g) = goto {
             self.document.go_to_frame(g);
@@ -13730,7 +13765,11 @@ impl eframe::App for SketchMotionApp {
                         }
                         self.last_pos = None;
                     } else if self.tool == Tool::Camera {
-                        self.interacao_camera(pressed, down, hover, ppos, rect, zoom);
+                        // Com "enquadrar o canvas inteiro" ligado, a camera fica
+                        // travada no canvas — nao editamos o enquadramento a mao.
+                        if !self.document.camera.fit_canvas {
+                            self.interacao_camera(pressed, down, hover, ppos, rect, zoom);
+                        }
                         self.last_pos = None;
                     } else if self.tool == Tool::Pivot {
                         self.interacao_pivo(pressed, down, hover, ppos, pdelta, rect, zoom);
