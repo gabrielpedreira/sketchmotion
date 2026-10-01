@@ -11,8 +11,9 @@
 use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{Document, PieceLibrary};
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Extensão do formato de projeto.
 pub const PROJECT_EXTENSION: &str = "sketchmotion";
@@ -35,6 +36,57 @@ pub fn load(path: &Path) -> Result<Document, String> {
     let mut doc: Document =
         ciborium::from_reader(BufReader::new(file)).map_err(|e| e.to_string())?;
     doc.normalize();
+    Ok(doc)
+}
+
+/// Como `save`, mas reporta progresso 0..1000 em `progress`. Serializa em
+/// memória (CBOR) e grava o arquivo em blocos, atualizando a porcentagem.
+pub fn save_with_progress(doc: &Document, path: &Path, progress: &AtomicU32) -> Result<(), String> {
+    progress.store(10, Ordering::Relaxed);
+    let mut buf: Vec<u8> = Vec::new();
+    ciborium::into_writer(doc, &mut buf).map_err(|e| e.to_string())?;
+    // Serialização concluída ~40% do trabalho total percebido.
+    progress.store(400, Ordering::Relaxed);
+    let total = buf.len().max(1);
+    let file = File::create(path).map_err(|e| e.to_string())?;
+    let mut w = BufWriter::new(file);
+    let chunk = 1usize << 20; // 1 MiB
+    let mut done = 0usize;
+    for part in buf.chunks(chunk) {
+        w.write_all(part).map_err(|e| e.to_string())?;
+        done += part.len();
+        let frac = 400 + (done as u64 * 600 / total as u64) as u32;
+        progress.store(frac.min(999), Ordering::Relaxed);
+    }
+    w.flush().map_err(|e| e.to_string())?;
+    progress.store(1000, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Como `load`, mas reporta progresso 0..1000 em `progress`. A leitura do
+/// arquivo (parte lenta em projetos grandes) é feita em blocos e vira a maior
+/// fatia da barra; a desserialização finaliza em 100%.
+pub fn load_with_progress(path: &Path, progress: &AtomicU32) -> Result<Document, String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0).max(1);
+    let mut buf: Vec<u8> = Vec::with_capacity(total as usize);
+    let mut tmp = vec![0u8; 1usize << 20];
+    let mut read_total: u64 = 0;
+    loop {
+        let n = file.read(&mut tmp).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        read_total += n as u64;
+        let frac = (read_total.saturating_mul(850) / total) as u32;
+        progress.store(frac.min(850), Ordering::Relaxed);
+    }
+    progress.store(880, Ordering::Relaxed);
+    let mut doc: Document =
+        ciborium::from_reader(&buf[..]).map_err(|e| e.to_string())?;
+    doc.normalize();
+    progress.store(1000, Ordering::Relaxed);
     Ok(doc)
 }
 

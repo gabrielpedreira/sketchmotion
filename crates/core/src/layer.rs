@@ -101,6 +101,36 @@ impl Layer {
         self.height = h;
     }
 
+    /// Redimensiona o buffer colocando o conteúdo antigo deslocado em (dx, dy)
+    /// no novo buffer (em pixels). Permite "esticar" o papel pela esquerda/topo:
+    /// o desenho é reposicionado para continuar no mesmo lugar visual.
+    pub fn resize_offset(&mut self, w: u32, h: u32, dx: i32, dy: i32) {
+        if self.width == w && self.height == h && dx == 0 && dy == 0 {
+            return;
+        }
+        let mut np = vec![0u8; (w as usize) * (h as usize) * 4];
+        let sw = self.width as i32;
+        let sh = self.height as i32;
+        for sy in 0..sh {
+            let ty = sy + dy;
+            if ty < 0 || ty >= h as i32 {
+                continue;
+            }
+            for sx in 0..sw {
+                let tx = sx + dx;
+                if tx < 0 || tx >= w as i32 {
+                    continue;
+                }
+                let si = ((sy * sw + sx) * 4) as usize;
+                let ti = ((ty * w as i32 + tx) * 4) as usize;
+                np[ti..ti + 4].copy_from_slice(&self.pixels[si..si + 4]);
+            }
+        }
+        self.pixels = np;
+        self.width = w;
+        self.height = h;
+    }
+
     pub fn opacity(&self) -> f32 {
         self.opacity
     }

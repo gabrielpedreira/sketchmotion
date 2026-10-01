@@ -1139,8 +1139,16 @@ enum ExportKind {
 /// Abertura de projeto em andamento (thread de fundo → tela de carregamento).
 struct OpenJob {
     rx: mpsc::Receiver<Result<Document, String>>,
+    progress: Arc<AtomicU32>,
     started: std::time::Instant,
     path: std::path::PathBuf,
+}
+
+/// Importação de imagem (decodifica numa thread + barra de progresso).
+struct ImportJob {
+    rx: mpsc::Receiver<Result<(u32, u32, Vec<u8>), String>>,
+    progress: Arc<AtomicU32>,
+    started: std::time::Instant,
 }
 
 /// Trabalho pesado (exportar/salvar) em andamento: barra de progresso + bloqueio.
@@ -1646,6 +1654,8 @@ struct SketchMotionApp {
     frame_sel: Vec<usize>,
     /// Modo "selecionar frames": clique alterna a seleção em vez de navegar.
     frame_sel_mode: bool,
+    /// Confirmação de exclusão de frame(s): (faixa, índices a excluir).
+    confirm_del_frame: Option<(usize, Vec<usize>)>,
     /// Conjunto de frames copiados (colados em sequência).
     frames_clip: Vec<Frame>,
     /// Arrasto de frame em andamento: (faixa, índice do frame).
@@ -1703,6 +1713,17 @@ struct SketchMotionApp {
     tex_dirvec: Option<egui::TextureHandle>,
     // Ferramenta Vetor de Direção (animação automática por interpolação).
     win_dirvec: bool,
+    // "Aplicar mudanças em": propaga a edição feita num frame só nos pixels
+    // alterados para outros frames selecionados.
+    win_aplicar: bool,
+    /// Frames marcados para receber a aplicação (índice = frame da faixa ativa).
+    aplicar_sel: Vec<bool>,
+    /// Modo de gravação ativo (capturando a edição a aplicar).
+    aplicar_gravando: bool,
+    /// Snapshot das camadas do frame no início da gravação (base do delta).
+    aplicar_base: Option<Vec<Layer>>,
+    /// Frame de origem da gravação (recebe a edição original).
+    aplicar_src: usize,
     /// Guia (régua) sendo arrastada (índice em document.guides), se houver.
     ruler_drag: Option<usize>,
     /// Pressionou numa barra da régua e aguarda o arraste sair da barra para
@@ -1757,6 +1778,8 @@ struct SketchMotionApp {
     busy_job: Option<BusyJob>,
     /// Abertura de projeto em andamento (tela de carregamento).
     open_job: Option<OpenJob>,
+    /// Importação de imagem em andamento (barra de progresso).
+    import_job: Option<ImportJob>,
     /// Splash: frames do GIF (textura + duração em segundos).
     splash_frames: Vec<(egui::TextureHandle, f32)>,
     /// Splash: já decodificou o GIF?
@@ -1969,6 +1992,7 @@ impl SketchMotionApp {
             play_both: false,
             frame_sel: Vec::new(),
             frame_sel_mode: false,
+            confirm_del_frame: None,
             obj_clip: ObjClip::default(),
             clip_objetos: false,
             frames_clip: Vec::new(),
@@ -1998,6 +2022,11 @@ impl SketchMotionApp {
             pivot_name_buf: String::new(),
             tex_dirvec: None,
             win_dirvec: false,
+            win_aplicar: false,
+            aplicar_sel: Vec::new(),
+            aplicar_gravando: false,
+            aplicar_base: None,
+            aplicar_src: 0,
             ruler_drag: None,
             ruler_pending: None,
             ruler_pushed: false,
@@ -2024,6 +2053,7 @@ impl SketchMotionApp {
             trace_job: None,
             busy_job: None,
             open_job: None,
+            import_job: None,
             splash_frames: Vec::new(),
             splash_loaded: false,
             splash_idx: 0,
@@ -2606,10 +2636,12 @@ impl SketchMotionApp {
         self.document.sync_to_frames();
         let doc = self.document.clone();
         let progress = Arc::new(AtomicU32::new(0));
+        let prog_thread = progress.clone();
         let (tx, rx) = mpsc::channel();
         let p2 = path.clone();
         std::thread::spawn(move || {
-            let r = sketchmotion_io::save(&doc, &p2).map(|_| format!("Salvo em {}", p2.display()));
+            let r = sketchmotion_io::save_with_progress(&doc, &p2, &prog_thread)
+                .map(|_| format!("Salvo em {}", p2.display()));
             let _ = tx.send(r);
         });
         self.busy_job = Some(BusyJob {
@@ -2617,7 +2649,7 @@ impl SketchMotionApp {
             progress,
             started: std::time::Instant::now(),
             titulo: "Salvando…".into(),
-            determinate: false,
+            determinate: true,
             set_path: Some(path),
         });
     }
@@ -2677,23 +2709,41 @@ impl SketchMotionApp {
             .save_file()
         {
             let (w, h) = (self.document.width, self.document.height);
-            let img = render_frame_alpha(
-                w,
-                h,
-                &self.document.layers,
-                &self.document.vectors,
-                &self.document.images,
-            );
-            let base = if self.export_camera {
-                self.aplicar_camera_rgba(&img.rgba, w, h, self.document.current)
-            } else {
-                img.rgba
-            };
-            let (ew, eh, ergba) = upscale_nn(w, h, &base, self.export_scale);
-            self.status = match sketchmotion_io::export_png(ew, eh, &ergba, &path) {
-                Ok(()) => format!("Exportado ({ew}x{eh}): {}", path.display()),
-                Err(e) => format!("Erro ao exportar: {e}"),
-            };
+            let layers = self.document.layers.clone();
+            let vectors = self.document.vectors.clone();
+            let images = self.document.images.clone();
+            let camera = self.document.camera.clone();
+            let export_camera = self.export_camera;
+            let scale = self.export_scale;
+            let cur = self.document.current;
+            let progress = Arc::new(AtomicU32::new(0));
+            let prog = progress.clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                prog.store(80, Ordering::Relaxed);
+                let img = render_frame_alpha(w, h, &layers, &vectors, &images);
+                prog.store(400, Ordering::Relaxed);
+                let base = if export_camera {
+                    aplicar_camera_livre(&camera, &img.rgba, w, h, cur)
+                } else {
+                    img.rgba
+                };
+                prog.store(650, Ordering::Relaxed);
+                let (ew, eh, ergba) = upscale_nn(w, h, &base, scale);
+                prog.store(800, Ordering::Relaxed);
+                let r = sketchmotion_io::export_png(ew, eh, &ergba, &path)
+                    .map(|_| format!("Exportado ({ew}x{eh}): {}", path.display()));
+                prog.store(1000, Ordering::Relaxed);
+                let _ = tx.send(r);
+            });
+            self.busy_job = Some(BusyJob {
+                rx,
+                progress,
+                started: std::time::Instant::now(),
+                titulo: "Exportando imagem…".into(),
+                determinate: true,
+                set_path: None,
+            });
         }
     }
 
@@ -2707,11 +2757,14 @@ impl SketchMotionApp {
         {
             let p2 = path.clone();
             let (tx, rx) = mpsc::channel();
+            let progress = Arc::new(AtomicU32::new(0));
+            let prog_thread = progress.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(sketchmotion_io::load(&p2));
+                let _ = tx.send(sketchmotion_io::load_with_progress(&p2, &prog_thread));
             });
             self.open_job = Some(OpenJob {
                 rx,
+                progress,
                 started: std::time::Instant::now(),
                 path,
             });
@@ -2832,10 +2885,20 @@ impl SketchMotionApp {
             .add_filter("Imagens", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
             .pick_file()
         {
-            match sketchmotion_io::load_image(&path) {
-                Ok((w, h, rgba)) => self.colocar_imagem(w, h, rgba),
-                Err(e) => self.status = format!("Erro ao importar: {e}"),
-            }
+            let progress = Arc::new(AtomicU32::new(0));
+            let prog = progress.clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                prog.store(100, Ordering::Relaxed);
+                let r = sketchmotion_io::load_image(&path);
+                prog.store(1000, Ordering::Relaxed);
+                let _ = tx.send(r);
+            });
+            self.import_job = Some(ImportJob {
+                rx,
+                progress,
+                started: std::time::Instant::now(),
+            });
         }
     }
 
@@ -3047,16 +3110,69 @@ impl SketchMotionApp {
     /// Verifica jobs de exportar/salvar; mostra a tela de progresso (bloqueante).
     /// Devolve true enquanto um job está ativo (o `update` deve parar aí).
     fn busy_poll(&mut self, ctx: &egui::Context) -> bool {
+        // Importação de imagem (barra de progresso).
+        if self.import_job.is_some() {
+            ctx.request_repaint();
+            let (elapsed, frac) = {
+                let job = self.import_job.as_ref().unwrap();
+                (
+                    job.started.elapsed().as_secs_f32(),
+                    (job.progress.load(Ordering::Relaxed) as f32 / 1000.0).clamp(0.0, 1.0),
+                )
+            };
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.4);
+                    ui.heading("Importando imagem…");
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(360.0)
+                            .show_percentage(),
+                    );
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_gray(150),
+                        format!("Decodificando… ({:.0}s)", elapsed),
+                    );
+                });
+            });
+            match self.import_job.as_ref().unwrap().rx.try_recv() {
+                Ok(res) => {
+                    self.import_job = None;
+                    match res {
+                        Ok((w, h, rgba)) => self.colocar_imagem(w, h, rgba),
+                        Err(e) => self.status = format!("Erro ao importar: {e}"),
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.import_job = None;
+                    self.status = "Falha ao importar".into();
+                }
+            }
+            return true;
+        }
         // Abertura de projeto (tela de carregamento — arquivos grandes demoram).
         if self.open_job.is_some() {
             ctx.request_repaint();
-            let elapsed = self.open_job.as_ref().unwrap().started.elapsed().as_secs_f32();
+            let (elapsed, frac) = {
+                let job = self.open_job.as_ref().unwrap();
+                (
+                    job.started.elapsed().as_secs_f32(),
+                    (job.progress.load(Ordering::Relaxed) as f32 / 1000.0).clamp(0.0, 1.0),
+                )
+            };
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() * 0.4);
                     ui.heading("Abrindo projeto…");
                     ui.add_space(10.0);
-                    ui.add(egui::Spinner::new().size(30.0));
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .desired_width(360.0)
+                            .show_percentage(),
+                    );
                     ui.add_space(6.0);
                     ui.colored_label(
                         egui::Color32::from_gray(150),
@@ -3460,6 +3576,24 @@ impl SketchMotionApp {
 
     /// Copia (ou recorta, se `recortar`) os objetos vetoriais selecionados para
     /// a área de transferência de objetos. Devolve true se havia algo.
+    /// Ferramentas que conseguem manipular uma seleção flutuante. Após
+    /// copiar/colar mantemos a ferramenta em uso quando ela for uma dessas;
+    /// só caímos para Seleção se o usuário estava em uma ferramenta de desenho.
+    fn ferramenta_selecao_ativa(&self) -> bool {
+        matches!(
+            self.tool,
+            Tool::Select | Tool::Lasso | Tool::MagicWand | Tool::DirectSelect
+        )
+    }
+
+    /// Garante que há uma ferramenta de seleção ativa para mexer na flutuante,
+    /// sem trocar a ferramenta se o usuário já estava em uma (ex.: Laço).
+    fn garantir_ferramenta_selecao(&mut self) {
+        if !self.ferramenta_selecao_ativa() {
+            self.tool = Tool::Select;
+        }
+    }
+
     fn copiar_objetos(&mut self, recortar: bool) -> bool {
         let idxs = self.objetos_selecionados();
         if idxs.is_empty() {
@@ -3521,7 +3655,7 @@ impl SketchMotionApp {
             self.sel_set = (start..self.document.vectors.len()).collect();
             self.selected_obj = self.sel_set.first().copied();
         }
-        self.tool = Tool::Select;
+        self.garantir_ferramenta_selecao();
         self.dirty = true;
         let nv = self.document.vectors.len() - start;
         let ni = self.obj_clip.images.len();
@@ -4215,6 +4349,307 @@ impl SketchMotionApp {
 
     /// Janela "Objetos": confirmação de agrupar + lista de peças salvas
     /// (miniatura, renomear, colar, excluir).
+    /// Janela da ferramenta "Aplicar mudanças em:". Fluxo:
+    /// 1) o usuário marca os frames de destino;
+    /// 2) clica em "Criar mudança" → entra em modo de gravação (tira um
+    ///    snapshot das camadas do frame atual como base);
+    /// 3) desenha/edita normalmente no canvas (uma borda vermelha avisa que
+    ///    está gravando);
+    /// 4) clica em "Salvar e aplicar" → só os pixels que mudaram desde o
+    ///    snapshot são carimbados nos frames escolhidos (nas mesmas camadas e
+    ///    coordenadas), sem transformar os outros frames em cópias.
+    /// Janela "tem certeza?" para excluir um ou vários frames.
+    fn janela_confirmar_del_frame(&mut self, ctx: &egui::Context) {
+        let Some((ti, idxs)) = self.confirm_del_frame.clone() else {
+            return;
+        };
+        let mut confirmar = false;
+        let mut cancelar = false;
+        let n = idxs.len();
+        egui::Window::new("Excluir frame(s)")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                if n == 1 {
+                    ui.label(format!(
+                        "Tem certeza que deseja excluir o frame {}?",
+                        idxs[0] + 1
+                    ));
+                } else {
+                    let nums: Vec<String> = idxs.iter().map(|i| (i + 1).to_string()).collect();
+                    ui.label(format!(
+                        "Tem certeza que deseja excluir {} frames? ({})",
+                        n,
+                        nums.join(", ")
+                    ));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new("Excluir")
+                                .fill(egui::Color32::from_rgb(200, 60, 60)),
+                        )
+                        .clicked()
+                    {
+                        confirmar = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        cancelar = true;
+                    }
+                });
+            });
+        if confirmar {
+            self.executar_del_frames(ti, &idxs);
+            self.confirm_del_frame = None;
+        }
+        if cancelar {
+            self.confirm_del_frame = None;
+        }
+    }
+
+    /// Exclui os frames de índices `idxs` na faixa `ti` (mantém ao menos um).
+    fn executar_del_frames(&mut self, ti: usize, idxs: &[usize]) {
+        if ti != self.document.active_track {
+            self.document.go_to_track(ti);
+        }
+        self.push_undo();
+        // Remove do maior para o menor índice para não bagunçar as posições.
+        let mut ordenados: Vec<usize> = idxs.to_vec();
+        ordenados.sort_unstable();
+        ordenados.dedup();
+        for &i in ordenados.iter().rev() {
+            self.document.remove_frame(i);
+        }
+        self.frame_sel.clear();
+        self.onion_for = None;
+        self.track_thumbs.clear();
+        self.between_cache.clear();
+        self.between_key = None;
+        self.dirty = true;
+        self.playing = false;
+        self.status = if ordenados.len() == 1 {
+            "Frame excluído".into()
+        } else {
+            format!("{} frames excluídos", ordenados.len())
+        };
+    }
+
+    fn janela_aplicar(&mut self, ctx: &egui::Context) {
+        let total = self.document.frames.len();
+        // Mantém o vetor de seleção do tamanho da quantidade de frames.
+        if self.aplicar_sel.len() != total {
+            self.aplicar_sel.resize(total, false);
+        }
+
+        // A janela abre junto quando a gravação está ativa (para o botão de
+        // salvar/cancelar ficar sempre acessível).
+        let mut open = self.win_aplicar || self.aplicar_gravando;
+        if !open {
+            return;
+        }
+
+        let mut iniciar = false;
+        let mut salvar = false;
+        let mut cancelar = false;
+        let src = self.document.current;
+        let gravando = self.aplicar_gravando;
+        let total_sel = self.aplicar_sel.iter().filter(|b| **b).count();
+
+        egui::Window::new("Aplicar mudanças em:")
+            .open(&mut open)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                if gravando {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 60, 60),
+                        "● GRAVANDO — desenhe a mudança e clique em \"Salvar e aplicar\".",
+                    );
+                } else {
+                    ui.label("Marque os frames que vão receber a mudança:");
+                }
+                ui.separator();
+
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for i in 0..total {
+                        ui.horizontal(|ui| {
+                            if i == src {
+                                ui.add_enabled(
+                                    false,
+                                    egui::Checkbox::new(&mut false, ""),
+                                );
+                                ui.label(format!("Frame {}  (origem)", i + 1));
+                            } else {
+                                ui.checkbox(&mut self.aplicar_sel[i], format!("Frame {}", i + 1));
+                            }
+                        });
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Marcar todos").clicked() {
+                        for (i, b) in self.aplicar_sel.iter_mut().enumerate() {
+                            *b = i != src;
+                        }
+                    }
+                    if ui.button("Limpar").clicked() {
+                        for b in self.aplicar_sel.iter_mut() {
+                            *b = false;
+                        }
+                    }
+                });
+
+                ui.separator();
+                if !gravando {
+                    let resp = ui.add_enabled(
+                        total_sel > 0,
+                        egui::Button::new("Criar mudança"),
+                    );
+                    if resp.on_hover_text(
+                        "Começa a gravar: o que você desenhar a partir de agora será copiado.",
+                    ).clicked() {
+                        iniciar = true;
+                    }
+                    if total_sel == 0 {
+                        ui.label("Marque pelo menos um frame de destino.");
+                    }
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("Salvar e aplicar").clicked() {
+                            salvar = true;
+                        }
+                        if ui.button("Cancelar").clicked() {
+                            cancelar = true;
+                        }
+                    });
+                    ui.label(format!("{} frame(s) de destino.", total_sel));
+                }
+            });
+
+        // Fechar a janela pelo "X" só vale quando não está gravando (não
+        // queremos perder a gravação por engano).
+        if !gravando {
+            self.win_aplicar = open;
+        }
+
+        if iniciar {
+            // Snapshot do estado atual das camadas = base do delta.
+            self.document.sync_to_frames();
+            self.aplicar_base = Some(self.document.layers.clone());
+            self.aplicar_src = self.document.current;
+            self.aplicar_gravando = true;
+            self.win_aplicar = true;
+            self.status = "Gravando mudança — desenhe e clique em Salvar e aplicar".into();
+        }
+
+        if salvar {
+            self.aplicar_mudancas_salvar();
+        }
+
+        if cancelar {
+            self.aplicar_gravando = false;
+            self.aplicar_base = None;
+            self.status = "Gravação cancelada".into();
+        }
+    }
+
+    /// Calcula o delta (pixels alterados desde o snapshot) e carimba esses
+    /// pixels nos frames selecionados, camada a camada, sem tocar no resto.
+    fn aplicar_mudancas_salvar(&mut self) {
+        let base = match self.aplicar_base.take() {
+            Some(b) => b,
+            None => {
+                self.aplicar_gravando = false;
+                return;
+            }
+        };
+        // Garante que a edição-origem está persistida em frames[current].
+        self.document.sync_to_frames();
+        let src = self.aplicar_src.min(self.document.frames.len().saturating_sub(1));
+
+        // Delta por camada: lista de (x, y, cor nova) onde os bytes mudaram.
+        let src_layers = &self.document.frames[src].layers;
+        let nl = base.len().min(src_layers.len());
+        let mut deltas: Vec<Vec<(u32, u32, Color)>> = Vec::with_capacity(nl);
+        for li in 0..nl {
+            let b = &base[li];
+            let c = &src_layers[li];
+            let w = b.width();
+            let h = b.height();
+            let mut changed = Vec::new();
+            if c.width() == w && c.height() == h {
+                let bp = b.pixels();
+                let cp = c.pixels();
+                if bp.len() == cp.len() {
+                    for y in 0..h {
+                        for x in 0..w {
+                            let i = ((y * w + x) * 4) as usize;
+                            if bp[i..i + 4] != cp[i..i + 4] {
+                                changed.push((
+                                    x,
+                                    y,
+                                    Color::rgba(cp[i], cp[i + 1], cp[i + 2], cp[i + 3]),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            deltas.push(changed);
+        }
+
+        let total_pix: usize = deltas.iter().map(|d| d.len()).sum();
+        if total_pix == 0 {
+            self.aplicar_gravando = false;
+            self.status = "Nenhuma mudança gravada para aplicar".into();
+            return;
+        }
+
+        self.push_undo();
+
+        let total_frames = self.document.frames.len();
+        let mut alvos = 0usize;
+        for ti in 0..total_frames {
+            if ti == src || ti >= self.aplicar_sel.len() || !self.aplicar_sel[ti] {
+                continue;
+            }
+            let frame = &mut self.document.frames[ti];
+            let mut tocou = false;
+            for (li, changed) in deltas.iter().enumerate() {
+                if li >= frame.layers.len() {
+                    break;
+                }
+                // Respeita camadas bloqueadas no frame de destino.
+                if frame.layers[li].locked {
+                    continue;
+                }
+                for &(x, y, color) in changed {
+                    frame.layers[li].set_pixel(x, y, color);
+                    tocou = true;
+                }
+            }
+            if tocou {
+                alvos += 1;
+            }
+        }
+
+        // Propaga frames[..] editados de volta para a faixa ativa e força o
+        // recomputo das miniaturas/onion dos frames afetados.
+        self.document.sync_to_frames();
+        self.between_cache.clear();
+        self.dirty = true;
+
+        self.aplicar_gravando = false;
+        self.aplicar_base = None;
+        self.modificado = true;
+        self.status = format!(
+            "Mudança aplicada em {} frame(s) ({} pixel(s))",
+            alvos, total_pix
+        );
+    }
+
     fn janela_objetos(&mut self, ctx: &egui::Context) {
         // Confirmação de agrupar (após o laço capturar a seleção).
         if self.pending_group.is_some() {
@@ -5841,14 +6276,34 @@ impl SketchMotionApp {
             self.playing = false;
         }
         if let Some(ti) = do_delframe {
-            if ti != self.document.active_track {
-                self.document.go_to_track(ti);
+            // Monta a lista de frames a excluir: se há seleção múltipla na faixa
+            // ativa, exclui o conjunto; senão, o frame atual/da faixa.
+            let mut idxs: Vec<usize> = if ti == self.document.active_track
+                && self.frame_sel_mode
+                && !self.frame_sel.is_empty()
+            {
+                let mut v = self.frame_sel.clone();
+                v.sort_unstable();
+                v.dedup();
+                v
+            } else if ti == self.document.active_track {
+                vec![self.document.current]
+            } else if let Some(t) = self.document.tracks.get(ti) {
+                vec![t.current.min(t.frames.len().saturating_sub(1))]
+            } else {
+                vec![self.document.current]
+            };
+            idxs.retain(|&i| {
+                let flen = if ti == self.document.active_track {
+                    self.document.frames.len()
+                } else {
+                    self.document.tracks.get(ti).map(|t| t.frames.len()).unwrap_or(0)
+                };
+                i < flen
+            });
+            if !idxs.is_empty() {
+                self.confirm_del_frame = Some((ti, idxs));
             }
-            let c = self.document.current;
-            self.document.remove_frame(c);
-            self.onion_for = None;
-            self.dirty = true;
-            self.playing = false;
         }
         if let Some(ti) = do_play {
             if ti != self.document.active_track {
@@ -6522,7 +6977,7 @@ impl SketchMotionApp {
         enum Slot {
             Pincel,
             Borracha,
-            Caneta,
+            Laco,
             ContaGotas,
             Ponta(usize),
         }
@@ -6534,7 +6989,7 @@ impl SketchMotionApp {
                 "Pincel",
             ),
             (icon::ERASER.to_string(), Slot::Borracha, self.tool == Tool::Eraser, "Borracha"),
-            (icon::PEN_NIB.to_string(), Slot::Caneta, self.tool == Tool::Pen, "Caneta"),
+            (icon::LASSO.to_string(), Slot::Laco, self.tool == Tool::Lasso, "Laço (seleção livre)"),
             (
                 icon::EYEDROPPER.to_string(),
                 Slot::ContaGotas,
@@ -6618,8 +7073,8 @@ impl SketchMotionApp {
                                 self.tool = Tool::Eraser;
                                 self.eyedropper = Eyedropper::Off;
                             }
-                            Slot::Caneta => {
-                                self.tool = Tool::Pen;
+                            Slot::Laco => {
+                                self.tool = Tool::Lasso;
                                 self.eyedropper = Eyedropper::Off;
                             }
                             Slot::ContaGotas => {
@@ -7401,6 +7856,16 @@ impl SketchMotionApp {
                             self.eyedropper = Eyedropper::Off;
                         }
                     }
+                    ui.add_space(6.0);
+
+                    // "Aplicar mudanças em:" — captura a edição feita neste
+                    // frame e copia APENAS os pixels alterados para os frames
+                    // escolhidos (não transforma os outros em cópias).
+                    let resp_ap = icon_button(ui, self.win_aplicar || self.aplicar_gravando, icon::COPY)
+                        .on_hover_text("Aplicar mudanças em: — copiar só os pixels editados para outros frames");
+                    if resp_ap.clicked() {
+                        self.win_aplicar = !self.win_aplicar;
+                    }
                 });
             });
     }
@@ -7413,6 +7878,31 @@ impl SketchMotionApp {
         }
         self.push_undo();
         self.document.resize_canvas(w, h);
+        self.pr_w = w;
+        self.pr_h = h;
+        self.center_canvas = true;
+        self.dirty = true;
+        self.track_thumbs.clear();
+        self.between_cache.clear();
+        self.between_key = None;
+        self.split_for = None;
+        self.below_tex = None;
+        self.above_tex = None;
+        self.onion_for = None;
+        self.status = format!("Papel: {w} x {h} px");
+    }
+
+    /// Redimensiona o papel deslocando o conteúdo em (dx, dy) — usado quando o
+    /// arrasto é feito pela borda esquerda/superior (o desenho não "escorrega").
+    fn aplicar_prancheta_offset(&mut self, w: u32, h: u32, dx: i32, dy: i32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        if w == self.document.width && h == self.document.height && dx == 0 && dy == 0 {
+            return;
+        }
+        self.push_undo();
+        self.document.resize_canvas_anchored(w, h, dx, dy);
         self.pr_w = w;
         self.pr_h = h;
         self.center_canvas = true;
@@ -9982,40 +10472,29 @@ impl SketchMotionApp {
         let blue = egui::Color32::from_rgb(0x2F, 0x84, 0xFE);
         let painter = ui.painter_at(ui.clip_rect());
         painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.5, blue));
-        // Quadradinhos de seleção em volta (8, estilo Illustrator).
-        let visuais = [
-            rect.left_top(),
-            rect.center_top(),
-            rect.right_top(),
-            rect.left_center(),
-            rect.left_bottom(),
-            rect.center_bottom(),
-            rect.right_center(),
-            rect.right_bottom(),
+
+        // 8 alças (cantos + meios), todas funcionais. Cada id controla um
+        // conjunto de bordas: L = esquerda, R = direita, T = topo, B = baixo.
+        // (pos, id, cursor, move_left, move_right, move_top, move_bottom)
+        let handles = [
+            (rect.right_center(), 0u8, egui::CursorIcon::ResizeHorizontal, false, true, false, false),
+            (rect.center_bottom(), 1u8, egui::CursorIcon::ResizeVertical, false, false, false, true),
+            (rect.right_bottom(), 2u8, egui::CursorIcon::ResizeNwSe, false, true, false, true),
+            (rect.left_center(), 3u8, egui::CursorIcon::ResizeHorizontal, true, false, false, false),
+            (rect.center_top(), 4u8, egui::CursorIcon::ResizeVertical, false, false, true, false),
+            (rect.left_top(), 5u8, egui::CursorIcon::ResizeNwSe, true, false, true, false),
+            (rect.left_bottom(), 6u8, egui::CursorIcon::ResizeNeSw, true, false, false, true),
+            (rect.right_top(), 7u8, egui::CursorIcon::ResizeNeSw, false, true, true, false),
         ];
-        for p in visuais {
-            let hr = egui::Rect::from_center_size(p, egui::vec2(9.0, 9.0));
-            painter.rect_filled(hr, 1.0, egui::Color32::WHITE);
-            painter.rect_stroke(hr, 1.0, egui::Stroke::new(1.0, blue));
-        }
-        // Alças funcionais (ancoradas no topo-esquerda): largura, altura, ambos.
-        let funcionais = [
-            (
-                rect.right_center(),
-                0u8,
-                egui::CursorIcon::ResizeHorizontal,
-            ),
-            (
-                rect.center_bottom(),
-                1u8,
-                egui::CursorIcon::ResizeVertical,
-            ),
-            (rect.right_bottom(), 2u8, egui::CursorIcon::ResizeNwSe),
-        ];
-        for (p, id, cur) in funcionais {
+
+        for (p, id, cur, _ml, _mr, _mt, _mb) in handles {
             let hr = egui::Rect::from_center_size(p, egui::vec2(14.0, 14.0));
             let resp = ui.interact(hr, ui.id().with(("prancheta_h", id)), egui::Sense::drag());
             let ativo = resp.hovered() || self.prancheta_drag == Some(id);
+            // Quadradinho branco (visual) + destaque azul quando ativo.
+            let sq = egui::Rect::from_center_size(p, egui::vec2(9.0, 9.0));
+            painter.rect_filled(sq, 1.0, egui::Color32::WHITE);
+            painter.rect_stroke(sq, 1.0, egui::Stroke::new(1.0, blue));
             if ativo {
                 painter.rect_filled(
                     egui::Rect::from_center_size(p, egui::vec2(11.0, 11.0)),
@@ -10028,21 +10507,41 @@ impl SketchMotionApp {
                 self.prancheta_drag = Some(id);
             }
         }
-        // Arrasto em andamento: preview + aplica ao soltar.
+
+        // Arrasto em andamento: calcula as novas bordas em coord. do documento,
+        // mostra o preview e aplica (com offset) ao soltar.
         if let Some(id) = self.prancheta_drag {
-            if let Some(pp) = ui.input(|i| i.pointer.interact_pos()) {
-                let px = (((pp.x - rect.left()) / zoom).round() as i32).clamp(1, 8192) as u32;
-                let py = (((pp.y - rect.top()) / zoom).round() as i32).clamp(1, 8192) as u32;
-                let mut nw = self.document.width;
-                let mut nh = self.document.height;
-                if id == 0 || id == 2 {
-                    nw = px;
-                }
-                if id == 1 || id == 2 {
-                    nh = py;
-                }
+            let hmeta = handles.iter().find(|h| h.1 == id).copied();
+            if let (Some((_, _, _, ml, mr, mt, mb)), Some(pp)) =
+                (hmeta, ui.input(|i| i.pointer.interact_pos()))
+            {
+                let cw = self.document.width as i32;
+                let ch = self.document.height as i32;
+                let px = ((pp.x - rect.left()) / zoom).round() as i32;
+                let py = ((pp.y - rect.top()) / zoom).round() as i32;
+                let mut x0 = 0i32;
+                let mut y0 = 0i32;
+                let mut x1 = cw;
+                let mut y1 = ch;
+                if ml { x0 = px; }
+                if mr { x1 = px; }
+                if mt { y0 = py; }
+                if mb { y1 = py; }
+                // Garante bordas coerentes e tamanho dentro dos limites.
+                if x1 <= x0 { x1 = x0 + 1; }
+                if y1 <= y0 { y1 = y0 + 1; }
+                let mut nw = (x1 - x0).clamp(1, 8192);
+                let mut nh = (y1 - y0).clamp(1, 8192);
+                // Reajusta as bordas caso o clamp tenha alterado o tamanho.
+                if ml { x0 = x1 - nw; } else { x1 = x0 + nw; }
+                if mt { y0 = y1 - nh; } else { y1 = y0 + nh; }
+                nw = x1 - x0;
+                nh = y1 - y0;
+                let dx = -x0;
+                let dy = -y0;
+
                 let prect = egui::Rect::from_min_size(
-                    rect.min,
+                    egui::pos2(rect.left() + x0 as f32 * zoom, rect.top() + y0 as f32 * zoom),
                     egui::vec2(nw as f32 * zoom, nh as f32 * zoom),
                 );
                 painter.rect_stroke(prect, 0.0, egui::Stroke::new(2.0, blue));
@@ -10053,11 +10552,11 @@ impl SketchMotionApp {
                     egui::FontId::proportional(13.0),
                     blue,
                 );
-                self.pr_w = nw;
-                self.pr_h = nh;
+                self.pr_w = nw as u32;
+                self.pr_h = nh as u32;
                 if ui.input(|i| i.pointer.any_released()) {
                     self.prancheta_drag = None;
-                    self.aplicar_prancheta(nw, nh);
+                    self.aplicar_prancheta_offset(nw as u32, nh as u32, dx, dy);
                 }
             } else if ui.input(|i| !i.pointer.any_down()) {
                 self.prancheta_drag = None;
@@ -11775,7 +12274,7 @@ impl eframe::App for SketchMotionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Abrir/Exportar/Salvar em andamento: tela de progresso, bloqueia o resto
         // (inclusive a tela inicial — a abertura pode começar a partir dela).
-        if self.open_job.is_some() || self.busy_job.is_some() {
+        if self.open_job.is_some() || self.busy_job.is_some() || self.import_job.is_some() {
             self.busy_poll(ctx);
             return;
         }
@@ -12421,6 +12920,8 @@ impl eframe::App for SketchMotionApp {
         self.janela_camadas(ctx);
         self.janela_rig(ctx);
         self.janela_objetos(ctx);
+        self.janela_aplicar(ctx);
+        self.janela_confirmar_del_frame(ctx);
         self.palette_radial(ctx);
         self.janela_editar_peca(ctx);
         self.janela_prancheta(ctx);
@@ -12484,8 +12985,12 @@ impl eframe::App for SketchMotionApp {
                     self.cv_rect_min = rect.min;
                     self.cv_pad = egui::vec2(pad_x, pad_y);
                     self.cv_zoom = zoom;
+                    // A área de interação cobre TODO o pasteboard (não só o
+                    // retângulo do papel): assim dá para agarrar alças de
+                    // seleção/objetos que ficam fora do canvas, na faixa cinza.
+                    let interact_rect = content_rect.intersect(ui.clip_rect());
                     let response = ui.interact(
-                        rect,
+                        interact_rect,
                         ui.id().with("canvas_area"),
                         egui::Sense::click_and_drag(),
                     );
@@ -13683,6 +14188,25 @@ impl eframe::App for SketchMotionApp {
                         );
                     }
                 });
+
+            // Modo de gravação de "Aplicar mudanças em:": borda vermelha
+            // pulsante em volta da área de trabalho para o usuário lembrar que
+            // está capturando a edição.
+            if self.aplicar_gravando {
+                let t = ui.input(|i| i.time);
+                let pulso = 0.5 + 0.5 * ((t * 3.0).sin() as f32);
+                let alpha = (120.0 + 135.0 * pulso) as u8;
+                let r = ui.max_rect();
+                ui.painter().rect_stroke(
+                    r.shrink(3.0),
+                    0.0,
+                    egui::Stroke::new(
+                        4.0,
+                        egui::Color32::from_rgba_unmultiplied(230, 40, 40, alpha),
+                    ),
+                );
+                ctx.request_repaint();
+            }
         });
         let mut do_zoom_in = false;
         let mut do_zoom_out = false;
@@ -13861,7 +14385,7 @@ impl eframe::App for SketchMotionApp {
                 self.sel_origem = None;
                 self.sel_movida = false;
                 self.float_tex = None;
-                self.tool = Tool::Select;
+                self.garantir_ferramenta_selecao();
                 self.active_layer = dest;
                 self.selected_obj = None;
                 self.dirty = true;

@@ -322,6 +322,37 @@ impl Document {
         self.load_active_track_mirror();
     }
 
+    /// Como `resize_canvas`, mas desloca o conteúdo em (dx, dy) pixels dentro do
+    /// novo papel. Usado para redimensionar pela borda esquerda/superior sem
+    /// mover visualmente o desenho (vetores e imagens acompanham o offset).
+    pub fn resize_canvas_anchored(&mut self, w: u32, h: u32, dx: i32, dy: i32) {
+        if w == 0 || h == 0 || (w == self.width && h == self.height && dx == 0 && dy == 0) {
+            return;
+        }
+        self.sync_to_frames();
+        let fdx = dx as f32;
+        let fdy = dy as f32;
+        for t in &mut self.tracks {
+            for f in &mut t.frames {
+                for l in &mut f.layers {
+                    l.resize_offset(w, h, dx, dy);
+                }
+                for v in &mut f.vectors {
+                    v.translate(fdx, fdy);
+                }
+                for im in &mut f.images {
+                    im.cx += fdx;
+                    im.cy += fdy;
+                }
+            }
+        }
+        self.width = w;
+        self.height = h;
+        self.camera.base_w = w as f32;
+        self.camera.base_h = h as f32;
+        self.load_active_track_mirror();
+    }
+
     /// Acrescenta uma faixa já pronta (ex.: importar de outro arquivo como
     /// referência). NÃO troca a faixa ativa. Devolve o índice dela.
     pub fn push_track(&mut self, name: impl Into<String>, frames: Vec<Frame>, fps: u32) -> usize {
