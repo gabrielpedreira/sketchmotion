@@ -8155,33 +8155,35 @@ impl SketchMotionApp {
         PivotTarget::None
     }
 
-    /// O ponto (doc) está sobre o objeto controlado pelo pivô `pi`?
-    fn pivot_point_on_object(&self, pi: usize, dp: (f32, f32)) -> bool {
+    /// Índice do pivô (completo) cujo objeto-alvo está sob o ponto `dp`,
+    /// escolhendo o objeto do TOPO e respeitando as camadas (oculta/bloqueada
+    /// não conta). Usado para a Seleção/Pivô pegar o objeto que foi realmente
+    /// clicado quando há vários empilhados na mesma camada.
+    fn pivot_under_cursor(&self, dp: (f32, f32)) -> Option<usize> {
         use sketchmotion_core::PivotTarget;
-        let Some(pv) = self.document.pivots.get(pi) else {
-            return false;
-        };
-        match &pv.target {
-            PivotTarget::Group(g) => self.document.vectors.iter().any(|o| {
-                o.group == Some(*g)
-                    && o.bounds().map_or(false, |(a, b, c, d)| {
-                        dp.0 >= a && dp.0 <= c && dp.1 >= b && dp.1 <= d
-                    })
-            }),
-            PivotTarget::Image(id) => {
-                if let Some(o) = self.document.images.iter().find(|o| o.id == *id) {
-                    let (s, c) = (-o.angle).sin_cos();
-                    let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
-                    let lx = rx * c - ry * s;
-                    let ly = rx * s + ry * c;
-                    lx.abs() <= o.hw && ly.abs() <= o.hh
-                } else {
-                    false
+        // 1) Imagem do topo sob o cursor (camadas usáveis) → pivô dessa imagem.
+        if let Some(i) = self.image_at_usavel(dp) {
+            if let Some(id) = self.document.images.get(i).map(|o| o.id).filter(|&x| x != 0) {
+                if let Some(pi) = self.document.pivots.iter().position(|p| {
+                    p.completo() && matches!(&p.target, PivotTarget::Image(x) if *x == id)
+                }) {
+                    return Some(pi);
                 }
             }
-            PivotTarget::None => false,
         }
+        // 2) Vetor sob o cursor → pivô do grupo desse vetor.
+        if let Some(vi) = self.hit_test(dp, 6.0) {
+            if let Some(g) = self.document.vectors.get(vi).and_then(|o| o.group) {
+                if let Some(pi) = self.document.pivots.iter().position(|p| {
+                    p.completo() && matches!(&p.target, PivotTarget::Group(x) if *x == g)
+                }) {
+                    return Some(pi);
+                }
+            }
+        }
+        None
     }
+
 
     /// Translada o objeto controlado e os dois pontos do pivô por (dx, dy).
     fn pivot_translate(&mut self, pi: usize, dx: f32, dy: f32) {
@@ -8384,15 +8386,15 @@ impl SketchMotionApp {
                     self.pivot_sel = Some(i);
                     self.pivot_drag = which;
                     self.push_undo();
-                } else if let Some(pi) = self.pivot_sel {
-                    // Sem ponto por perto: arrasta o objeto do pivô selecionado.
-                    let completo = self.document.pivots.get(pi).map_or(false, |p| p.completo());
-                    if completo && self.pivot_point_on_object(pi, dp) {
-                        self.pivot_drag = 3;
-                        self.push_undo();
-                    } else {
-                        self.pivot_drag = 0;
-                    }
+                } else if let Some(pi) = self.pivot_under_cursor(dp) {
+                    // Sem ponto por perto: seleciona o pivô do objeto que está
+                    // REALMENTE sob o cursor (o do topo, respeitando camadas) e
+                    // arrasta esse objeto. Assim, com vários objetos por camada,
+                    // clicar em cada um pega o pivô certo — não fica preso num só.
+                    self.pivot_sel = Some(pi);
+                    self.pivot_stage = 0;
+                    self.pivot_drag = 3;
+                    self.push_undo();
                 } else {
                     self.pivot_drag = 0;
                 }
