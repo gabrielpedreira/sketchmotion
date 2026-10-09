@@ -4020,23 +4020,44 @@ impl SketchMotionApp {
         self.layer_usavel(self.img_layer(i))
     }
 
+    /// A imagem `i` tem um PIXEL VISÍVEL (não transparente) sob o ponto `dp`?
+    /// Peças costumam ter muita área transparente em volta do desenho; testar a
+    /// caixa não basta — o que vale é a área realmente pintada. Assim, com
+    /// objetos empilhados, o clique seleciona aquele cujo desenho está no ponto.
+    fn img_alpha_hit(&self, i: usize, dp: (f32, f32)) -> bool {
+        let Some(o) = self.document.images.get(i) else {
+            return false;
+        };
+        if o.hw <= 0.0 || o.hh <= 0.0 || o.ow == 0 || o.oh == 0 {
+            return false;
+        }
+        // Ponto local (desfaz a rotação em torno do centro).
+        let (s, c) = (-o.angle).sin_cos();
+        let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
+        let lx = rx * c - ry * s;
+        let ly = rx * s + ry * c;
+        if lx.abs() > o.hw || ly.abs() > o.hh {
+            return false;
+        }
+        // Mapeia para o texel correspondente e lê o alfa.
+        let u = ((lx / o.hw) * 0.5 + 0.5).clamp(0.0, 1.0);
+        let v = ((ly / o.hh) * 0.5 + 0.5).clamp(0.0, 1.0);
+        let tx = ((u * o.ow as f32) as u32).min(o.ow - 1);
+        let ty = ((v * o.oh as f32) as u32).min(o.oh - 1);
+        let idx = ((ty * o.ow + tx) * 4 + 3) as usize;
+        o.pixels.get(idx).map_or(false, |&a| a > 8)
+    }
+
     /// Índice da imagem do TOPO sob o ponto `dp`, considerando SÓ camadas
-    /// usáveis. Objetos empilhados: oculta/bloqueia as camadas que não quer e a
-    /// ferramenta "atravessa" essas, pegando só o que está disponível embaixo.
+    /// usáveis E apenas a ÁREA PINTADA (alfa) de cada peça. Objetos empilhados:
+    /// o clique pega aquele cujo desenho está no ponto, ignorando a moldura
+    /// transparente das peças de cima e as camadas ocultas/bloqueadas.
     fn image_at_usavel(&self, dp: (f32, f32)) -> Option<usize> {
         for i in (0..self.document.images.len()).rev() {
             if !self.img_usavel(i) {
                 continue;
             }
-            let o = &self.document.images[i];
-            if o.hw <= 0.0 || o.hh <= 0.0 {
-                continue;
-            }
-            let (s, c) = (-o.angle).sin_cos();
-            let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
-            let lx = rx * c - ry * s;
-            let ly = rx * s + ry * c;
-            if lx.abs() <= o.hw && ly.abs() <= o.hh {
+            if self.img_alpha_hit(i, dp) {
                 return Some(i);
             }
         }
