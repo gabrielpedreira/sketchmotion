@@ -3343,6 +3343,10 @@ impl SketchMotionApp {
         }
         let mut out = Vec::new();
         for (i, o) in self.document.images.iter().enumerate() {
+            // Objetos em camadas ocultas/bloqueadas não entram na seleção.
+            if !self.img_usavel(i) {
+                continue;
+            }
             let (minx, miny, maxx, maxy) =
                 (o.cx - o.hw, o.cy - o.hh, o.cx + o.hw, o.cy + o.hh);
             if minx <= x1 && maxx >= x0 && miny <= y1 && maxy >= y0 {
@@ -4000,38 +4004,52 @@ impl SketchMotionApp {
     /// Tenta pegar um OBJETO DE IMAGEM sob o ponto (espaço do documento) para
     /// editá-lo (mover/escalar/girar). Remove-o da lista e o transforma em
     /// flutuante. Devolve true se pegou algum.
-    fn pick_image_at(&mut self, dp: (f32, f32)) -> bool {
-        let mut hit: Option<usize> = None;
+    /// Camada (válida, dentro do intervalo) de um objeto de imagem.
+    fn img_layer(&self, i: usize) -> usize {
+        self.document
+            .images
+            .get(i)
+            .map(|o| o.layer.min(self.document.layers.len().saturating_sub(1)))
+            .unwrap_or(0)
+    }
+
+    /// A imagem `i` está numa camada USÁVEL (visível e desbloqueada)? Objetos
+    /// em camadas ocultas ou bloqueadas não podem ser selecionados/pegos por
+    /// nenhuma ferramenta.
+    fn img_usavel(&self, i: usize) -> bool {
+        self.layer_usavel(self.img_layer(i))
+    }
+
+    /// Índice da imagem do TOPO sob o ponto `dp`, considerando SÓ camadas
+    /// usáveis. Objetos empilhados: oculta/bloqueia as camadas que não quer e a
+    /// ferramenta "atravessa" essas, pegando só o que está disponível embaixo.
+    fn image_at_usavel(&self, dp: (f32, f32)) -> Option<usize> {
         for i in (0..self.document.images.len()).rev() {
+            if !self.img_usavel(i) {
+                continue;
+            }
             let o = &self.document.images[i];
             if o.hw <= 0.0 || o.hh <= 0.0 {
                 continue;
             }
-            // Ponto local (desfaz a rotação em torno do centro).
             let (s, c) = (-o.angle).sin_cos();
             let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
             let lx = rx * c - ry * s;
             let ly = rx * s + ry * c;
             if lx.abs() <= o.hw && ly.abs() <= o.hh {
-                hit = Some(i);
-                break;
+                return Some(i);
             }
         }
-        let Some(i) = hit else {
+        None
+    }
+
+    fn pick_image_at(&mut self, dp: (f32, f32)) -> bool {
+        // Só pega imagens em camadas usáveis (ignora ocultas/bloqueadas e
+        // atravessa para o objeto disponível que estiver embaixo).
+        let Some(i) = self.image_at_usavel(dp) else {
             return false;
         };
-        // Índice da camada do objeto, SEMPRE limitado ao intervalo válido: um
-        // objeto pode ter guardado um índice de uma camada que não existe mais
-        // (ex.: camada excluída). Sem esse clamp, layer_locked trataria o índice
-        // inexistente como "bloqueado" e recusaria o objeto mesmo sem cadeado.
-        let layer = self.document.images[i]
-            .layer
-            .min(self.document.layers.len().saturating_sub(1));
-        // Só bloqueia se essa camada (válida) estiver realmente travada.
-        if self.layer_locked(layer) {
-            self.warn_locked_layer(layer);
-            return false;
-        }
+        let layer = self.img_layer(i);
         let o = self.document.images.remove(i);
         // Clicar num objeto leva o seletor de camadas para a camada dele — o
         // usuário passa a saber sempre em qual camada o objeto está.
@@ -8130,19 +8148,9 @@ impl SketchMotionApp {
             };
             return PivotTarget::Group(g);
         }
-        for i in (0..self.document.images.len()).rev() {
-            let o = &self.document.images[i];
-            if o.hw <= 0.0 || o.hh <= 0.0 {
-                continue;
-            }
-            let (s, c) = (-o.angle).sin_cos();
-            let (rx, ry) = (dp.0 - o.cx, dp.1 - o.cy);
-            let lx = rx * c - ry * s;
-            let ly = rx * s + ry * c;
-            if lx.abs() <= o.hw && ly.abs() <= o.hh {
-                let id = self.ensure_img_id(i);
-                return PivotTarget::Image(id);
-            }
+        if let Some(i) = self.image_at_usavel(dp) {
+            let id = self.ensure_img_id(i);
+            return PivotTarget::Image(id);
         }
         PivotTarget::None
     }
