@@ -5,6 +5,7 @@
 
 use crate::color::Color;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 fn default_opacity() -> f32 {
     1.0
@@ -23,7 +24,12 @@ pub struct Layer {
     width: u32,
     height: u32,
     /// Pixels RGBA, linha a linha: width * height * 4 bytes.
-    pixels: Vec<u8>,
+    ///
+    /// Compartilhado (Arc) com cópia sob demanda: clonar uma camada (histórico
+    /// de desfazer, espelho do frame, faixas) é só copiar um ponteiro; o buffer
+    /// só é duplicado de fato na PRIMEIRA escrita após o clone. Evita copiar
+    /// todos os frames inteiros a cada ação em projetos grandes.
+    pixels: Arc<Vec<u8>>,
 }
 
 impl Layer {
@@ -36,7 +42,7 @@ impl Layer {
             opacity: 1.0,
             width,
             height,
-            pixels: vec![0; (width as usize) * (height as usize) * 4],
+            pixels: Arc::new(vec![0; (width as usize) * (height as usize) * 4]),
         }
     }
 
@@ -62,10 +68,11 @@ impl Layer {
     /// Pinta um pixel (substitui, sem blending — suficiente para a v0.1).
     pub fn set_pixel(&mut self, x: u32, y: u32, color: Color) {
         if let Some(i) = self.index(x, y) {
-            self.pixels[i] = color.r;
-            self.pixels[i + 1] = color.g;
-            self.pixels[i + 2] = color.b;
-            self.pixels[i + 3] = color.a;
+            let px = Arc::make_mut(&mut self.pixels);
+            px[i] = color.r;
+            px[i + 1] = color.g;
+            px[i + 2] = color.b;
+            px[i + 3] = color.a;
         }
     }
 
@@ -96,7 +103,7 @@ impl Layer {
             let n = cw * 4;
             np[drow..drow + n].copy_from_slice(&self.pixels[srow..srow + n]);
         }
-        self.pixels = np;
+        self.pixels = Arc::new(np);
         self.width = w;
         self.height = h;
     }
@@ -126,7 +133,7 @@ impl Layer {
                 np[ti..ti + 4].copy_from_slice(&self.pixels[si..si + 4]);
             }
         }
-        self.pixels = np;
+        self.pixels = Arc::new(np);
         self.width = w;
         self.height = h;
     }
@@ -143,12 +150,13 @@ impl Layer {
     pub fn flip_h(&mut self) {
         let w = self.width as usize;
         let h = self.height as usize;
+        let px = Arc::make_mut(&mut self.pixels);
         for y in 0..h {
             for x in 0..w / 2 {
                 let a = (y * w + x) * 4;
                 let b = (y * w + (w - 1 - x)) * 4;
                 for k in 0..4 {
-                    self.pixels.swap(a + k, b + k);
+                    px.swap(a + k, b + k);
                 }
             }
         }
@@ -159,11 +167,12 @@ impl Layer {
         let w = self.width as usize;
         let h = self.height as usize;
         let stride = w * 4;
+        let px = Arc::make_mut(&mut self.pixels);
         for y in 0..h / 2 {
             let top = y * stride;
             let bot = (h - 1 - y) * stride;
             for i in 0..stride {
-                self.pixels.swap(top + i, bot + i);
+                px.swap(top + i, bot + i);
             }
         }
     }
@@ -171,11 +180,12 @@ impl Layer {
     /// Gira 180° (dimensões inalteradas).
     pub fn rotate_180(&mut self) {
         let n = (self.width as usize) * (self.height as usize);
+        let px = Arc::make_mut(&mut self.pixels);
         for i in 0..n / 2 {
             let a = i * 4;
             let b = (n - 1 - i) * 4;
             for k in 0..4 {
-                self.pixels.swap(a + k, b + k);
+                px.swap(a + k, b + k);
             }
         }
     }
@@ -195,7 +205,7 @@ impl Layer {
                 np[di..di + 4].copy_from_slice(&self.pixels[si..si + 4]);
             }
         }
-        self.pixels = np;
+        self.pixels = Arc::new(np);
         self.width = nw as u32;
         self.height = nh as u32;
     }
@@ -215,7 +225,7 @@ impl Layer {
                 np[di..di + 4].copy_from_slice(&self.pixels[si..si + 4]);
             }
         }
-        self.pixels = np;
+        self.pixels = Arc::new(np);
         self.width = nw as u32;
         self.height = nh as u32;
     }

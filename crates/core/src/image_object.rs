@@ -8,6 +8,7 @@
 //! resolução do trabalho (o render aplica a transformação sobre o buffer final).
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 fn default_opacity() -> f32 {
     1.0
@@ -16,7 +17,8 @@ fn default_opacity() -> f32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageObject {
     /// Pixels de origem em RGBA8 (ow * oh * 4 bytes).
-    pub pixels: Vec<u8>,
+    /// Compartilhado (Arc): clonar o objeto (desfazer, frames) não copia os pixels.
+    pub pixels: Arc<Vec<u8>>,
     /// Largura/altura originais da imagem (em pixels da origem).
     pub ow: u32,
     pub oh: u32,
@@ -57,7 +59,7 @@ impl ImageObject {
         layer: usize,
     ) -> Self {
         Self {
-            pixels,
+            pixels: Arc::new(pixels),
             ow,
             oh,
             cx,

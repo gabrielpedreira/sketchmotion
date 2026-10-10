@@ -1814,6 +1814,12 @@ struct SketchMotionApp {
     prancheta_preview: Option<(u32, u32)>,
     /// Cache de miniaturas por faixa/frame (evita re-renderizar tudo a cada quadro).
     track_thumbs: Vec<Vec<Option<egui::TextureHandle>>>,
+    /// Miniatura do frame atual precisa ser refeita (o desenho mudou).
+    thumb_stale: bool,
+    /// Última vez que a miniatura do frame atual foi refeita (limita durante o traço).
+    thumb_last: std::time::Instant,
+    /// Quadro cinza mostrado enquanto a miniatura real ainda está sendo gerada.
+    thumb_placeholder: Option<egui::TextureHandle>,
     /// Cache das texturas de sobreposição entre timelines (onion/ver ambas).
     between_cache: Vec<Option<egui::TextureHandle>>,
     /// Chave do cache acima: (faixa ativa, página atual, nº de faixas, onion_between, view_both).
@@ -2072,6 +2078,9 @@ impl SketchMotionApp {
             prancheta_drag: None,
             prancheta_preview: None,
             track_thumbs: Vec::new(),
+            thumb_stale: false,
+            thumb_last: std::time::Instant::now(),
+            thumb_placeholder: None,
             between_cache: Vec::new(),
             between_key: None,
             brush_kind: 0,
@@ -4206,7 +4215,7 @@ impl SketchMotionApp {
         // usuário passa a saber sempre em qual camada o objeto está.
         self.active_layer = layer;
         self.float_sel = Some(FloatSel {
-            pixels: o.pixels,
+            pixels: Arc::try_unwrap(o.pixels).unwrap_or_else(|a| (*a).clone()),
             ow: o.ow,
             oh: o.oh,
             cx: o.cx,
@@ -5691,7 +5700,27 @@ impl SketchMotionApp {
         if self.track_thumbs.len() != ntr {
             self.track_thumbs = vec![Vec::new(); ntr];
         }
-        for ti in 0..ntr {
+        if self.thumb_placeholder.is_none() {
+            let img = egui::ColorImage::new([2, 2], egui::Color32::from_gray(70));
+            self.thumb_placeholder =
+                Some(ctx.load_texture("thumb_placeholder", img, egui::TextureOptions::NEAREST));
+        }
+        // Miniatura do frame atual: durante o traço, no máximo ~3x por segundo
+        // (antes era refeita em resolução cheia a CADA quadro de pintura). Ao
+        // soltar o botão ela é atualizada na hora.
+        if self.dirty {
+            self.thumb_stale = true;
+        }
+        let desenhando = ctx.input(|i| i.pointer.primary_down());
+        let refazer_atual = self.thumb_stale
+            && (!desenhando || self.thumb_last.elapsed() >= std::time::Duration::from_millis(330));
+        // Orçamento de tempo por quadro: com muitos frames pesados, gerar todas as
+        // miniaturas de uma vez travava a interface. Gera o que couber (~10 ms)
+        // e continua no próximo quadro (as que faltam aparecem como cinza).
+        let inicio = std::time::Instant::now();
+        let orcamento = std::time::Duration::from_millis(10);
+        let mut pendente = false;
+        'faixas: for ti in 0..ntr {
             let total = if ti == active {
                 self.document.frames.len()
             } else {
@@ -5701,12 +5730,19 @@ impl SketchMotionApp {
                 self.track_thumbs[ti] = vec![None; total];
             }
             for fi in 0..total {
-                // O frame atual da faixa ativa é refeito só quando há edição.
-                if ti == active && fi == self.document.current && self.dirty {
+                // O frame atual da faixa ativa é refeito só quando há edição
+                // (e com limite de frequência durante o traço).
+                if ti == active && fi == self.document.current && refazer_atual {
                     self.track_thumbs[ti][fi] = None;
+                    self.thumb_stale = false;
+                    self.thumb_last = std::time::Instant::now();
                 }
                 if self.track_thumbs[ti][fi].is_some() {
                     continue;
+                }
+                if inicio.elapsed() >= orcamento {
+                    pendente = true;
+                    break 'faixas;
                 }
                 let full = if ti == active {
                     if fi == self.document.current {
@@ -5742,6 +5778,9 @@ impl SketchMotionApp {
                     egui::TextureOptions::NEAREST,
                 ));
             }
+        }
+        if pendente || (self.thumb_stale && desenhando) {
+            ctx.request_repaint();
         }
     }
 
@@ -6076,7 +6115,10 @@ impl SketchMotionApp {
                                                         .and_then(|o| o.as_ref())
                                                     {
                                                         Some(t) => t.clone(),
-                                                        None => continue,
+                                                        None => match &self.thumb_placeholder {
+                                                            Some(t) => t.clone(),
+                                                            None => continue,
+                                                        },
                                                     };
                                                     let (rect, resp) = ui.allocate_exact_size(
                                                         egui::vec2(
@@ -6755,7 +6797,7 @@ impl SketchMotionApp {
                 continue;
             }
             self.float_sel = Some(FloatSel {
-                pixels: o.pixels,
+                pixels: Arc::try_unwrap(o.pixels).unwrap_or_else(|a| (*a).clone()),
                 ow: o.ow,
                 oh: o.oh,
                 cx: o.cx,
@@ -12869,14 +12911,9 @@ impl eframe::App for SketchMotionApp {
                 }
             }
             self.dirty = false;
-            // Invalida só a miniatura do frame atual da faixa ativa (barato).
-            let at = self.document.active_track;
-            let cf = self.document.current;
-            if let Some(tv) = self.track_thumbs.get_mut(at) {
-                if cf < tv.len() {
-                    tv[cf] = None;
-                }
-            }
+            // A miniatura do frame atual é refeita pela timeline (com limite de
+            // frequência) — aqui só marca que mudou.
+            self.thumb_stale = true;
             self.onion_for = None;
             self.split_for = None; // camadas mudaram → refazer below/above
         }
@@ -14612,6 +14649,14 @@ impl eframe::App for SketchMotionApp {
                 }
             } else {
                 self.status = "Nada selecionado para copiar/recortar".into();
+            }
+            // No Windows, o eframe só gera o evento de COLAR (Ctrl+V) quando a
+            // área de transferência do sistema tem TEXTO. A cópia interna não
+            // punha nada lá — por isso o Ctrl+V às vezes não fazia nada. Ao
+            // copiar algo, deixamos uma marca de texto para o Ctrl+V sempre chegar.
+            // (Não mexe se o foco está num campo de texto: o texto copiado ali vale.)
+            if !self.status.starts_with("Nada selecionado") && !ctx.wants_keyboard_input() {
+                ctx.output_mut(|o| o.copied_text = "SketchMotion".to_owned());
             }
         }
         // Colar (Ctrl+V). Objetos → mesma posição/tamanho; seleção raster → nova
