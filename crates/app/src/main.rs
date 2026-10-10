@@ -2596,8 +2596,137 @@ impl SketchMotionApp {
 
     /// Cria um documento novo em branco (w x h). `pixel` marca o modo pixel art
     /// (comportamento específico virá com o painel de configuração).
+    /// Zera TODO o estado de trabalho ligado ao documento (ferramenta,
+    /// seleções, pivô/vetor em edição, gravação, janelas de ferramenta…).
+    /// Chamado ao criar e ao abrir um documento, para nada "vazar" do trabalho
+    /// anterior para o novo (era a origem de seleções/pivôs apontando para o
+    /// objeto errado).
+    fn resetar_estado_documento(&mut self) {
+        // Ferramenta neutra (não pinta ao clicar).
+        self.tool = Tool::Select;
+        self.eyedropper = Eyedropper::Off;
+        self.conta_gotas_trava = false;
+        self.active_layer = 0;
+        self.last_pos = None;
+        self.undo_stack = Vec::new();
+        self.redo_stack = Vec::new();
+        self.confirmado_fechar = false;
+        // Seleções e transformações.
+        self.float_sel = None;
+        self.float_tex = None;
+        self.float_dragging = false;
+        self.float_resize = None;
+        self.float_rotating = false;
+        self.sel_set.clear();
+        self.sel_imgs.clear();
+        self.selected_obj = None;
+        self.multi_drag = 0;
+        self.dragging_obj = false;
+        self.resize_handle = None;
+        self.rotating = false;
+        self.marquee_start = None;
+        self.lasso_points.clear();
+        self.sel_origem = None;
+        self.sel_movida = false;
+        self.pen_anchors.clear();
+        self.pen_drag_idx = None;
+        self.shape_start = None;
+        self.place_piece = false;
+        self.pending_group = None;
+        // Frames / timeline.
+        self.frame_sel.clear();
+        self.frame_sel_mode = false;
+        self.confirm_del_frame = None;
+        self.drag_frame = None;
+        self.playing = false;
+        self.play_frame = 0;
+        self.play_done = false;
+        // Rig / câmera / réguas.
+        self.sel_rig = None;
+        self.rig_skel = 0;
+        self.rig_sel_bone = None;
+        self.rig_dragging = RigDrag::None;
+        self.rig_start = None;
+        self.rig_preview = None;
+        self.cam_act = 0;
+        self.cam_kf_drag = None;
+        self.ruler_drag = None;
+        self.ruler_pending = None;
+        self.ruler_pushed = false;
+        // Pivô / Vetor de Direção.
+        self.pivot_sel = None;
+        self.pivot_stage = 0;
+        self.pivot_drag = 0;
+        self.pivot_naming = false;
+        self.pivot_name_buf.clear();
+        self.dirvec_sel = None;
+        self.dirvec_stage = 0;
+        self.dirvec_dragging = false;
+        self.dirvec_ghost_drag = false;
+        self.dirvec_ghost_tex = None;
+        self.dirvec_ghost_tex_for = None;
+        // Traçado.
+        self.trace_src = None;
+        self.trace_from_float = false;
+        self.trace_img_idx = None;
+        self.trace_confirm = None;
+        self.trace_regions.clear();
+        // "Aplicar mudanças em:" e prancheta.
+        self.aplicar_gravando = false;
+        self.aplicar_base = None;
+        self.aplicar_sel.clear();
+        self.prancheta_drag = None;
+        self.prancheta_preview = None;
+        // Janelas de FERRAMENTA (as de layout — camadas, cores — continuam).
+        self.win_roda = false;
+        self.win_aplicar = false;
+        self.win_prancheta = false;
+        self.win_pivot = false;
+        self.win_dirvec = false;
+        self.win_trace = false;
+        self.win_camera = false;
+        // Caches de render.
+        self.dirty = true;
+        self.track_thumbs.clear();
+        self.between_cache.clear();
+        self.between_key = None;
+        self.onion_tex = None;
+        self.onion_for = None;
+        self.split_for = None;
+        self.below_tex = None;
+        self.above_tex = None;
+        self.center_canvas = true;
+        // Contadores de id coerentes com o documento (evita colisão de ids de
+        // grupo/imagem com os que já existem no arquivo).
+        let mut max_g = 0u32;
+        let mut max_i = 0u32;
+        for t in &self.document.tracks {
+            for f in &t.frames {
+                for v in &f.vectors {
+                    if let Some(g) = v.group {
+                        max_g = max_g.max(g);
+                    }
+                }
+                for o in &f.images {
+                    max_i = max_i.max(o.id);
+                }
+            }
+        }
+        for v in &self.document.vectors {
+            if let Some(g) = v.group {
+                max_g = max_g.max(g);
+            }
+        }
+        for o in &self.document.images {
+            max_i = max_i.max(o.id);
+        }
+        self.next_group = max_g + 1;
+        self.next_img_id = max_i + 1;
+    }
+
     fn novo_documento(&mut self, w: u32, h: u32, pixel: bool) {
         self.document = Document::new(w, h, Color::WHITE);
+        self.resetar_estado_documento();
         // Libera o histórico do trabalho anterior (memória).
         self.undo_stack = Vec::new();
         self.redo_stack = Vec::new();
@@ -2776,6 +2905,7 @@ impl SketchMotionApp {
     /// Aplica um documento recém-aberto ao estado do app.
     fn aplicar_documento_aberto(&mut self, doc: Document, path: std::path::PathBuf) {
         self.document = doc;
+        self.resetar_estado_documento();
         // Libera o histórico do trabalho anterior (memória) — abrir substitui o
         // trabalho atual, então o desfazer dele não precisa mais existir.
         self.undo_stack = Vec::new();
@@ -8094,17 +8224,67 @@ impl SketchMotionApp {
     /// a mudanças de índice/frames).
     /// Garante um id estável para a imagem em `index` (atribui se ainda for 0).
     fn ensure_img_id(&mut self, index: usize) -> u32 {
+        // Ids repetidos no mesmo frame fazem o pivô "pular" para outra peça
+        // (a busca por id acha a primeira). Corrige antes de usar.
+        self.dedup_img_ids();
         let cur = self.document.images.get(index).map(|o| o.id).unwrap_or(0);
         if cur != 0 {
             return cur;
         }
-        let id = self.next_img_id;
-        self.next_img_id += 1;
+        let id = self.novo_img_id();
         if let Some(o) = self.document.images.get_mut(index) {
             o.id = id;
             return id;
         }
         0
+    }
+
+    /// Próximo id de imagem que NÃO colide com nenhum id existente (em qualquer
+    /// faixa/frame). O contador começava em 1 a cada abertura do programa, e
+    /// projetos salvos já tinham ids 1, 2… — a peça nova ganhava o MESMO id de
+    /// outra e o pivô passava a apontar para a peça errada.
+    fn novo_img_id(&mut self) -> u32 {
+        let mut maxid = 0u32;
+        for o in &self.document.images {
+            maxid = maxid.max(o.id);
+        }
+        for t in &self.document.tracks {
+            for f in &t.frames {
+                for o in &f.images {
+                    maxid = maxid.max(o.id);
+                }
+            }
+        }
+        for pv in &self.document.pivots {
+            if let sketchmotion_core::PivotTarget::Image(x) = &pv.target {
+                maxid = maxid.max(*x);
+            }
+        }
+        let id = self.next_img_id.max(maxid + 1);
+        self.next_img_id = id + 1;
+        id
+    }
+
+    /// No frame atual, duas peças não podem ter o mesmo id (acontece ao
+    /// duplicar/colar uma peça). A de menor índice (a original, a que os pivôs
+    /// já encontravam) fica com o id; as cópias ganham ids novos.
+    fn dedup_img_ids(&mut self) {
+        let mut vistos: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut repetidos: Vec<usize> = Vec::new();
+        for (i, o) in self.document.images.iter().enumerate() {
+            if o.id == 0 {
+                continue;
+            }
+            if !vistos.insert(o.id) {
+                repetidos.push(i);
+            }
+        }
+        for i in repetidos {
+            let id = self.novo_img_id();
+            if let Some(o) = self.document.images.get_mut(i) {
+                o.id = id;
+            }
+        }
     }
 
     /// Recalcula, a cada frame, os pontos (eixo/mov) dos pivôs ligados a IMAGENS
@@ -8302,6 +8482,7 @@ impl SketchMotionApp {
     ) {
         let to_doc = |p: egui::Pos2| ((p.x - rect.min.x) / zoom, (p.y - rect.min.y) / zoom);
         if pressed {
+            self.dedup_img_ids();
             if let Some(p) = hover {
                 let dp = to_doc(p);
                 // Fluxo de criação: primeiro clique = objeto + EIXO; segundo = MOV.
