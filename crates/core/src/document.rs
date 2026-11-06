@@ -184,7 +184,7 @@ impl Document {
 
     /// Carrega os dados da faixa ativa no espelho (frames/current/fps) e
     /// atualiza a cópia de trabalho (layers/vectors).
-    fn load_active_track_mirror(&mut self) {
+    pub(crate) fn load_active_track_mirror(&mut self) {
         let mut frames = self.tracks[self.active_track].frames.clone();
         let fps = self.tracks[self.active_track].fps.max(1);
         let mut current = self.tracks[self.active_track].current;

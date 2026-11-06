@@ -11,7 +11,7 @@ use eframe::egui;
 use sketchmotion_color::PaletteLibrary;
 use sketchmotion_core::{
     Anchor, Camera, CameraKeyframe, Color, Document, Frame, Guide, GuideOrient, ImageObject,
-    Interp, Layer, PieceLibrary, VectorObject,
+    Interp, Layer, PieceLibrary, PixelArtParams, VectorObject,
 };
 use sketchmotion_render::{rasterize_images, render_frame_alpha, render_layers_alpha, PixelImage};
 use sketchmotion_trace::{trace_bilevel, trace_quantized, BilevelParams, QuantParams, TracedRegion};
@@ -1144,6 +1144,14 @@ struct OpenJob {
     path: std::path::PathBuf,
 }
 
+/// Conversão do documento para pixel art (roda numa thread + barra de progresso).
+struct PixelJob {
+    rx: mpsc::Receiver<Document>,
+    progress: Arc<AtomicU32>,
+    started: std::time::Instant,
+    alvo: (u32, u32),
+}
+
 /// Importação de imagem (decodifica numa thread + barra de progresso).
 struct ImportJob {
     rx: mpsc::Receiver<Result<(u32, u32, Vec<u8>), String>>,
@@ -1780,6 +1788,15 @@ struct SketchMotionApp {
     open_job: Option<OpenJob>,
     /// Importação de imagem em andamento (barra de progresso).
     import_job: Option<ImportJob>,
+    /// Conversão para pixel art em andamento.
+    pixel_job: Option<PixelJob>,
+    /// Janela "Converter em pixel art".
+    win_pixelart: bool,
+    /// Opções da conversão (tamanho, cores, preservação de traços).
+    pa_params: PixelArtParams,
+    /// Prévia do frame atual convertido (+ chave do que ela representa).
+    pa_prev: Option<egui::TextureHandle>,
+    pa_prev_key: Option<(u32, u32, u32, usize, usize)>,
     /// Splash: frames do GIF (textura + duração em segundos).
     splash_frames: Vec<(egui::TextureHandle, f32)>,
     /// Splash: já decodificou o GIF?
@@ -2060,6 +2077,11 @@ impl SketchMotionApp {
             busy_job: None,
             open_job: None,
             import_job: None,
+            pixel_job: None,
+            win_pixelart: false,
+            pa_params: PixelArtParams::default(),
+            pa_prev: None,
+            pa_prev_key: None,
             splash_frames: Vec::new(),
             splash_loaded: false,
             splash_idx: 0,
@@ -2217,6 +2239,184 @@ impl SketchMotionApp {
         self.modificado = true;
     }
 
+    /// Depois de trocar o documento inteiro (desfazer/refazer uma conversão,
+    /// por exemplo): se o tamanho do papel ou o modo pixel art mudou, sincroniza
+    /// o modo, o zoom e invalida os caches de textura.
+    fn apos_trocar_papel(&mut self) {
+        let (w, h) = (self.document.width, self.document.height);
+        let tex_ok = self.texture.as_ref().map_or(false, |t| t.size() == [w as usize, h as usize]);
+        if tex_ok && self.pixel_mode == self.document.pixel_art {
+            return;
+        }
+        self.pixel_mode = self.document.pixel_art;
+        self.zoom = if self.pixel_mode {
+            (512.0 / (w.max(h) as f32)).floor().max(1.0)
+        } else {
+            1.0
+        };
+        self.center_canvas = true;
+        self.track_thumbs.clear();
+        self.between_cache.clear();
+        self.between_key = None;
+        self.onion_tex = None;
+        self.onion_for = None;
+        self.split_for = None;
+        self.below_tex = None;
+        self.above_tex = None;
+        self.texture = None;
+        self.pa_prev_key = None;
+    }
+
+    /// Janela "Converter em pixel art": tamanho, cores, preservação de traços e
+    /// prévia do frame atual.
+    fn janela_pixelart(&mut self, ctx: &egui::Context) {
+        if !self.win_pixelart {
+            return;
+        }
+        let mut open = true;
+        let mut converter = false;
+        let (dw, dh) = (self.document.width, self.document.height);
+        egui::Window::new("Converter em pixel art")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.label(format!("Trabalho atual: {dw} × {dh} px"));
+                ui.separator();
+                ui.label("Tamanho (lado maior):");
+                ui.horizontal_wrapped(|ui| {
+                    for t in [16u32, 32, 48, 64, 96, 128, 192, 256] {
+                        if ui.selectable_label(self.pa_params.long_side == t, t.to_string()).clicked() {
+                            self.pa_params.long_side = t;
+                        }
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut self.pa_params.long_side)
+                            .range(4..=1024)
+                            .suffix(" px"),
+                    )
+                    .on_hover_text("Tamanho personalizado");
+                });
+                let (tw, th) = sketchmotion_core::target_size(dw, dh, self.pa_params.long_side);
+                ui.strong(format!("Resultado: {tw} × {th} px (proporção mantida)"));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Cores:");
+                    let rot = |n: u32| if n == 0 { "Sem limite".to_string() } else { n.to_string() };
+                    egui::ComboBox::from_id_salt("pa_cores")
+                        .selected_text(rot(self.pa_params.colors))
+                        .show_ui(ui, |ui| {
+                            for n in [4u32, 8, 16, 24, 32, 48, 64, 128, 0] {
+                                ui.selectable_value(&mut self.pa_params.colors, n, rot(n));
+                            }
+                        });
+                })
+                .response
+                .on_hover_text("Uma única paleta para TODOS os frames — as cores não piscam na animação.");
+                ui.add(
+                    egui::Slider::new(&mut self.pa_params.detail, 0.0..=1.0)
+                        .text("Preservar traços finos"),
+                )
+                .on_hover_text("Mais alto = linhas finas da arte original sobrevivem; mais baixo = só formas grossas.");
+                ui.separator();
+                // Prévia do frame atual (refeita só ao soltar o mouse).
+                let key = (
+                    self.pa_params.long_side,
+                    self.pa_params.colors,
+                    (self.pa_params.detail * 100.0) as u32,
+                    self.document.current,
+                    self.document.active_track,
+                );
+                let solto = !ui.input(|i| i.pointer.any_down());
+                if solto && (self.pa_prev_key != Some(key) || self.pa_prev.is_none()) {
+                    let full = render_frame_alpha(
+                        dw,
+                        dh,
+                        &self.document.layers,
+                        &self.document.vectors,
+                        &self.document.images,
+                    );
+                    let mut px = sketchmotion_core::downscale(&full.rgba, dw, dh, tw, th, self.pa_params.detail);
+                    if self.pa_params.colors > 0 {
+                        let mut hist = std::collections::HashMap::new();
+                        for c in px.chunks_exact(4) {
+                            if c[3] > 0 {
+                                *hist.entry([c[0], c[1], c[2]]).or_insert(0u32) += 1;
+                            }
+                        }
+                        let pal = sketchmotion_core::build_palette(&hist, self.pa_params.colors as usize);
+                        sketchmotion_core::apply_palette(&mut px, &pal);
+                    }
+                    let img = egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &px);
+                    self.pa_prev = Some(ctx.load_texture("pa_prev", img, egui::TextureOptions::NEAREST));
+                    self.pa_prev_key = Some(key);
+                }
+                ui.label("Prévia (frame atual):");
+                if let Some(t) = &self.pa_prev {
+                    let lado = 320.0_f32;
+                    let esc = (lado / t.size()[0].max(t.size()[1]) as f32).max(0.01);
+                    let tam = egui::vec2(t.size()[0] as f32 * esc, t.size()[1] as f32 * esc);
+                    let (r, _) = ui.allocate_exact_size(tam, egui::Sense::hover());
+                    // fundo xadrez simples para ver a transparência
+                    ui.painter().rect_filled(r, 0.0, egui::Color32::from_gray(200));
+                    ui.painter().image(
+                        t.id(),
+                        r,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                ui.separator();
+                ui.weak(
+                    "Converte TODAS as timelines e frames (camadas, peças, vetores, câmera, pivôs \
+                     e rig acompanham o novo tamanho) e entra no modo pixel art. Dá para desfazer \
+                     com Ctrl+Z; para manter o original, use \"Salvar como\" depois.",
+                );
+                ui.add_space(4.0);
+                if ui
+                    .add(egui::Button::new(format!("Converter para {tw} × {th}")).min_size(egui::vec2(200.0, 28.0)))
+                    .clicked()
+                {
+                    converter = true;
+                }
+            });
+        if !open {
+            self.win_pixelart = false;
+            self.pa_prev = None;
+            self.pa_prev_key = None;
+        }
+        if converter {
+            self.iniciar_conversao_pixelart();
+        }
+    }
+
+    /// Dispara a conversão numa thread (o clone do documento é barato: as
+    /// camadas são compartilhadas).
+    fn iniciar_conversao_pixelart(&mut self) {
+        self.drop_float();
+        self.document.sync_to_frames();
+        let mut doc = self.document.clone();
+        let params = self.pa_params;
+        let alvo = sketchmotion_core::target_size(doc.width, doc.height, params.long_side);
+        let progress = Arc::new(AtomicU32::new(0));
+        let prog = progress.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            doc.convert_to_pixel_art(params, &prog);
+            let _ = tx.send(doc);
+        });
+        self.pixel_job = Some(PixelJob {
+            rx,
+            progress,
+            started: std::time::Instant::now(),
+            alvo,
+        });
+        self.win_pixelart = false;
+        self.pa_prev = None;
+        self.pa_prev_key = None;
+    }
+
     fn undo(&mut self) {
         if let Some(prev) = self.undo_stack.pop() {
             // MOVE o documento atual para o redo (sem clonar): elimina a cópia
@@ -2241,6 +2441,7 @@ impl SketchMotionApp {
             self.selected_obj = None;
             self.modificado = true;
             self.dirty = true;
+            self.apos_trocar_papel();
             self.status = "Desfeito".to_owned();
         }
     }
@@ -2265,6 +2466,7 @@ impl SketchMotionApp {
             self.selected_obj = None;
             self.modificado = true;
             self.dirty = true;
+            self.apos_trocar_papel();
             self.status = "Refeito".to_owned();
         }
     }
@@ -3249,6 +3451,60 @@ impl SketchMotionApp {
     /// Verifica jobs de exportar/salvar; mostra a tela de progresso (bloqueante).
     /// Devolve true enquanto um job está ativo (o `update` deve parar aí).
     fn busy_poll(&mut self, ctx: &egui::Context) -> bool {
+        // Conversão para pixel art (barra de progresso).
+        if self.pixel_job.is_some() {
+            ctx.request_repaint();
+            let (elapsed, frac, alvo) = {
+                let job = self.pixel_job.as_ref().unwrap();
+                (
+                    job.started.elapsed().as_secs_f32(),
+                    (job.progress.load(Ordering::Relaxed) as f32 / 1000.0).clamp(0.0, 1.0),
+                    job.alvo,
+                )
+            };
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.4);
+                    ui.heading(format!("Convertendo para pixel art ({} × {})…", alvo.0, alvo.1));
+                    ui.add_space(10.0);
+                    ui.add(egui::ProgressBar::new(frac).desired_width(360.0).show_percentage());
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_gray(150),
+                        format!("Processando todos os frames… ({:.0}s)", elapsed),
+                    );
+                });
+            });
+            match self.pixel_job.as_ref().unwrap().rx.try_recv() {
+                Ok(doc) => {
+                    self.pixel_job = None;
+                    self.push_undo();
+                    self.document = doc;
+                    self.float_sel = None;
+                    self.float_tex = None;
+                    self.sel_set.clear();
+                    self.sel_imgs.clear();
+                    self.selected_obj = None;
+                    self.active_layer = self
+                        .active_layer
+                        .min(self.document.layers.len().saturating_sub(1));
+                    self.last_pos = None;
+                    self.dirty = true;
+                    self.modificado = true;
+                    self.apos_trocar_papel();
+                    self.status = format!(
+                        "Convertido para pixel art {} × {} — Ctrl+Z desfaz",
+                        self.document.width, self.document.height
+                    );
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pixel_job = None;
+                    self.status = "Falha na conversão para pixel art".into();
+                }
+            }
+            return true;
+        }
         // Importação de imagem (barra de progresso).
         if self.import_job.is_some() {
             ctx.request_repaint();
@@ -12569,7 +12825,11 @@ impl eframe::App for SketchMotionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Abrir/Exportar/Salvar em andamento: tela de progresso, bloqueia o resto
         // (inclusive a tela inicial — a abertura pode começar a partir dela).
-        if self.open_job.is_some() || self.busy_job.is_some() || self.import_job.is_some() {
+        if self.open_job.is_some()
+            || self.busy_job.is_some()
+            || self.import_job.is_some()
+            || self.pixel_job.is_some()
+        {
             self.busy_poll(ctx);
             return;
         }
@@ -13043,6 +13303,19 @@ impl eframe::App for SketchMotionApp {
                         img_fv = true;
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui
+                        .button("Converter em pixel art…")
+                        .on_hover_text(
+                            "Converte o trabalho inteiro (todos os frames) para pixel art no \
+                             tamanho escolhido, mantendo cores e traços.",
+                        )
+                        .clicked()
+                    {
+                        self.win_pixelart = true;
+                        self.pa_prev_key = None;
+                        ui.close_menu();
+                    }
                 });
                 ui.separator();
                 ui.label("Escala export:")
@@ -13212,6 +13485,7 @@ impl eframe::App for SketchMotionApp {
         self.janela_objetos(ctx);
         self.janela_aplicar(ctx);
         self.janela_confirmar_del_frame(ctx);
+        self.janela_pixelart(ctx);
         self.palette_radial(ctx);
         self.janela_editar_peca(ctx);
         self.janela_prancheta(ctx);

@@ -52,6 +52,19 @@ impl Layer {
     pub fn height(&self) -> u32 {
         self.height
     }
+    /// Buffer compartilhado (uso interno: conversão em lote reaproveita
+    /// camadas idênticas entre frames sem processá-las de novo).
+    pub(crate) fn pixels_arc(&self) -> &Arc<Vec<u8>> {
+        &self.pixels
+    }
+
+    /// Troca o buffer inteiro (e o tamanho) da camada.
+    pub(crate) fn set_buffer(&mut self, width: u32, height: u32, pixels: Arc<Vec<u8>>) {
+        self.width = width;
+        self.height = height;
+        self.pixels = pixels;
+    }
+
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
